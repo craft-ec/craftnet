@@ -1,0 +1,27 @@
+[package]
+name = "tunnelcraft-uniffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "tunnelcraft_uniffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/generate_bindings.rs"
+
+[dependencies]
+tunnelcraft-core = { workspace = true }
+tunnelcraft-client = { workspace = true }
+tunnelcraft-crypto = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uniffi = { version = "0.28", features = ["cli"] }
+once_cell = "1.19"
+parking_lot = "0.12"
+hex = { workspace = true }

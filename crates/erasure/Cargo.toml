@@ -1,0 +1,11 @@
+[package]
+name = "tunnelcraft-erasure"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tunnelcraft-core = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+thiserror = { workspace = true }

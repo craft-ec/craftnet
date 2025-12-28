@@ -1,0 +1,22 @@
+[package]
+name = "tunnelcraft-exit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tunnelcraft-core = { workspace = true }
+tunnelcraft-crypto = { workspace = true }
+tunnelcraft-erasure = { workspace = true }
+tunnelcraft-settlement = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+sha2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"

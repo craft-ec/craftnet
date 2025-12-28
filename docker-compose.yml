@@ -1,0 +1,152 @@
+# TunnelCraft Multi-Node Test Environment
+# Usage: docker compose up --build
+#
+# Discovery mechanisms:
+# - mDNS: Nodes automatically discover each other on the same network
+# - Rendezvous: Nodes can register with rendezvous servers for cross-network discovery
+
+services:
+  # Rendezvous server - central discovery point
+  # Other nodes can use this as a rendezvous point
+  rendezvous-node:
+    build: .
+    container_name: tunnelcraft-rendezvous
+    command: ["--keyfile", "/data/node.key", "-l", "/ip4/0.0.0.0/tcp/9000", "-v", "full"]
+    ports:
+      - "9100:9000"
+    volumes:
+      - rendezvous-data:/data
+    networks:
+      tunnelcraft:
+        ipv4_address: 172.28.0.5
+    healthcheck:
+      test: ["CMD", "pgrep", "tunnelcraft-node"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Exit node - handles outbound requests
+  # Uses mDNS for local discovery (enabled by default)
+  exit-node:
+    build: .
+    container_name: tunnelcraft-exit
+    command: ["--keyfile", "/data/node.key", "-l", "/ip4/0.0.0.0/tcp/9000", "-v", "exit"]
+    ports:
+      - "9000:9000"
+    volumes:
+      - exit-data:/data
+    networks:
+      tunnelcraft:
+        ipv4_address: 172.28.0.10
+    depends_on:
+      rendezvous-node:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pgrep", "tunnelcraft-node"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Relay node 1 - discovers peers via mDNS
+  relay-node-1:
+    build: .
+    container_name: tunnelcraft-relay-1
+    command: ["--keyfile", "/data/node.key", "-l", "/ip4/0.0.0.0/tcp/9000", "-v", "relay"]
+    ports:
+      - "9001:9000"
+    volumes:
+      - relay1-data:/data
+    networks:
+      tunnelcraft:
+        ipv4_address: 172.28.0.11
+    depends_on:
+      exit-node:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pgrep", "tunnelcraft-node"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Relay node 2 - discovers peers via mDNS
+  relay-node-2:
+    build: .
+    container_name: tunnelcraft-relay-2
+    command: ["--keyfile", "/data/node.key", "-l", "/ip4/0.0.0.0/tcp/9000", "-v", "relay"]
+    ports:
+      - "9002:9000"
+    volumes:
+      - relay2-data:/data
+    networks:
+      tunnelcraft:
+        ipv4_address: 172.28.0.12
+    depends_on:
+      relay-node-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pgrep", "tunnelcraft-node"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Full node - runs both relay and exit
+  full-node:
+    build: .
+    container_name: tunnelcraft-full
+    command: ["--keyfile", "/data/node.key", "-l", "/ip4/0.0.0.0/tcp/9000", "-v", "full"]
+    ports:
+      - "9003:9000"
+    volumes:
+      - full-data:/data
+    networks:
+      tunnelcraft:
+        ipv4_address: 172.28.0.13
+    depends_on:
+      relay-node-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pgrep", "tunnelcraft-node"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Test runner container
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: tunnelcraft-test
+    networks:
+      tunnelcraft:
+        ipv4_address: 172.28.0.100
+    depends_on:
+      rendezvous-node:
+        condition: service_healthy
+      exit-node:
+        condition: service_healthy
+      relay-node-1:
+        condition: service_healthy
+      relay-node-2:
+        condition: service_healthy
+      full-node:
+        condition: service_healthy
+    environment:
+      - RENDEZVOUS_ADDR=172.28.0.5:9000
+      - EXIT_NODE_ADDR=172.28.0.10:9000
+      - RELAY1_ADDR=172.28.0.11:9000
+      - RELAY2_ADDR=172.28.0.12:9000
+      - FULL_NODE_ADDR=172.28.0.13:9000
+
+volumes:
+  rendezvous-data:
+  exit-data:
+  relay1-data:
+  relay2-data:
+  full-data:
+
+networks:
+  tunnelcraft:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

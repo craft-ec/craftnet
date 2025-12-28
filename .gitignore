@@ -1,0 +1,38 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Node (for apps/)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Mobile builds
+apps/mobile/ios/build/
+apps/mobile/android/build/
+apps/mobile/android/.gradle/
+*.xcworkspace
+*.xcuserdata
+
+# Electron
+apps/desktop/dist/
+apps/desktop/out/
+
+# Logs
+*.log
+Pods/

@@ -1,0 +1,25 @@
+[package]
+name = "tunnelcraft-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tunnelcraft"
+path = "src/main.rs"
+
+[dependencies]
+tunnelcraft-app = { workspace = true }
+tunnelcraft-client = { workspace = true }
+tunnelcraft-core = { workspace = true }
+tunnelcraft-daemon = { workspace = true }
+tunnelcraft-network = { workspace = true }
+tunnelcraft-keystore = { workspace = true }
+tunnelcraft-ipc-client = { workspace = true }
+tokio = { workspace = true }
+libp2p = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

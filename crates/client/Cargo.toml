@@ -1,0 +1,24 @@
+[package]
+name = "tunnelcraft-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tunnelcraft-core = { workspace = true }
+tunnelcraft-crypto = { workspace = true }
+tunnelcraft-erasure = { workspace = true }
+tunnelcraft-network = { workspace = true }
+tunnelcraft-relay = { workspace = true }
+tunnelcraft-exit = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+libp2p = { workspace = true }
+serde_json = { workspace = true }
+futures = "0.3"
+parking_lot = "0.12"

@@ -1,0 +1,29 @@
+[package]
+name = "tunnelcraft-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tunnelcraft-core = { workspace = true }
+tunnelcraft-crypto = { workspace = true }
+tunnelcraft-erasure = { workspace = true }
+tunnelcraft-network = { workspace = true }
+tunnelcraft-relay = { workspace = true }
+tunnelcraft-exit = { workspace = true }
+tunnelcraft-client = { workspace = true }
+tokio = { workspace = true }
+axum = "0.8"
+hyper = { version = "1.0", features = ["full"] }
+rand = "0.8"
+futures = "0.3"
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+
+[[test]]
+name = "shard_flow"
+path = "shard_flow.rs"
+
+[[test]]
+name = "full_tunnel_simulation"
+path = "full_tunnel_simulation.rs"

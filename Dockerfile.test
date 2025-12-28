@@ -1,0 +1,29 @@
+# TunnelCraft Integration Test Runner
+# Runs integration tests against the multi-node environment
+
+FROM rust:1.75-bookworm
+
+WORKDIR /app
+
+# Install test dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    curl \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY apps/ apps/
+
+# Build test binaries
+RUN cargo build --release -p tunnelcraft-cli
+RUN cargo test --no-run --release -p tunnelcraft-network
+
+# Copy test scripts
+COPY scripts/docker-integration-test.sh /app/run-tests.sh
+RUN chmod +x /app/run-tests.sh
+
+ENTRYPOINT ["/app/run-tests.sh"]

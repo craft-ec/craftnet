@@ -1,0 +1,62 @@
+.status-card {
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.status-indicator {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  margin: 0 auto;
+  box-shadow: 0 0 20px currentColor;
+  transition: background-color 0.3s ease;
+}
+
+.status-info {
+  text-align: center;
+}
+
+.status-text {
+  font-size: 24px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.exit-node {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.error-message {
+  font-size: 12px;
+  color: var(--error);
+}
+
+.status-details {
+  display: flex;
+  justify-content: center;
+  gap: 32px;
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.detail .label {
+  font-size: 12px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.detail .value {
+  font-size: 18px;
+  font-weight: 600;
+}

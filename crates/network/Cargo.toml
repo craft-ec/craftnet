@@ -1,0 +1,19 @@
+[package]
+name = "tunnelcraft-network"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tunnelcraft-core = { workspace = true }
+tunnelcraft-crypto = { workspace = true }
+libp2p = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+futures = "0.3"
+async-trait = "0.1"

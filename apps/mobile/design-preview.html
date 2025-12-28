@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=430, maximum-scale=1">
+    <title>TunnelCraft - Mobile App Design Preview</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* Base colors */
+            --black: #0A0A0B;
+            --charcoal: #121214;
+            --graphite: #1A1A1E;
+            --slate: #252529;
+            --zinc: #3A3A42;
+            --silver: #6B6B76;
+            --mist: #9B9BA6;
+            --cloud: #CCCCD4;
+            --snow: #F4F4F6;
+            --white: #FFFFFF;
+
+            /* Mode colors */
+            --cyan-500: #00C4E6;
+            --cyan-400: #26CFEB;
+            --amber-500: #FFB700;
+            --amber-400: #FFC226;
+            --violet-500: #9333EA;
+            --violet-400: #A855F7;
+
+            /* Semantic */
+            --success: #22C55E;
+            --error: #EF4444;
+
+            /* Current mode color (will be updated by JS) */
+            --mode-color: var(--violet-500);
+            --mode-glow: rgba(147, 51, 234, 0.4);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--black);
+            color: var(--snow);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+
+        /* Phone frame */
+        .phone-frame {
+            width: 390px;
+            height: 844px;
+            background: var(--charcoal);
+            border-radius: 50px;
+            padding: 12px;
+            box-shadow:
+                0 50px 100px -20px rgba(0, 0, 0, 0.5),
+                0 30px 60px -30px rgba(0, 0, 0, 0.3),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
+            position: relative;
+        }
+
+        .phone-screen {
+            width: 100%;
+            height: 100%;
+            background: var(--black);
+            border-radius: 40px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* Background gradient */
+        .bg-gradient {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(ellipse at 50% 30%, var(--mode-glow), transparent 60%);
+            opacity: 0.5;
+            transition: all 0.5s ease;
+        }
+
+        /* Dynamic island */
+        .dynamic-island {
+            position: absolute;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 120px;
+            height: 35px;
+            background: var(--black);
+            border-radius: 20px;
+            z-index: 100;
+        }
+
+        /* Content */
+        .content {
+            position: relative;
+            z-index: 10;
+            padding: 60px 24px 24px;
+            height: 100%;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 24px;
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+
+        .tagline {
+            font-size: 13px;
+            color: var(--silver);
+            margin-top: 4px;
+        }
+
+        .mode-badge {
+            padding: 8px 14px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            background: rgba(147, 51, 234, 0.2);
+            color: var(--mode-color);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* Connection Orb */
+        .orb-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 280px;
+            position: relative;
+        }
+
+        .orb-ring {
+            position: absolute;
+            width: 200px;
+            height: 200px;
+            border-radius: 50%;
+            border: 2px solid var(--mode-color);
+            opacity: 0;
+            animation: ring-pulse 2.4s ease-out infinite;
+        }
+
+        .orb-ring:nth-child(2) { animation-delay: 0.8s; }
+        .orb-ring:nth-child(3) { animation-delay: 1.6s; }
+
+        @keyframes ring-pulse {
+            0% { transform: scale(1); opacity: 0.6; }
+            100% { transform: scale(1.8); opacity: 0; }
+        }
+
+        .orb {
+            width: 200px;
+            height: 200px;
+            border-radius: 50%;
+            background: var(--mode-color);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow:
+                0 0 60px var(--mode-glow),
+                0 20px 40px -10px rgba(0, 0, 0, 0.5);
+            animation: orb-pulse 4s ease-in-out infinite;
+        }
+
+        @keyframes orb-pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.03); }
+        }
+
+        .orb:hover {
+            transform: scale(1.05);
+        }
+
+        .orb-icon {
+            font-size: 48px;
+            margin-bottom: 8px;
+        }
+
+        .orb-status {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--black);
+        }
+
+        .orb-peers {
+            font-size: 12px;
+            color: var(--black);
+            opacity: 0.8;
+            margin-top: 4px;
+        }
+
+        .orb-hint {
+            font-size: 13px;
+            color: var(--silver);
+            margin-top: 16px;
+        }
+
+        /* Mode Selector */
+        .mode-section {
+            margin-bottom: 24px;
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .section-label {
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--silver);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            background: var(--zinc);
+            border-radius: 20px;
+        }
+
+        .status-badge.active {
+            background: rgba(147, 51, 234, 0.2);
+        }
+
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--silver);
+        }
+
+        .status-dot.active {
+            background: var(--success);
+        }
+
+        .status-text {
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--silver);
+        }
+
+        .status-badge.active .status-text {
+            color: var(--mode-color);
+        }
+
+        .mode-selector {
+            display: flex;
+            background: var(--graphite);
+            border-radius: 16px;
+            padding: 4px;
+            position: relative;
+        }
+
+        .mode-indicator {
+            position: absolute;
+            top: 4px;
+            left: 4px;
+            width: calc(33.33% - 2.67px);
+            height: calc(100% - 8px);
+            background: var(--mode-color);
+            border-radius: 12px;
+            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+            box-shadow: 0 4px 12px rgba(147, 51, 234, 0.3);
+        }
+
+        .mode-indicator[data-mode="client"] { transform: translateX(0); }
+        .mode-indicator[data-mode="both"] { transform: translateX(100%); }
+        .mode-indicator[data-mode="node"] { transform: translateX(200%); }
+
+        .mode-option {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 12px 0;
+            cursor: pointer;
+            z-index: 1;
+            transition: color 0.2s ease;
+        }
+
+        .mode-icon {
+            font-size: 20px;
+            margin-bottom: 4px;
+        }
+
+        .mode-label {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--silver);
+        }
+
+        .mode-option.active .mode-label {
+            color: var(--black);
+            font-weight: 600;
+        }
+
+        .mode-description {
+            font-size: 13px;
+            color: var(--mist);
+            text-align: center;
+            margin-top: 12px;
+            padding: 0 20px;
+        }
+
+        /* Stats */
+        .credits-card {
+            background: var(--graphite);
+            border-radius: 20px;
+            padding: 24px;
+            text-align: center;
+            margin-bottom: 24px;
+        }
+
+        .credits-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .credits-label {
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--silver);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .credits-flow {
+            display: flex;
+            gap: 8px;
+        }
+
+        .flow-badge {
+            padding: 4px 8px;
+            background: var(--zinc);
+            border-radius: 20px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }
+
+        .flow-badge.positive { color: var(--success); }
+        .flow-badge.negative { color: var(--error); }
+
+        .credits-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 48px;
+            font-weight: 600;
+            color: var(--mode-color);
+            line-height: 1;
+        }
+
+        .credits-unit {
+            font-size: 13px;
+            color: var(--silver);
+            margin-top: 8px;
+        }
+
+        /* Stats Grid */
+        .stats-section {
+            margin-bottom: 20px;
+        }
+
+        .stats-title {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--mist);
+            margin-bottom: 12px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .stat-card {
+            background: var(--graphite);
+            border-radius: 16px;
+            padding: 16px;
+            border-left: 3px solid var(--mode-color);
+        }
+
+        .stat-header {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+
+        .stat-icon {
+            font-size: 14px;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: var(--silver);
+        }
+
+        .stat-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 20px;
+            font-weight: 500;
+            color: var(--snow);
+        }
+
+        /* Tab Bar */
+        .tab-bar {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: var(--charcoal);
+            padding: 8px 0 28px;
+            display: flex;
+            justify-content: space-around;
+            border-top: 1px solid var(--zinc);
+        }
+
+        .tab-bar::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 24px;
+            right: 24px;
+            height: 2px;
+            background: var(--mode-color);
+            border-radius: 1px;
+        }
+
+        .tab {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+            cursor: pointer;
+            padding: 8px 24px;
+        }
+
+        .tab-icon {
+            font-size: 24px;
+        }
+
+        .tab-label {
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--silver);
+        }
+
+        .tab.active .tab-label {
+            color: var(--mode-color);
+        }
+
+        /* Preview controls */
+        .controls {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: var(--graphite);
+            padding: 16px;
+            border-radius: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 1000;
+        }
+
+        .control-label {
+            font-size: 12px;
+            color: var(--silver);
+            margin-bottom: 4px;
+        }
+
+        .control-buttons {
+            display: flex;
+            gap: 8px;
+        }
+
+        .control-btn {
+            padding: 8px 16px;
+            background: var(--zinc);
+            border: none;
+            border-radius: 8px;
+            color: var(--snow);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .control-btn:hover {
+            background: var(--slate);
+        }
+
+        .control-btn.active {
+            background: var(--mode-color);
+            color: var(--black);
+        }
+
+        .title-banner {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .title-banner h1 {
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .title-banner p {
+            color: var(--mist);
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="title-banner">
+        <h1>TunnelCraft Mobile</h1>
+        <p>Decentralized VPN Network • Design Preview</p>
+    </div>
+
+    <div class="controls">
+        <div>
+            <div class="control-label">Mode</div>
+            <div class="control-buttons">
+                <button class="control-btn" data-mode="client">Client</button>
+                <button class="control-btn active" data-mode="both">Both</button>
+                <button class="control-btn" data-mode="node">Node</button>
+            </div>
+        </div>
+        <div>
+            <div class="control-label">Connection</div>
+            <div class="control-buttons">
+                <button class="control-btn" data-connected="false">Disconnected</button>
+                <button class="control-btn active" data-connected="true">Connected</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="phone-frame">
+        <div class="phone-screen">
+            <div class="bg-gradient"></div>
+            <div class="dynamic-island"></div>
+
+            <div class="content">
+                <!-- Header -->
+                <div class="header">
+                    <div>
+                        <div class="logo">TunnelCraft</div>
+                        <div class="tagline">Decentralized VPN Network</div>
+                    </div>
+                    <div class="mode-badge">Dual Mode</div>
+                </div>
+
+                <!-- Connection Orb -->
+                <div class="orb-container">
+                    <div class="orb-ring"></div>
+                    <div class="orb-ring"></div>
+                    <div class="orb-ring"></div>
+                    <div class="orb">
+                        <div class="orb-icon">⚡</div>
+                        <div class="orb-status">Protected</div>
+                        <div class="orb-peers">12 peers</div>
+                    </div>
+                </div>
+
+                <!-- Mode Selector -->
+                <div class="mode-section">
+                    <div class="section-header">
+                        <div class="section-label">Operating Mode</div>
+                        <div class="status-badge active">
+                            <div class="status-dot active"></div>
+                            <div class="status-text">Active</div>
+                        </div>
+                    </div>
+                    <div class="mode-selector">
+                        <div class="mode-indicator" data-mode="both"></div>
+                        <div class="mode-option" data-mode="client">
+                            <div class="mode-icon">🛡️</div>
+                            <div class="mode-label">Client</div>
+                        </div>
+                        <div class="mode-option active" data-mode="both">
+                            <div class="mode-icon">⚡</div>
+                            <div class="mode-label">Both</div>
+                        </div>
+                        <div class="mode-option" data-mode="node">
+                            <div class="mode-icon">🌐</div>
+                            <div class="mode-label">Node</div>
+                        </div>
+                    </div>
+                    <div class="mode-description">⚡ Use VPN protection while earning from the network</div>
+                </div>
+
+                <!-- Credits -->
+                <div class="credits-card">
+                    <div class="credits-header">
+                        <div class="credits-label">Credit Balance</div>
+                        <div class="credits-flow">
+                            <div class="flow-badge negative">-12</div>
+                            <div class="flow-badge positive">+47</div>
+                        </div>
+                    </div>
+                    <div class="credits-value">1,247</div>
+                    <div class="credits-unit">credits available</div>
+                </div>
+
+                <!-- Stats -->
+                <div class="stats-section">
+                    <div class="stats-title">📡 Your Traffic</div>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <div class="stat-icon">📤</div>
+                                <div class="stat-label">Data Sent</div>
+                            </div>
+                            <div class="stat-value">24.3 MB</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <div class="stat-icon">📥</div>
+                                <div class="stat-label">Data Received</div>
+                            </div>
+                            <div class="stat-value">156.7 MB</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="stats-section">
+                    <div class="stats-title">🌐 Network Contribution</div>
+                    <div class="stats-grid">
+                        <div class="stat-card" style="border-left-color: var(--amber-500);">
+                            <div class="stat-header">
+                                <div class="stat-icon">🔀</div>
+                                <div class="stat-label">Shards Relayed</div>
+                            </div>
+                            <div class="stat-value">1,842</div>
+                        </div>
+                        <div class="stat-card" style="border-left-color: var(--amber-500);">
+                            <div class="stat-header">
+                                <div class="stat-icon">🌐</div>
+                                <div class="stat-label">Requests Exited</div>
+                            </div>
+                            <div class="stat-value">124</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab Bar -->
+            <div class="tab-bar">
+                <div class="tab active">
+                    <div class="tab-icon">🏠</div>
+                    <div class="tab-label">Home</div>
+                </div>
+                <div class="tab">
+                    <div class="tab-icon">⚙️</div>
+                    <div class="tab-label">Settings</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const modeColors = {
+            client: { color: '#00C4E6', glow: 'rgba(0, 196, 230, 0.4)' },
+            both: { color: '#9333EA', glow: 'rgba(147, 51, 234, 0.4)' },
+            node: { color: '#FFB700', glow: 'rgba(255, 183, 0, 0.4)' }
+        };
+
+        const modeDescriptions = {
+            client: '🛡️ Route your traffic through the VPN network',
+            both: '⚡ Use VPN protection while earning from the network',
+            node: '🌐 Help others by relaying traffic and earn credits'
+        };
+
+        const modeIcons = {
+            client: '🛡️',
+            both: '⚡',
+            node: '🌐'
+        };
+
+        const modeBadgeText = {
+            client: 'Client Mode',
+            both: 'Dual Mode',
+            node: 'Node Mode'
+        };
+
+        let currentMode = 'both';
+        let isConnected = true;
+
+        function updateMode(mode) {
+            currentMode = mode;
+            const colors = modeColors[mode];
+
+            // Update CSS variables
+            document.documentElement.style.setProperty('--mode-color', colors.color);
+            document.documentElement.style.setProperty('--mode-glow', colors.glow);
+
+            // Update indicator
+            document.querySelector('.mode-indicator').dataset.mode = mode;
+
+            // Update active states
+            document.querySelectorAll('.mode-option').forEach(opt => {
+                opt.classList.toggle('active', opt.dataset.mode === mode);
+            });
+
+            // Update description
+            document.querySelector('.mode-description').textContent = modeDescriptions[mode];
+
+            // Update orb icon
+            document.querySelector('.orb-icon').textContent = modeIcons[mode];
+
+            // Update mode badge
+            document.querySelector('.mode-badge').textContent = modeBadgeText[mode];
+
+            // Update control buttons
+            document.querySelectorAll('[data-mode]').forEach(btn => {
+                if (btn.classList.contains('control-btn')) {
+                    btn.classList.toggle('active', btn.dataset.mode === mode);
+                }
+            });
+
+            // Show/hide stats sections based on mode
+            const trafficStats = document.querySelectorAll('.stats-section')[0];
+            const nodeStats = document.querySelectorAll('.stats-section')[1];
+
+            if (mode === 'client') {
+                trafficStats.style.display = 'block';
+                nodeStats.style.display = 'none';
+            } else if (mode === 'node') {
+                trafficStats.style.display = 'none';
+                nodeStats.style.display = 'block';
+            } else {
+                trafficStats.style.display = 'block';
+                nodeStats.style.display = 'block';
+            }
+        }
+
+        function updateConnection(connected) {
+            isConnected = connected;
+
+            const orb = document.querySelector('.orb');
+            const rings = document.querySelectorAll('.orb-ring');
+            const statusBadge = document.querySelector('.status-badge');
+            const statusDot = document.querySelector('.status-dot');
+            const orbStatus = document.querySelector('.orb-status');
+            const orbPeers = document.querySelector('.orb-peers');
+            const tabBarLine = document.querySelector('.tab-bar::before');
+
+            if (connected) {
+                orb.style.background = 'var(--mode-color)';
+                rings.forEach(r => r.style.display = 'block');
+                statusBadge.classList.add('active');
+                statusDot.classList.add('active');
+                document.querySelector('.status-text').textContent = 'Active';
+                orbStatus.textContent = 'Protected';
+                orbPeers.style.display = 'block';
+            } else {
+                orb.style.background = 'var(--zinc)';
+                rings.forEach(r => r.style.display = 'none');
+                statusBadge.classList.remove('active');
+                statusDot.classList.remove('active');
+                document.querySelector('.status-text').textContent = 'Inactive';
+                orbStatus.textContent = 'Tap to Connect';
+                orbPeers.style.display = 'none';
+            }
+
+            // Update control buttons
+            document.querySelectorAll('[data-connected]').forEach(btn => {
+                btn.classList.toggle('active', (btn.dataset.connected === 'true') === connected);
+            });
+        }
+
+        // Event listeners
+        document.querySelectorAll('.mode-option').forEach(opt => {
+            opt.addEventListener('click', () => updateMode(opt.dataset.mode));
+        });
+
+        document.querySelectorAll('.control-btn[data-mode]').forEach(btn => {
+            btn.addEventListener('click', () => updateMode(btn.dataset.mode));
+        });
+
+        document.querySelectorAll('.control-btn[data-connected]').forEach(btn => {
+            btn.addEventListener('click', () => updateConnection(btn.dataset.connected === 'true'));
+        });
+
+        document.querySelector('.orb').addEventListener('click', () => {
+            updateConnection(!isConnected);
+        });
+
+        // Initialize
+        updateMode('both');
+        updateConnection(true);
+    </script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+[package]
+name = "tunnelcraft-relay"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tunnelcraft-core = { workspace = true }
+tunnelcraft-crypto = { workspace = true }
+tunnelcraft-settlement = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }

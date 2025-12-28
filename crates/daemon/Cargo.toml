@@ -1,0 +1,22 @@
+[package]
+name = "tunnelcraft-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tunnelcraft-core = { workspace = true }
+tunnelcraft-crypto = { workspace = true }
+tunnelcraft-client = { workspace = true }
+tunnelcraft-relay = { workspace = true }
+tunnelcraft-exit = { workspace = true }
+tunnelcraft-network = { workspace = true }
+tokio = { workspace = true }
+libp2p = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = "0.3"
