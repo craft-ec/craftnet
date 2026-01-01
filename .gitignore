@@ -36,3 +36,4 @@ apps/desktop/out/
 # Logs
 *.log
 Pods/
+node_modules/
