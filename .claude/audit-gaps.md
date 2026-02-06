@@ -286,4 +286,92 @@ All 247 items from first pass + 10 re-audit items addressed.
 - [x] SKIPPED: `apps/mobile/src/screens/SettingsScreen.tsx:20` - @react-native-clipboard/clipboard types — dependency install issue, not a code gap
 - [x] SKIPPED: `apps/mobile/src/services/DaemonService.ts:192` - configureSettlement guarded by typeof check + @ts-ignore — intentional
 
-## Status: RE-AUDIT COMPLETE — All gaps addressed
+## Status: RE-AUDIT COMPLETE — All code quality gaps addressed
+
+---
+
+## FEATURE IMPLEMENTATION STATE (2026-02-07)
+
+Honest end-to-end assessment of every major feature. Code quality is separate from feature completeness — a feature can have clean code but still be a stub.
+
+### FULLY WORKING (Real implementation, tested)
+
+| Feature | Where | Evidence |
+|---------|-------|---------|
+| P2P Networking | `crates/network/` | Full libp2p swarm with Kademlia DHT, mDNS, gossipsub, NAT traversal (dcutr + relay) |
+| Erasure Coding (5/3) | `crates/erasure/src/lib.rs` | Reed-Solomon encode/decode with 20+ passing tests, handles up to 2 lost shards |
+| Multi-hop Relay Routing | `crates/relay/`, `crates/client/src/node.rs` | Privacy levels control hop count; each relay decrements hops and signs shards |
+| Chain Signatures | `crates/core/src/shard.rs`, `crates/relay/src/handler.rs` | Each relay appends signature to shard chain; accumulates proof-of-work |
+| Trustless Relay Verification | `crates/relay/src/handler.rs:180-200` | Destination-mismatch check prevents exit node redirection attacks |
+| Exit Node HTTP Fetch | `crates/exit/src/handler.rs` | Full GET/POST/PUT/DELETE/PATCH/HEAD via reqwest; shards and encodes response |
+| Raw VPN Packet Tunneling | `crates/exit/src/handler.rs` (handle_raw_packet) | IPv4 TCP/UDP forwarding with IP header reconstruction at exit nodes |
+| Response Reconstruction | `crates/erasure/src/lib.rs`, `crates/client/` | Client reassembles shards via erasure decoding after relay traversal |
+| Gossipsub Exit Announcements | `crates/network/src/status.rs`, `crates/network/src/node.rs` | Exit nodes broadcast heartbeats with load/throughput/uptime via gossipsub |
+| Domain Blocking (Exit) | `crates/exit/src/handler.rs` | Blocked domain list enforced at exit handler; tested |
+| Local Discovery Toggle | `crates/client/src/node.rs` | mDNS peers skipped when `local_discovery_enabled = false` |
+| Desktop Electron App | `apps/desktop/` | Full JSON-RPC IPC to daemon; all commands wired; event forwarding works |
+| CLI | `apps/cli/src/main.rs` | 15+ commands fully connected to daemon via IPC client |
+| Settings Persistence | `crates/settings/src/config.rs` | JSON config load/save to `~/.tunnelcraft/settings.json` |
+| Key Management | `crates/keystore/` | ED25519 generate/store/load; persistent across runs |
+| Custom Headers Passthrough | `crates/client/src/node.rs`, `crates/daemon/src/service.rs` | Headers flow from IPC → daemon → node.fetch() → RequestBuilder |
+
+### PARTIAL (Some parts work, gaps remain)
+
+| Feature | What works | What doesn't |
+|---------|-----------|--------------|
+| Exit Geo Selection | Preference stored; `exit_nodes_by_region()`/`exit_nodes_by_country()` filter methods exist | Not enforced — falls back silently if no exits match the selected region |
+| iOS VPN Network Extension | 563-line PacketTunnelProvider with IP + domain-based split tunneling; UniFFI bindings compile | Never integration-tested on a real device; depends on UniFFI Rust library linking |
+| iOS Native Module | 574-line Swift module (connect/disconnect/status/exits/request) | Dev mode returns mocks; production UniFFI path untested on device |
+| Node Earnings | Points tracked in mock settlement; `credits_earned` field in NodeStats | Requires live Solana program for real earnings — currently mock only |
+| Windows IPC | Named pipe server (`crates/daemon/src/windows_pipe.rs`) + client (`crates/ipc-client/`) both compile | Never tested on actual Windows; no CI Windows build |
+| NAT Traversal | libp2p dcutr + relay protocol configured in swarm | Never tested in real NAT scenarios |
+
+### STUB (Code exists, returns fake/mock data)
+
+| Feature | Where | Details |
+|---------|-------|---------|
+| Settlement / Credits | `crates/settlement/src/client.rs` | Daemon uses `SettlementConfig::mock()` — in-memory credit tracking only. Live mode struct exists but requires deployed Solana program that doesn't exist |
+| Credit Purchasing | `crates/settlement/src/client.rs:111` | `purchase_credits()` increments an in-memory HashMap counter. No Stripe, no Apple IAP, no Google Play billing |
+| Bootstrap Nodes | `crates/network/src/bootstrap.rs:22` | `DEFAULT_BOOTSTRAP_NODES` array is **empty**. Infrastructure parses addresses but none are configured |
+| Android VPN | `apps/mobile/android/.../TunnelCraftVPNModule.kt` | 302-line Kotlin module returns hardcoded mock data for all methods. No real VpnService tunnel, no JNI/UniFFI wiring |
+
+### DEAD-END (Interface exists in UI/service layer, zero implementation behind it)
+
+| Feature | Exposed at | What's missing |
+|---------|-----------|----------------|
+| Connection History | `DaemonService.getConnectionHistory()` | No daemon handler, no storage, no data model — method declared but nothing backs it |
+| Earnings History | `DaemonService.getEarningsHistory()` | Same — declared in service interface, zero implementation |
+| Speed Test | `DaemonService.runSpeedTest()` | Zero implementation anywhere in the codebase |
+| Bandwidth Limiting | `DaemonService.setBandwidthLimit()` | No throttling logic in daemon, network, or node. Exit nodes announce capacity via gossipsub but don't enforce it |
+| Key Export/Import | `DaemonService.exportPrivateKey()` / `importPrivateKey()` | No daemon handler. Keys are generated and stored but cannot be exported or imported |
+
+### NOT IMPLEMENTED (No code at all)
+
+| Feature | Notes |
+|---------|-------|
+| Android Split Tunneling | iOS has IP + domain-based routing; Android has nothing |
+| Real Payment Processing | No Stripe, Apple IAP, or Google Play billing integration |
+| Production Bootstrap Nodes | Need at least 1 public VPS running as a bootstrap peer |
+| Public Exit Nodes | No deployed exit infrastructure — nobody to route traffic through |
+| CI/CD Pipeline | No `.github/workflows/` directory; no automated builds or tests |
+
+---
+
+### Production Blockers (what prevents this from being a real VPN)
+
+1. **No bootstrap nodes** — peers cannot find each other without ≥1 public bootstrap node
+2. **No exit nodes** — no deployed infrastructure to route traffic through
+3. **Settlement is mock** — credits are fake; Solana program not deployed
+4. **Android VPN is mocked** — returns fake data, no real tunnel
+5. **iOS untested on device** — UniFFI bindings compile but never ran on hardware
+6. **No payment flow** — no way for users to actually purchase credits
+
+### What genuinely works today
+
+The **Rust core engine** is the strongest layer: P2P networking, erasure coding, multi-hop relay routing, chain signatures, trustless verification, exit HTTP fetch, raw packet tunneling, and response reconstruction are all real implementations with tests.
+
+The **desktop Electron app** and **CLI** are fully wired to the daemon via IPC.
+
+**Settings**, **key management**, and **domain blocking** work end-to-end.
+
+If you deployed bootstrap nodes + exit nodes + switched settlement to Live mode, the desktop/CLI path could theoretically function as a VPN. The mobile apps need more work (especially Android).
