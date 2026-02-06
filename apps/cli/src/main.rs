@@ -102,7 +102,15 @@ enum Commands {
     },
 
     /// Start the daemon (usually run by system service)
-    Daemon,
+    Daemon {
+        /// Run as a bootstrap node (relay-only, no exit, no settlement)
+        #[arg(long)]
+        bootstrap: bool,
+
+        /// Listen port for bootstrap mode
+        #[arg(long, default_value = "9000")]
+        port: u16,
+    },
 
     /// Run in standalone mode (SDK direct, no daemon)
     Run {
@@ -137,6 +145,27 @@ enum Commands {
     Node {
         #[command(subcommand)]
         mode: NodeMode,
+    },
+
+    /// Show connection history
+    History,
+
+    /// Show earnings history
+    Earnings,
+
+    /// Run a speed test
+    Speedtest,
+
+    /// Set bandwidth limit (in kbps)
+    Bandwidth {
+        /// Bandwidth limit in kbps (omit to show current, 0 to remove limit)
+        limit: Option<u64>,
+    },
+
+    /// Key management
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
     },
 
     /// Developer tools and diagnostics
@@ -225,6 +254,28 @@ enum CreditsAction {
 }
 
 #[derive(Subcommand)]
+enum KeyAction {
+    /// Export private key (encrypted)
+    Export {
+        /// Path to export the key to
+        path: String,
+
+        /// Password to encrypt the key
+        #[arg(short, long)]
+        password: String,
+    },
+    /// Import private key (encrypted)
+    Import {
+        /// Path to import the key from
+        path: String,
+
+        /// Password to decrypt the key
+        #[arg(short, long)]
+        password: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum DevAction {
     /// Show feature implementation matrix
     Matrix,
@@ -238,7 +289,7 @@ async fn main() -> Result<()> {
 
     // Initialize app with standard startup sequence
     let app_type = match &cli.command {
-        Commands::Daemon => AppType::Daemon,
+        Commands::Daemon { .. } => AppType::Daemon,
         Commands::Node { .. } => AppType::Node,
         _ => AppType::Cli,
     };
@@ -287,8 +338,8 @@ async fn main() -> Result<()> {
         } => {
             request(&cli.socket, &method, &url, body, header).await?;
         }
-        Commands::Daemon => {
-            run_daemon().await?;
+        Commands::Daemon { bootstrap, port } => {
+            run_daemon(bootstrap, port).await?;
         }
         Commands::Run {
             hops,
@@ -306,6 +357,21 @@ async fn main() -> Result<()> {
         }
         Commands::Node { mode } => {
             run_node(mode).await?;
+        }
+        Commands::History => {
+            history(&cli.socket).await?;
+        }
+        Commands::Earnings => {
+            earnings_history(&cli.socket).await?;
+        }
+        Commands::Speedtest => {
+            speedtest(&cli.socket).await?;
+        }
+        Commands::Bandwidth { limit } => {
+            bandwidth_cmd(&cli.socket, limit).await?;
+        }
+        Commands::Key { action } => {
+            key_cmd(&cli.socket, action).await?;
         }
         Commands::Dev { action } => {
             run_dev(action);
@@ -621,11 +687,168 @@ async fn request(
 }
 
 // ============================================================================
+// New Feature Commands
+// ============================================================================
+
+async fn history(socket: &PathBuf) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+    let result = client.get_connection_history().await?;
+
+    println!("Connection History");
+    println!("==================");
+
+    if result.entries.is_empty() {
+        println!("No connection history yet.");
+        return Ok(());
+    }
+
+    println!("{:<4} {:<20} {:<12} {:<12} {:<12}", "ID", "Connected", "Duration", "Sent", "Received");
+    println!("{}", "-".repeat(60));
+
+    for entry in &result.entries {
+        let duration = entry.duration_secs
+            .map(|d| format!("{}s", d))
+            .unwrap_or_else(|| "active".to_string());
+        println!("{:<4} {:<20} {:<12} {:<12} {:<12}",
+            entry.id,
+            entry.connected_at,
+            duration,
+            format_bytes(entry.bytes_sent),
+            format_bytes(entry.bytes_received),
+        );
+    }
+
+    println!("\n{} connection(s)", result.entries.len());
+    Ok(())
+}
+
+async fn earnings_history(socket: &PathBuf) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+    let result = client.get_earnings_history().await?;
+
+    println!("Earnings History");
+    println!("================");
+
+    if result.entries.is_empty() {
+        println!("No earnings yet.");
+        return Ok(());
+    }
+
+    println!("{:<4} {:<12} {:<10} {:<12} {:<8}", "ID", "Timestamp", "Type", "Credits", "Shards");
+    println!("{}", "-".repeat(50));
+
+    for entry in &result.entries {
+        println!("{:<4} {:<12} {:<10} {:<12} {:<8}",
+            entry.id,
+            entry.timestamp,
+            entry.entry_type,
+            entry.credits_earned,
+            entry.shards_count,
+        );
+    }
+
+    println!("\n{} earning(s)", result.entries.len());
+    Ok(())
+}
+
+async fn speedtest(socket: &PathBuf) -> Result<()> {
+    println!("Running speed test...");
+
+    let client = IpcClient::new(socket.clone());
+    let result = client.run_speed_test().await?;
+
+    println!("Speed Test Results");
+    println!("==================");
+    println!("Download:  {:.1} Mbps", result.result.download_mbps);
+    println!("Upload:    {:.1} Mbps", result.result.upload_mbps);
+    println!("Latency:   {} ms", result.result.latency_ms);
+    println!("Jitter:    {} ms", result.result.jitter_ms);
+
+    Ok(())
+}
+
+async fn bandwidth_cmd(socket: &PathBuf, limit: Option<u64>) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+
+    match limit {
+        Some(0) => {
+            client.set_bandwidth_limit(None).await?;
+            println!("Bandwidth limit removed (unlimited)");
+        }
+        Some(kbps) => {
+            client.set_bandwidth_limit(Some(kbps)).await?;
+            println!("Bandwidth limit set to {} kbps ({:.1} Mbps)", kbps, kbps as f64 / 1000.0);
+        }
+        None => {
+            println!("Usage: tunnelcraft bandwidth <limit_kbps>");
+            println!("  Set to 0 to remove limit");
+            println!("  Example: tunnelcraft bandwidth 5000  (5 Mbps)");
+        }
+    }
+
+    Ok(())
+}
+
+async fn key_cmd(socket: &PathBuf, action: KeyAction) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+
+    match action {
+        KeyAction::Export { path, password } => {
+            let result = client.export_key(&path, &password).await?;
+            println!("Key exported to: {}", result.path);
+            println!("Public key: {}", result.public_key);
+        }
+        KeyAction::Import { path, password } => {
+            let result = client.import_key(&path, &password).await?;
+            println!("Key imported successfully");
+            println!("Public key: {}", result.public_key);
+            println!("Note: Restart the daemon to use the new key");
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Daemon
 // ============================================================================
 
-async fn run_daemon() -> Result<()> {
+async fn run_daemon(bootstrap: bool, port: u16) -> Result<()> {
     use tunnelcraft_daemon::{DaemonService, IpcConfig, IpcServer};
+
+    if bootstrap {
+        info!("Starting TunnelCraft BOOTSTRAP node on port {}...", port);
+
+        // In bootstrap mode, run a relay-only node with no exit or settlement
+        let keyfile = PathBuf::from("~/.tunnelcraft/bootstrap.key");
+        let listen = format!("/ip4/0.0.0.0/tcp/{}", port);
+
+        let libp2p_keypair = load_or_generate_libp2p_keypair(&keyfile)
+            .map_err(|e| anyhow::anyhow!("Failed to load keypair: {}", e))?;
+        let peer_id = PeerId::from(libp2p_keypair.public());
+
+        println!("Bootstrap node Peer ID: {}", peer_id);
+        println!("Listening on: {}", listen);
+        println!("Share this address with peers:");
+        println!("  /ip4/<YOUR_PUBLIC_IP>/tcp/{}/p2p/{}", port, peer_id);
+
+        let listen_addr: Multiaddr = listen.parse().context("Invalid listen address")?;
+
+        let config = NodeConfig {
+            node_type: NodeType::Relay,
+            listen_addr,
+            bootstrap_peers: Vec::new(),
+            allow_last_hop: false,
+            request_timeout: Duration::from_secs(30),
+        };
+
+        let mut node_service = NodeService::new(config);
+        node_service.start(libp2p_keypair).await?;
+
+        info!("Bootstrap node running. Press Ctrl+C to stop.");
+        tokio::signal::ctrl_c().await?;
+        return Ok(());
+    }
 
     info!("Starting TunnelCraft daemon...");
 

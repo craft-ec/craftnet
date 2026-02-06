@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "programs/tunnelcraft-settlement",
+]
 members = [
     "crates/core",
     "crates/crypto",
@@ -89,3 +92,6 @@ tunnelcraft-ipc-client = { path = "crates/ipc-client" }
 tunnelcraft-logging = { path = "crates/logging" }
 tunnelcraft-settings = { path = "crates/settings" }
 tunnelcraft-app = { path = "crates/app" }
+
+[profile.release]
+overflow-checks = true

@@ -87,6 +87,9 @@ pub enum ClientError {
     #[error("No exit nodes available")]
     NoExitNodes,
 
+    #[error("No exit nodes available in region: {0}")]
+    NoExitsInRegion(String),
+
     #[error("Invalid response")]
     InvalidResponse,
 

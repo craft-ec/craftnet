@@ -195,6 +195,60 @@ function setupIpcHandlers(): void {
     }
   });
 
+  ipcMain.handle('vpn:getConnectionHistory', async () => {
+    try {
+      const result = await ipcClient?.sendRaw('get_connection_history');
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:getEarningsHistory', async () => {
+    try {
+      const result = await ipcClient?.sendRaw('get_earnings_history');
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:runSpeedTest', async () => {
+    try {
+      const result = await ipcClient?.sendRaw('run_speed_test');
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:setBandwidthLimit', async (_event, limitKbps: number | null) => {
+    try {
+      await ipcClient?.sendRaw('set_bandwidth_limit', { limit_kbps: limitKbps });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:exportKey', async (_event, { path, password }: { path: string; password: string }) => {
+    try {
+      const result = await ipcClient?.sendRaw('export_key', { path, password });
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:importKey', async (_event, { path, password }: { path: string; password: string }) => {
+    try {
+      const result = await ipcClient?.sendRaw('import_key', { path, password });
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
   ipcMain.handle('window:minimize', () => {
     mainWindow?.minimize();
   });

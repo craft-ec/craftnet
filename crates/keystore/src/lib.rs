@@ -15,6 +15,9 @@ mod paths;
 pub use keypair::{
     load_or_generate_libp2p_keypair,
     load_or_generate_signing_keypair,
+    load_or_generate_keypair,
+    default_key_path,
+    save_keypair_bytes,
     KeystoreError,
 };
 pub use paths::{expand_path, default_keystore_dir, default_config_dir};

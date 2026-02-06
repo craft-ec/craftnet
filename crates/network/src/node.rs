@@ -701,7 +701,7 @@ mod tests {
     fn test_default_config() {
         let config = NetworkConfig::default();
         assert!(!config.listen_addrs.is_empty());
-        assert!(config.bootstrap_peers.is_empty());
+        assert!(!config.bootstrap_peers.is_empty());
     }
 
     #[test]

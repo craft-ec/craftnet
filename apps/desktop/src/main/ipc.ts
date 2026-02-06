@@ -138,6 +138,10 @@ export class IPCClient extends EventEmitter {
     return this.call('get_available_exits');
   }
 
+  async sendRaw(method: string, params?: unknown): Promise<unknown> {
+    return this.call(method, params);
+  }
+
   private async call(method: string, params?: unknown): Promise<unknown> {
     if (!this.socket || !this.isConnected) {
       throw new Error('Not connected to daemon');

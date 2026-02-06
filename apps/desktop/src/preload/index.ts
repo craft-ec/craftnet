@@ -40,6 +40,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAvailableExits: () =>
     ipcRenderer.invoke('vpn:getAvailableExits'),
 
+  getConnectionHistory: () =>
+    ipcRenderer.invoke('vpn:getConnectionHistory'),
+
+  getEarningsHistory: () =>
+    ipcRenderer.invoke('vpn:getEarningsHistory'),
+
+  runSpeedTest: () =>
+    ipcRenderer.invoke('vpn:runSpeedTest'),
+
+  setBandwidthLimit: (limitKbps: number | null) =>
+    ipcRenderer.invoke('vpn:setBandwidthLimit', limitKbps),
+
+  exportKey: (path: string, password: string) =>
+    ipcRenderer.invoke('vpn:exportKey', { path, password }),
+
+  importKey: (path: string, password: string) =>
+    ipcRenderer.invoke('vpn:importKey', { path, password }),
+
   // Window operations
   minimize: () =>
     ipcRenderer.invoke('window:minimize'),
@@ -81,6 +99,12 @@ export interface ElectronAPI {
   setExitNode: (region: string, countryCode?: string, city?: string) => Promise<{ success: boolean; error?: string }>;
   setLocalDiscovery: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   getAvailableExits: () => Promise<{ success: boolean; exits?: Array<{ pubkey: string; country_code?: string; city?: string; region: string; score: number; load: number; latency_ms?: number }>; error?: string }>;
+  getConnectionHistory: () => Promise<{ success: boolean; entries?: Array<{ id: number; connected_at: number; disconnected_at?: number; duration_secs?: number; exit_region?: string; bytes_sent: number; bytes_received: number }>; error?: string }>;
+  getEarningsHistory: () => Promise<{ success: boolean; entries?: Array<{ id: number; timestamp: number; entry_type: string; credits_earned: number; shards_count: number }>; error?: string }>;
+  runSpeedTest: () => Promise<{ success: boolean; result?: { download_mbps: number; upload_mbps: number; latency_ms: number; jitter_ms: number; timestamp: number }; error?: string }>;
+  setBandwidthLimit: (limitKbps: number | null) => Promise<{ success: boolean; error?: string }>;
+  exportKey: (path: string, password: string) => Promise<{ success: boolean; path?: string; public_key?: string; error?: string }>;
+  importKey: (path: string, password: string) => Promise<{ success: boolean; public_key?: string; error?: string }>;
   minimize: () => Promise<void>;
   close: () => Promise<void>;
   onStateChange: (callback: (state: string) => void) => () => void;

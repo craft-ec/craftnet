@@ -18,11 +18,13 @@ use libp2p::{Multiaddr, PeerId};
 /// 1. Run `tunnelcraft-node` on a VPS with public IP
 /// 2. Note the peer ID from startup logs
 /// 3. Add the multiaddr below
+/// Devnet bootstrap nodes for the TunnelCraft network.
+///
+/// These can be overridden via settings (`network.bootstrap_peers`).
+/// To run your own bootstrap node: `tunnelcraft daemon --bootstrap`
 pub const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
-    // TODO: Replace with actual bootstrap node addresses once VPS is set up
-    // Example format:
-    // "/ip4/123.45.67.89/tcp/9000/p2p/12D3KooWxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-    // "/ip4/98.76.54.32/tcp/9000/p2p/12D3KooWyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+    // DigitalOcean NYC bootstrap node
+    "/ip4/64.225.12.79/tcp/9000/p2p/12D3KooWMHxq3CkQ1YogRBuCUJJPoSgFSdi3pshqv3zfLxMHS9hq",
 ];
 
 /// Default port for TunnelCraft nodes
@@ -132,8 +134,6 @@ mod tests {
 
     #[test]
     fn test_has_bootstrap_nodes() {
-        // Currently empty, so should be false
-        // Will be true once we add actual addresses
-        assert!(!has_bootstrap_nodes());
+        assert!(has_bootstrap_nodes());
     }
 }

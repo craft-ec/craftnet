@@ -477,6 +477,18 @@ pub struct TunnelCraftNode {
 
     /// Whether mDNS local discovery is enabled
     local_discovery_enabled: bool,
+
+    /// Bandwidth limit in kbps (None = unlimited)
+    bandwidth_limit_kbps: Option<u64>,
+
+    /// Client's preferred exit region (Auto = any region)
+    exit_preference_region: ExitRegion,
+
+    /// Client's preferred exit country code (e.g., "US", "DE")
+    exit_preference_country: Option<String>,
+
+    /// Client's preferred exit city
+    exit_preference_city: Option<String>,
 }
 
 impl TunnelCraftNode {
@@ -518,6 +530,10 @@ impl TunnelCraftNode {
             exit_downlink_kbps: 0,
             start_time: std::time::Instant::now(),
             local_discovery_enabled: true,
+            bandwidth_limit_kbps: None,
+            exit_preference_region: ExitRegion::Auto,
+            exit_preference_country: None,
+            exit_preference_city: None,
         })
     }
 
@@ -859,17 +875,47 @@ impl TunnelCraftNode {
         }
     }
 
-    /// Select the best available exit (online, lowest score)
+    /// Select the best available exit (online, lowest score, matching geo preference)
     ///
     /// Score combines: load (20%), latency (30%), throughput (50%)
-    /// Lower score = better exit
+    /// Lower score = better exit.
+    /// When a geo preference is set (region != Auto, or country/city specified),
+    /// only exits matching the preference are considered.
     fn select_best_exit(&mut self) {
-        let best = self
+        let has_geo_preference = self.exit_preference_region != ExitRegion::Auto
+            || self.exit_preference_country.is_some()
+            || self.exit_preference_city.is_some();
+
+        let candidates = self
             .exit_nodes
             .values()
             .filter(|s| s.online)
-            .min_by_key(|s| s.score)
-            .map(|s| s.info.clone());
+            .filter(|s| {
+                if !has_geo_preference {
+                    return true;
+                }
+                // Filter by region if set
+                if self.exit_preference_region != ExitRegion::Auto
+                    && s.info.region != self.exit_preference_region
+                {
+                    return false;
+                }
+                // Filter by country if set
+                if let Some(ref pref_country) = self.exit_preference_country {
+                    if s.info.country_code.as_deref() != Some(pref_country.as_str()) {
+                        return false;
+                    }
+                }
+                // Filter by city if set
+                if let Some(ref pref_city) = self.exit_preference_city {
+                    if s.info.city.as_deref() != Some(pref_city.as_str()) {
+                        return false;
+                    }
+                }
+                true
+            });
+
+        let best = candidates.min_by_key(|s| s.score).map(|s| s.info.clone());
 
         if let Some(exit) = best {
             let status = self.exit_nodes.get(&exit.pubkey);
@@ -882,6 +928,12 @@ impl TunnelCraftNode {
                 status.and_then(|s| s.measured_downlink_kbps),
             );
             self.selected_exit = Some(exit);
+        } else if has_geo_preference {
+            warn!(
+                "No exits available matching preference: region={:?}, country={:?}, city={:?}",
+                self.exit_preference_region, self.exit_preference_country, self.exit_preference_city
+            );
+            self.selected_exit = None;
         } else {
             warn!("No online exits available");
             self.selected_exit = None;
@@ -984,6 +1036,23 @@ impl TunnelCraftNode {
         if self.connected && self.config.enable_exit {
             self.announce_as_exit();
         }
+    }
+
+    /// Set preferred exit node geography for client mode
+    ///
+    /// When set, `select_best_exit()` only considers exits matching these criteria.
+    /// Set region to `ExitRegion::Auto` and country/city to `None` to clear the preference.
+    pub fn set_exit_preference(&mut self, region: ExitRegion, country_code: Option<String>, city: Option<String>) {
+        info!(
+            "Exit preference set: region={:?}, country={:?}, city={:?}",
+            region, country_code, city
+        );
+        self.exit_preference_region = region;
+        self.exit_preference_country = country_code;
+        self.exit_preference_city = city;
+
+        // Re-select exit with new preference
+        self.select_best_exit();
     }
 
     /// Check if connected
@@ -1769,9 +1838,9 @@ impl TunnelCraftNode {
                 exit_info.region, exit_info.country_code, exit_info.city, EXIT_BASE_SCORE
             );
 
-            // Auto-select first exit if none selected
+            // Auto-select best exit if none selected (respects geo preference)
             if self.selected_exit.is_none() {
-                self.selected_exit = Some(exit_info);
+                self.select_best_exit();
             }
         } else {
             // Existing exit - update DHT timestamp
@@ -1886,6 +1955,12 @@ impl TunnelCraftNode {
     /// Check if local discovery is enabled
     pub fn local_discovery_enabled(&self) -> bool {
         self.local_discovery_enabled
+    }
+
+    /// Set bandwidth limit in kbps (None = unlimited)
+    pub fn set_bandwidth_limit(&mut self, limit_kbps: Option<u64>) {
+        self.bandwidth_limit_kbps = limit_kbps;
+        info!("Bandwidth limit set to: {:?} kbps", limit_kbps);
     }
 }
 

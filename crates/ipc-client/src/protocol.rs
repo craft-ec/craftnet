@@ -144,6 +144,69 @@ pub struct AvailableExitsResult {
     pub exits: Vec<ExitNodeInfo>,
 }
 
+/// Connection history entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionHistoryEntry {
+    pub id: u64,
+    pub connected_at: u64,
+    pub disconnected_at: Option<u64>,
+    pub duration_secs: Option<u64>,
+    pub exit_region: Option<String>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+/// Result of the `get_connection_history` method
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectionHistoryResult {
+    pub entries: Vec<ConnectionHistoryEntry>,
+}
+
+/// Earnings history entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EarningsEntry {
+    pub id: u64,
+    pub timestamp: u64,
+    pub entry_type: String,
+    pub credits_earned: u64,
+    pub shards_count: u64,
+}
+
+/// Result of the `get_earnings_history` method
+#[derive(Debug, Clone, Deserialize)]
+pub struct EarningsHistoryResult {
+    pub entries: Vec<EarningsEntry>,
+}
+
+/// Speed test result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedTestResult {
+    pub download_mbps: f64,
+    pub upload_mbps: f64,
+    pub latency_ms: u64,
+    pub jitter_ms: u64,
+    pub timestamp: u64,
+}
+
+/// Result of the `run_speed_test` method
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeedTestResponse {
+    pub result: SpeedTestResult,
+}
+
+/// Key export result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyExportResult {
+    pub path: String,
+    pub public_key: String,
+}
+
+/// Key import result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyImportResult {
+    pub public_key: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

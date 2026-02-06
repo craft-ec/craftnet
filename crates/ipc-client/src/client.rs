@@ -9,8 +9,9 @@ use tokio::net::UnixStream;
 use tracing::debug;
 
 use crate::protocol::{
-    AvailableExitsResult, ConnectParams, ConnectResult, CreditsResult, NodeStatsResult,
-    RequestResult, RpcRequest, RpcResponse, StatusResult,
+    AvailableExitsResult, ConnectParams, ConnectResult, ConnectionHistoryResult, CreditsResult,
+    EarningsHistoryResult, KeyExportResult, KeyImportResult, NodeStatsResult, RequestResult,
+    RpcRequest, RpcResponse, SpeedTestResponse, StatusResult,
 };
 use crate::{IpcError, Result};
 
@@ -248,6 +249,45 @@ impl IpcClient {
     /// Get available exit nodes
     pub async fn get_available_exits(&self) -> Result<AvailableExitsResult> {
         let result = self.send_request("get_available_exits", None).await?;
+        serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
+    }
+
+    /// Get connection history
+    pub async fn get_connection_history(&self) -> Result<ConnectionHistoryResult> {
+        let result = self.send_request("get_connection_history", None).await?;
+        serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
+    }
+
+    /// Get earnings history
+    pub async fn get_earnings_history(&self) -> Result<EarningsHistoryResult> {
+        let result = self.send_request("get_earnings_history", None).await?;
+        serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
+    }
+
+    /// Run a speed test
+    pub async fn run_speed_test(&self) -> Result<SpeedTestResponse> {
+        let result = self.send_request("run_speed_test", None).await?;
+        serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
+    }
+
+    /// Set bandwidth limit (in kbps, None to remove limit)
+    pub async fn set_bandwidth_limit(&self, limit_kbps: Option<u64>) -> Result<()> {
+        let params = serde_json::json!({ "limit_kbps": limit_kbps });
+        self.send_request("set_bandwidth_limit", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Export private key (encrypted with password)
+    pub async fn export_key(&self, path: &str, password: &str) -> Result<KeyExportResult> {
+        let params = serde_json::json!({ "path": path, "password": password });
+        let result = self.send_request("export_key", Some(params)).await?;
+        serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
+    }
+
+    /// Import private key (decrypted with password)
+    pub async fn import_key(&self, path: &str, password: &str) -> Result<KeyImportResult> {
+        let params = serde_json::json!({ "path": path, "password": password });
+        let result = self.send_request("import_key", Some(params)).await?;
         serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
     }
 }

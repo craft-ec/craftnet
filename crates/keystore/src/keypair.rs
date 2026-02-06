@@ -130,6 +130,31 @@ pub fn load_or_generate_signing_keypair(keyfile: &Path) -> Result<SigningKeypair
     Ok(keypair)
 }
 
+/// Get the default signing key path
+pub fn default_key_path() -> std::path::PathBuf {
+    crate::paths::default_keystore_dir().join("signing.key")
+}
+
+/// Load or generate a signing keypair from the default path
+pub fn load_or_generate_keypair(keyfile: &Path) -> Result<SigningKeypair, KeystoreError> {
+    load_or_generate_signing_keypair(keyfile)
+}
+
+/// Save raw keypair bytes to a file
+pub fn save_keypair_bytes(keyfile: &Path, secret: &[u8; 32]) -> Result<(), KeystoreError> {
+    let path = expand_path(keyfile);
+
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(KeystoreError::CreateDirError)?;
+        }
+    }
+
+    std::fs::write(&path, secret).map_err(KeystoreError::WriteError)?;
+    info!("Saved keypair to {:?}", path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

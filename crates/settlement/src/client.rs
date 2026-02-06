@@ -74,6 +74,13 @@ impl SettlementConfig {
         }
     }
 
+    /// Devnet program ID for TunnelCraft settlement
+    /// Program: 2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH
+    pub const DEVNET_PROGRAM_ID: [u8; 32] = [
+        20, 219, 24, 53, 50, 190, 161, 233, 43, 183, 226, 86, 179, 16, 135, 37,
+        125, 140, 196, 11, 102, 112, 243, 189, 110, 247, 244, 195, 28, 128, 17, 116,
+    ];
+
     /// Create a live configuration for Solana devnet
     pub fn devnet(program_id: [u8; 32]) -> Self {
         Self {
@@ -82,6 +89,11 @@ impl SettlementConfig {
             program_id,
             ..Default::default()
         }
+    }
+
+    /// Create a live configuration for Solana devnet with the default program ID
+    pub fn devnet_default() -> Self {
+        Self::devnet(Self::DEVNET_PROGRAM_ID)
     }
 
     /// Create a live configuration for Solana mainnet
