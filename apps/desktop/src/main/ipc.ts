@@ -105,8 +105,24 @@ export class IPCClient extends EventEmitter {
     await this.call('set_privacy_level', { level });
   }
 
-  async purchaseCredits(amount: number): Promise<void> {
-    await this.call('purchase_credits', { amount });
+  async purchaseCredits(amount: number): Promise<unknown> {
+    return this.call('purchase_credits', { amount });
+  }
+
+  async getCredits(): Promise<unknown> {
+    return this.call('get_credits');
+  }
+
+  async getNodeStats(): Promise<unknown> {
+    return this.call('get_node_stats');
+  }
+
+  async setMode(mode: string): Promise<void> {
+    await this.call('set_mode', { mode });
+  }
+
+  async request(method: string, url: string, body?: string, headers?: Record<string, string>): Promise<unknown> {
+    return this.call('request', { method, url, body, headers });
   }
 
   private async call(method: string, params?: unknown): Promise<unknown> {

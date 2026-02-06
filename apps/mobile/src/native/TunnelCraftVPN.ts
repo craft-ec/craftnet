@@ -1,5 +1,7 @@
 import {NativeModules, NativeEventEmitter, Platform} from 'react-native';
 
+type NodeMode = 'client' | 'node' | 'both';
+
 // Native module interface
 interface TunnelCraftVPNModule {
   // Connection
@@ -13,6 +15,8 @@ interface TunnelCraftVPNModule {
   // Configuration
   setPrivacyLevel(level: PrivacyLevel): Promise<void>;
   setCredits(credits: number): Promise<void>;
+  setMode(mode: string): Promise<void>;
+  purchaseCredits(amount: number): Promise<{ balance: number }>;
 
   // Constants
   getConstants(): {
@@ -120,6 +124,20 @@ export const TunnelCraftVPN = {
    */
   async setCredits(credits: number): Promise<void> {
     return NativeVPN.setCredits(credits);
+  },
+
+  /**
+   * Set node mode (client, node, or both)
+   */
+  async setMode(mode: NodeMode): Promise<void> {
+    return NativeVPN.setMode(mode);
+  },
+
+  /**
+   * Purchase credits using mock settlement
+   */
+  async purchaseCredits(amount: number): Promise<{ balance: number }> {
+    return NativeVPN.purchaseCredits(amount);
   },
 
   /**

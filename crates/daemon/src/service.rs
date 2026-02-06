@@ -87,6 +87,7 @@ enum NodeCommand {
     },
     GetStatus(oneshot::Sender<NodeStatusInfo>),
     GetStats(oneshot::Sender<ClientNodeStats>),
+    SetMode(NodeMode, oneshot::Sender<std::result::Result<(), String>>),
 }
 
 /// Node status info (simpler version for channel communication)
@@ -319,6 +320,34 @@ impl DaemonService {
         Ok(balance)
     }
 
+    /// Set node mode at runtime
+    pub async fn set_mode(&self, mode_str: &str) -> Result<()> {
+        let mode = match mode_str {
+            "client" => NodeMode::Client,
+            "node" => NodeMode::Node,
+            "both" => NodeMode::Both,
+            _ => return Err(crate::DaemonError::InvalidRequest(
+                format!("Unknown mode: {}. Use client, node, or both", mode_str)
+            )),
+        };
+
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(NodeCommand::SetMode(mode, reply_tx)).await
+                .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
+
+            drop(cmd_tx);
+
+            reply_rx.await
+                .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
+                .map_err(|e| crate::DaemonError::SdkError(e))?;
+        }
+
+        info!("Node mode set to: {}", mode_str);
+        Ok(())
+    }
+
     /// Set privacy level for the next connection
     pub async fn set_privacy_level(&self, level: &str) -> Result<()> {
         let hop_mode = match level {
@@ -419,6 +448,10 @@ async fn run_node_task(
                     Some(NodeCommand::GetStats(reply)) => {
                         let _ = reply.send(node.stats());
                     }
+                    Some(NodeCommand::SetMode(mode, reply)) => {
+                        node.set_mode(mode);
+                        let _ = reply.send(Ok(()));
+                    }
                     None => {
                         info!("Command channel closed, shutting down node task");
                         break;
@@ -512,6 +545,23 @@ impl IpcHandler for DaemonService {
                         .map_err(|e| format!("Set privacy level error: {}", e))?;
 
                     Ok(serde_json::json!({"success": true, "level": params.level}))
+                }
+
+                "set_mode" => {
+                    #[derive(Deserialize)]
+                    struct ModeParams {
+                        mode: String,
+                    }
+
+                    let params: ModeParams = params
+                        .ok_or_else(|| "Missing params".to_string())
+                        .and_then(|p| serde_json::from_value(p)
+                            .map_err(|e| format!("Invalid params: {}", e)))?;
+
+                    self.set_mode(&params.mode).await
+                        .map_err(|e| format!("Set mode error: {}", e))?;
+
+                    Ok(serde_json::json!({"success": true, "mode": params.mode}))
                 }
 
                 "get_node_stats" => {
@@ -876,6 +926,53 @@ mod tests {
         let service = DaemonService::new().unwrap();
         let result = service.set_privacy_level("invalid").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ipc_handler_set_mode() {
+        let service = DaemonService::new().unwrap();
+
+        // Valid modes (without a running node, set_mode is a no-op but should succeed)
+        for mode in ["client", "node", "both"] {
+            let result = service.handle(
+                "set_mode",
+                Some(serde_json::json!({"mode": mode})),
+            ).await;
+            assert!(result.is_ok(), "Failed for mode: {}", mode);
+            let value = result.unwrap();
+            assert!(value["success"].as_bool().unwrap());
+            assert_eq!(value["mode"], mode);
+        }
+
+        // Invalid mode
+        let result = service.handle(
+            "set_mode",
+            Some(serde_json::json!({"mode": "invalid"})),
+        ).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_set_mode_with_running_node() {
+        let service = DaemonService::new().unwrap();
+
+        // Initialize node first
+        service.connect(ConnectParams::default()).await.unwrap();
+
+        // Set mode should work with a running node
+        let result = service.handle(
+            "set_mode",
+            Some(serde_json::json!({"mode": "client"})),
+        ).await;
+        assert!(result.is_ok());
+
+        let result = service.handle(
+            "set_mode",
+            Some(serde_json::json!({"mode": "both"})),
+        ).await;
+        assert!(result.is_ok());
+
+        service.disconnect().await.unwrap();
     }
 
     #[tokio::test]

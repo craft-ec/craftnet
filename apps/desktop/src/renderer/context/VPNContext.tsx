@@ -1,7 +1,8 @@
-import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef, ReactNode } from 'react';
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'disconnecting' | 'error';
 type PrivacyLevel = 'direct' | 'light' | 'standard' | 'paranoid';
+type NodeMode = 'client' | 'node' | 'both';
 
 interface VPNStatus {
   state: ConnectionState;
@@ -20,16 +21,32 @@ interface NetworkStats {
   uptimeSecs: number;
 }
 
+interface NodeStats {
+  shards_relayed: number;
+  requests_exited: number;
+  peers_connected: number;
+  credits_earned: number;
+  credits_spent: number;
+  bytes_sent: number;
+  bytes_received: number;
+  bytes_relayed: number;
+}
+
 interface VPNContextType {
   status: VPNStatus;
   stats: NetworkStats;
+  nodeStats: NodeStats | null;
   privacyLevel: PrivacyLevel;
+  mode: NodeMode;
+  credits: number;
   isLoading: boolean;
   error: string | null;
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   toggle: () => Promise<void>;
   setPrivacyLevel: (level: PrivacyLevel) => Promise<void>;
+  setMode: (mode: NodeMode) => Promise<void>;
+  purchaseCredits: (amount: number) => Promise<void>;
 }
 
 const defaultStatus: VPNStatus = {
@@ -66,9 +83,13 @@ interface VPNProviderProps {
 export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
   const [status, setStatus] = useState<VPNStatus>(defaultStatus);
   const [stats, setStats] = useState<NetworkStats>(defaultStats);
+  const [nodeStats, setNodeStats] = useState<NodeStats | null>(null);
   const [privacyLevel, setPrivacyLevelState] = useState<PrivacyLevel>('standard');
+  const [mode, setModeState] = useState<NodeMode>('both');
+  const [credits, setCreditsState] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const nodeStatsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Subscribe to VPN events
   useEffect(() => {
@@ -151,16 +172,80 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
     }
   }, []);
 
+  const setMode = useCallback(async (newMode: NodeMode) => {
+    try {
+      const result = await window.electronAPI.setMode(newMode);
+      if (result.success) {
+        setModeState(newMode);
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, []);
+
+  const purchaseCredits = useCallback(async (amount: number) => {
+    try {
+      const result = await window.electronAPI.purchaseCredits(amount);
+      if (result.success && result.balance !== undefined) {
+        setCreditsState(result.balance);
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, []);
+
+  // Fetch node stats and credits periodically when connected
+  useEffect(() => {
+    const fetchNodeData = async () => {
+      try {
+        const [statsResult, creditsResult] = await Promise.all([
+          window.electronAPI.getNodeStats(),
+          window.electronAPI.getCredits(),
+        ]);
+        if (statsResult.success && statsResult.stats) {
+          setNodeStats(statsResult.stats as NodeStats);
+        }
+        if (creditsResult.success && creditsResult.credits !== undefined) {
+          setCreditsState(creditsResult.credits);
+        }
+      } catch {
+        // Ignore fetch errors during polling
+      }
+    };
+
+    if (status.state === 'connected') {
+      fetchNodeData();
+      nodeStatsIntervalRef.current = setInterval(fetchNodeData, 5000);
+    } else {
+      if (nodeStatsIntervalRef.current) {
+        clearInterval(nodeStatsIntervalRef.current);
+        nodeStatsIntervalRef.current = null;
+      }
+      setNodeStats(null);
+    }
+
+    return () => {
+      if (nodeStatsIntervalRef.current) {
+        clearInterval(nodeStatsIntervalRef.current);
+      }
+    };
+  }, [status.state]);
+
   const value: VPNContextType = {
     status,
     stats,
+    nodeStats,
     privacyLevel,
+    mode,
+    credits,
     isLoading,
     error,
     connect,
     disconnect,
     toggle,
     setPrivacyLevel,
+    setMode,
+    purchaseCredits,
   };
 
   return <VPNContext.Provider value={value}>{children}</VPNContext.Provider>;

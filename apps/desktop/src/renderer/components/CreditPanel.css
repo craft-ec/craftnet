@@ -1,0 +1,79 @@
+.credit-panel {
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.credit-panel .panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text-secondary);
+}
+
+.credit-balance {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.balance-display {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.balance-amount {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.balance-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.purchase-row {
+  display: flex;
+  gap: 8px;
+}
+
+.credit-input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid transparent;
+  color: var(--text-primary);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.credit-input:focus {
+  border-color: var(--accent);
+}
+
+.credit-input::placeholder {
+  color: var(--text-muted);
+}
+
+.buy-button {
+  padding: 8px 16px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  transition: opacity 0.15s ease;
+}
+
+.buy-button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.buy-button:disabled {
+  opacity: 0.5;
+}

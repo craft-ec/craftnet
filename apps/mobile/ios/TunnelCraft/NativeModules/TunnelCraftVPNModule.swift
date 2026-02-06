@@ -303,6 +303,48 @@ class TunnelCraftVPNModule: RCTEventEmitter {
         resolve(nil)
     }
 
+    @objc(setMode:withResolver:withRejecter:)
+    func setMode(
+        _ mode: String,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        // Development mode: just accept the mode
+        if isDevelopmentMode {
+            resolve(nil)
+            return
+        }
+
+        // In production, delegate to UniFFI node's set_mode
+        // The TunnelCraftVpn client wraps the unified node
+        vpnClient?.setMode(mode: mode)
+        resolve(nil)
+    }
+
+    @objc(purchaseCredits:withResolver:withRejecter:)
+    func purchaseCredits(
+        _ amount: NSNumber,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        let creditAmount = amount.uint64Value
+
+        // Development mode: simulate purchase
+        if isDevelopmentMode {
+            mockCredits += creditAmount
+            resolve(["balance": mockCredits])
+            return
+        }
+
+        // In production, use mock settlement through UniFFI bindings
+        do {
+            let newBalance = try vpnClient?.purchaseCredits(amount: creditAmount) ?? creditAmount
+            resolve(["balance": newBalance])
+        } catch {
+            reject("E_PURCHASE_FAILED", error.localizedDescription, error)
+        }
+    }
+
     @objc(getStats:withRejecter:)
     func getStats(
         resolver resolve: @escaping RCTPromiseResolveBlock,

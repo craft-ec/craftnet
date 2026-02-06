@@ -109,6 +109,31 @@ class TunnelCraftVPNModule(reactContext: ReactApplicationContext) :
         promise.resolve(null)
     }
 
+    @ReactMethod
+    fun setMode(mode: String, promise: Promise) {
+        val prefs = reactApplicationContext.getSharedPreferences("tunnelcraft", Context.MODE_PRIVATE)
+        prefs.edit().putString("node_mode", mode).apply()
+        // In production, this would call through JNI to TunnelCraftUnifiedNode.set_mode()
+        promise.resolve(null)
+    }
+
+    @ReactMethod
+    fun purchaseCredits(amount: Double, promise: Promise) {
+        try {
+            val prefs = reactApplicationContext.getSharedPreferences("tunnelcraft", Context.MODE_PRIVATE)
+            val currentCredits = prefs.getLong("credits", 0)
+            val newBalance = currentCredits + amount.toLong()
+            prefs.edit().putLong("credits", newBalance).apply()
+
+            val result = Arguments.createMap().apply {
+                putDouble("balance", newBalance.toDouble())
+            }
+            promise.resolve(result)
+        } catch (e: Exception) {
+            promise.reject("E_PURCHASE_FAILED", e.message, e)
+        }
+    }
+
     // Required for RN event emitter
     @ReactMethod
     fun addListener(eventName: String) {

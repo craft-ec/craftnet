@@ -16,6 +16,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setPrivacyLevel: (level: string) =>
     ipcRenderer.invoke('vpn:setPrivacyLevel', level),
 
+  purchaseCredits: (amount: number) =>
+    ipcRenderer.invoke('vpn:purchaseCredits', amount),
+
+  getCredits: () =>
+    ipcRenderer.invoke('vpn:getCredits'),
+
+  getNodeStats: () =>
+    ipcRenderer.invoke('vpn:getNodeStats'),
+
+  setMode: (mode: string) =>
+    ipcRenderer.invoke('vpn:setMode', mode),
+
+  request: (method: string, url: string, body?: string, headers?: Record<string, string>) =>
+    ipcRenderer.invoke('vpn:request', { method, url, body, headers }),
+
   // Window operations
   minimize: () =>
     ipcRenderer.invoke('window:minimize'),
@@ -49,6 +64,11 @@ export interface ElectronAPI {
   disconnect: () => Promise<{ success: boolean; error?: string }>;
   getStatus: () => Promise<{ success: boolean; status?: unknown; error?: string }>;
   setPrivacyLevel: (level: string) => Promise<{ success: boolean; error?: string }>;
+  purchaseCredits: (amount: number) => Promise<{ success: boolean; balance?: number; error?: string }>;
+  getCredits: () => Promise<{ success: boolean; credits?: number; error?: string }>;
+  getNodeStats: () => Promise<{ success: boolean; stats?: unknown; error?: string }>;
+  setMode: (mode: string) => Promise<{ success: boolean; error?: string }>;
+  request: (method: string, url: string, body?: string, headers?: Record<string, string>) => Promise<{ success: boolean; status?: number; body?: string; error?: string }>;
   minimize: () => Promise<void>;
   close: () => Promise<void>;
   onStateChange: (callback: (state: string) => void) => () => void;

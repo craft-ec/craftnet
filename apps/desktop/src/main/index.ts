@@ -7,6 +7,7 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let daemonManager: DaemonManager | null = null;
 let ipcClient: IPCClient | null = null;
+let isQuitting = false;
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -35,7 +36,7 @@ async function createWindow(): Promise<void> {
   }
 
   mainWindow.on('close', (e) => {
-    if (!app.isQuitting) {
+    if (!isQuitting) {
       e.preventDefault();
       mainWindow?.hide();
     }
@@ -59,7 +60,7 @@ function createTray(): void {
     { label: 'Disconnect', click: () => ipcClient?.disconnect() },
     { type: 'separator' },
     { label: 'Quit', click: () => {
-      app.isQuitting = true;
+      isQuitting = true;
       app.quit();
     }},
   ]);
@@ -84,7 +85,7 @@ async function startDaemon(): Promise<void> {
 function setupIpcHandlers(): void {
   ipcMain.handle('vpn:connect', async (_event, config) => {
     try {
-      await ipcClient?.connect(config);
+      await ipcClient?.vpnConnect(config);
       return { success: true };
     } catch (error) {
       return { success: false, error: (error as Error).message };
@@ -93,7 +94,7 @@ function setupIpcHandlers(): void {
 
   ipcMain.handle('vpn:disconnect', async () => {
     try {
-      await ipcClient?.disconnect();
+      await ipcClient?.vpnDisconnect();
       return { success: true };
     } catch (error) {
       return { success: false, error: (error as Error).message };
@@ -113,6 +114,51 @@ function setupIpcHandlers(): void {
     try {
       await ipcClient?.setPrivacyLevel(level);
       return { success: true };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:purchaseCredits', async (_event, amount) => {
+    try {
+      const result = await ipcClient?.purchaseCredits(amount);
+      return { success: true, ...(result as object) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:getCredits', async () => {
+    try {
+      const result = await ipcClient?.getCredits();
+      return { success: true, ...(result as object) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:getNodeStats', async () => {
+    try {
+      const result = await ipcClient?.getNodeStats();
+      return { success: true, stats: result };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:setMode', async (_event, mode) => {
+    try {
+      await ipcClient?.setMode(mode);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:request', async (_event, { method, url, body, headers }) => {
+    try {
+      const result = await ipcClient?.request(method, url, body, headers);
+      return { success: true, ...(result as object) };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }
@@ -168,9 +214,3 @@ app.on('before-quit', async () => {
   await ipcClient?.disconnect();
   await daemonManager?.stop();
 });
-
-declare module 'electron' {
-  interface App {
-    isQuitting?: boolean;
-  }
-}

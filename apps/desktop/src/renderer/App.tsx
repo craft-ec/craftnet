@@ -4,6 +4,8 @@ import { TitleBar } from './components/TitleBar';
 import { StatusCard } from './components/StatusCard';
 import { ConnectButton } from './components/ConnectButton';
 import { PrivacyLevelSelector } from './components/PrivacyLevelSelector';
+import { ModeSelector } from './components/ModeSelector';
+import { CreditPanel } from './components/CreditPanel';
 import { StatsPanel } from './components/StatsPanel';
 import './styles/App.css';
 
@@ -15,7 +17,9 @@ const App: React.FC = () => {
         <main className="main-content">
           <StatusCard />
           <ConnectButton />
+          <ModeSelector />
           <PrivacyLevelSelector />
+          <CreditPanel />
           <StatsPanel />
         </main>
       </div>

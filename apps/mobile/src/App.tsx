@@ -8,14 +8,14 @@ import React from 'react';
 import { View, StyleSheet } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { TunnelProvider } from './context/TunnelContext';
-import { HomeScreen } from './screens/HomeScreen';
+import { AppNavigator } from './navigation/AppNavigator';
 
 function App() {
   return (
     <View style={styles.root}>
       <SafeAreaProvider>
         <TunnelProvider>
-          <HomeScreen />
+          <AppNavigator />
         </TunnelProvider>
       </SafeAreaProvider>
     </View>

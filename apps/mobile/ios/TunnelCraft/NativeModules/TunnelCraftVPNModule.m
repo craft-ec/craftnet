@@ -27,4 +27,12 @@ RCT_EXTERN_METHOD(setCredits:(nonnull NSNumber *)credits
 RCT_EXTERN_METHOD(getStats:(RCTPromiseResolveBlock)resolve
                   withRejecter:(RCTPromiseRejectBlock)reject)
 
+RCT_EXTERN_METHOD(setMode:(NSString *)mode
+                  withResolver:(RCTPromiseResolveBlock)resolve
+                  withRejecter:(RCTPromiseRejectBlock)reject)
+
+RCT_EXTERN_METHOD(purchaseCredits:(nonnull NSNumber *)amount
+                  withResolver:(RCTPromiseResolveBlock)resolve
+                  withRejecter:(RCTPromiseRejectBlock)reject)
+
 @end
