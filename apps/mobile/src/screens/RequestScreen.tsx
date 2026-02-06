@@ -20,7 +20,7 @@ import { theme, modeColors } from '../theme';
 import { typography, spacing, radius } from '../theme/typography';
 import { useTunnel } from '../context/TunnelContext';
 
-type HttpMethod = 'GET' | 'POST';
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD';
 
 interface HistoryItem {
   id: number;
@@ -49,7 +49,8 @@ export function RequestScreen() {
     setResponse(null);
 
     try {
-      const res = await request(method, url.trim(), method === 'POST' ? requestBody : undefined);
+      const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
+      const res = await request(method, url.trim(), hasBody ? requestBody : undefined);
       setResponse(res);
 
       const item: HistoryItem = {
@@ -108,8 +109,12 @@ export function RequestScreen() {
           {/* Method Selector */}
           <View style={styles.card}>
             <Text style={styles.cardLabel}>Method</Text>
-            <View style={styles.methodRow}>
-              {(['GET', 'POST'] as HttpMethod[]).map((m) => (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.methodRow}
+            >
+              {(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'] as HttpMethod[]).map((m) => (
                 <Pressable
                   key={m}
                   style={[
@@ -128,7 +133,7 @@ export function RequestScreen() {
                   </Text>
                 </Pressable>
               ))}
-            </View>
+            </ScrollView>
 
             {/* URL Input */}
             <Text style={[styles.cardLabel, { marginTop: spacing.lg }]}>URL</Text>
@@ -145,8 +150,8 @@ export function RequestScreen() {
               onSubmitEditing={handleSend}
             />
 
-            {/* Body Input (POST only) */}
-            {method === 'POST' && (
+            {/* Body Input (POST, PUT, PATCH) */}
+            {(method === 'POST' || method === 'PUT' || method === 'PATCH') && (
               <>
                 <Text style={[styles.cardLabel, { marginTop: spacing.lg }]}>Body</Text>
                 <TextInput
@@ -229,7 +234,11 @@ export function RequestScreen() {
                   <View
                     style={[
                       styles.historyMethod,
-                      item.method === 'POST' && styles.historyMethodPost,
+                      (item.method === 'POST') && styles.historyMethodPost,
+                      (item.method === 'PUT') && styles.historyMethodPut,
+                      (item.method === 'DELETE') && styles.historyMethodDelete,
+                      (item.method === 'PATCH') && styles.historyMethodPatch,
+                      (item.method === 'HEAD') && styles.historyMethodHead,
                     ]}
                   >
                     <Text style={styles.historyMethodText}>{item.method}</Text>
@@ -321,11 +330,12 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   methodButton: {
-    flex: 1,
     paddingVertical: spacing.md,
+    paddingHorizontal: spacing.lg,
     borderRadius: 10,
     backgroundColor: theme.background.secondary,
     alignItems: 'center',
+    minWidth: 72,
   },
   methodButtonText: {
     ...typography.bodyMedium,
@@ -408,6 +418,18 @@ const styles = StyleSheet.create({
   },
   historyMethodPost: {
     backgroundColor: 'rgba(168, 85, 247, 0.15)',
+  },
+  historyMethodPut: {
+    backgroundColor: 'rgba(245, 158, 11, 0.15)',
+  },
+  historyMethodDelete: {
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+  },
+  historyMethodPatch: {
+    backgroundColor: 'rgba(34, 197, 94, 0.15)',
+  },
+  historyMethodHead: {
+    backgroundColor: 'rgba(107, 114, 128, 0.15)',
   },
   historyMethodText: {
     fontSize: 10,

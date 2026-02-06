@@ -5,6 +5,7 @@ import { StatusCard } from './components/StatusCard';
 import { ConnectButton } from './components/ConnectButton';
 import { PrivacyLevelSelector } from './components/PrivacyLevelSelector';
 import { ModeSelector } from './components/ModeSelector';
+import { ExitNodePanel } from './components/ExitNodePanel';
 import { CreditPanel } from './components/CreditPanel';
 import { StatsPanel } from './components/StatsPanel';
 import { RequestPanel } from './components/RequestPanel';
@@ -19,6 +20,7 @@ const App: React.FC = () => {
           <StatusCard />
           <ConnectButton />
           <ModeSelector />
+          <ExitNodePanel />
           <PrivacyLevelSelector />
           <CreditPanel />
           <StatsPanel />

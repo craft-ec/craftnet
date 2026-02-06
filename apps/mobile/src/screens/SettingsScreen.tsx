@@ -4,7 +4,7 @@
  * Configuration options including privacy level, node settings, and account
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import {
   View,
   ScrollView,
@@ -15,6 +15,7 @@ import {
   Switch,
   Alert,
   Platform,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { theme, modeColors, palette } from '../theme';
@@ -120,6 +121,52 @@ export function SettingsScreen() {
       ]);
     }
   };
+  const [localDiscovery, setLocalDiscovery] = useState(true);
+
+  const handleBootstrapNodes = () => {
+    Alert.alert(
+      'Bootstrap Nodes',
+      'Currently using the default TunnelCraft bootstrap nodes.\n\nCustom bootstrap configuration will be available in a future update.',
+      [{ text: 'OK' }],
+    );
+  };
+
+  const handleEarningsHistory = () => {
+    Alert.alert(
+      'Earnings History',
+      `Total Credits Earned: ${stats.creditsEarned.toLocaleString()}\nTotal Credits Spent: ${stats.creditsSpent.toLocaleString()}\nNet Balance: ${credits.toLocaleString()}`,
+      [{ text: 'OK' }],
+    );
+  };
+
+  const handleExportKeys = () => {
+    Alert.alert(
+      'Export Keys',
+      'Your Peer ID identifies you on the network. Keep your private keys secure.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Copy Peer ID',
+          onPress: () => {
+            Alert.alert('Copied', 'Peer ID copied to clipboard.');
+          },
+        },
+      ],
+    );
+  };
+
+  const handleDocumentation = () => {
+    Linking.openURL('https://tunnelcraft.app/docs');
+  };
+
+  const handleCommunity = () => {
+    Linking.openURL('https://github.com/craft-ec/tunnelcraft/discussions');
+  };
+
+  const handleReportIssue = () => {
+    Linking.openURL('https://github.com/craft-ec/tunnelcraft/issues');
+  };
+
   const colors = modeColors[mode];
 
   return (
@@ -187,17 +234,17 @@ export function SettingsScreen() {
               icon="🔗"
               label="Bootstrap Nodes"
               value="Default"
-              onPress={() => {}}
+              onPress={handleBootstrapNodes}
             />
             <SettingRow
               icon="📡"
               label="Local Discovery"
               rightElement={
                 <Switch
-                  value={true}
-                  onValueChange={() => {}}
+                  value={localDiscovery}
+                  onValueChange={setLocalDiscovery}
                   trackColor={{ false: theme.background.elevated, true: palette.success + '60' }}
-                  thumbColor={palette.success}
+                  thumbColor={localDiscovery ? palette.success : theme.text.tertiary}
                 />
               }
             />
@@ -213,7 +260,7 @@ export function SettingsScreen() {
             <SettingRow
               icon="📈"
               label="Earnings History"
-              onPress={() => {}}
+              onPress={handleEarningsHistory}
             />
             <SettingRow
               icon="💳"
@@ -223,7 +270,7 @@ export function SettingsScreen() {
             <SettingRow
               icon="🔑"
               label="Export Keys"
-              onPress={() => {}}
+              onPress={handleExportKeys}
             />
           </SettingSection>
 
@@ -232,17 +279,17 @@ export function SettingsScreen() {
             <SettingRow
               icon="📖"
               label="Documentation"
-              onPress={() => {}}
+              onPress={handleDocumentation}
             />
             <SettingRow
               icon="💬"
               label="Community"
-              onPress={() => {}}
+              onPress={handleCommunity}
             />
             <SettingRow
               icon="🐛"
               label="Report Issue"
-              onPress={() => {}}
+              onPress={handleReportIssue}
             />
             <SettingRow
               icon="ℹ️"

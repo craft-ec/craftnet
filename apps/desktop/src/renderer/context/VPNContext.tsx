@@ -4,6 +4,17 @@ type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'disconnect
 type PrivacyLevel = 'direct' | 'light' | 'standard' | 'paranoid';
 type NodeMode = 'client' | 'node' | 'both';
 
+export interface ExitNode {
+  id: string;
+  countryCode: string;
+  countryName: string;
+  city: string;
+  region: string;
+  score: number;
+  latencyMs: number;
+  loadPercent: number;
+}
+
 interface VPNStatus {
   state: ConnectionState;
   peerId: string;
@@ -41,6 +52,9 @@ interface VPNContextType {
   credits: number;
   isLoading: boolean;
   error: string | null;
+  exitNode: ExitNode | null;
+  availableExits: ExitNode[];
+  setExitNode: (node: ExitNode) => void;
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   toggle: () => Promise<void>;
@@ -66,6 +80,17 @@ const defaultStats: NetworkStats = {
   uptimeSecs: 0,
 };
 
+const mockAvailableExits: ExitNode[] = [
+  { id: '1', countryCode: 'DE', countryName: 'Germany', city: 'Frankfurt', region: 'eu', score: 28, latencyMs: 45, loadPercent: 35 },
+  { id: '2', countryCode: 'NL', countryName: 'Netherlands', city: 'Amsterdam', region: 'eu', score: 32, latencyMs: 52, loadPercent: 42 },
+  { id: '3', countryCode: 'US', countryName: 'United States', city: 'New York', region: 'na', score: 45, latencyMs: 85, loadPercent: 65 },
+  { id: '4', countryCode: 'JP', countryName: 'Japan', city: 'Tokyo', region: 'ap', score: 58, latencyMs: 180, loadPercent: 55 },
+  { id: '5', countryCode: 'SG', countryName: 'Singapore', city: 'Singapore', region: 'ap', score: 42, latencyMs: 165, loadPercent: 28 },
+  { id: '6', countryCode: 'GB', countryName: 'United Kingdom', city: 'London', region: 'eu', score: 35, latencyMs: 60, loadPercent: 48 },
+  { id: '7', countryCode: 'CH', countryName: 'Switzerland', city: 'Zurich', region: 'eu', score: 22, latencyMs: 40, loadPercent: 20 },
+  { id: '8', countryCode: 'CA', countryName: 'Canada', city: 'Toronto', region: 'na', score: 50, latencyMs: 95, loadPercent: 58 },
+];
+
 const VPNContext = createContext<VPNContextType | null>(null);
 
 export const useVPN = (): VPNContextType => {
@@ -89,6 +114,8 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
   const [credits, setCreditsState] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [exitNode, setExitNode] = useState<ExitNode | null>(mockAvailableExits[0]);
+  const [availableExits] = useState<ExitNode[]>(mockAvailableExits);
   const nodeStatsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Subscribe to VPN events
@@ -240,6 +267,9 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
     credits,
     isLoading,
     error,
+    exitNode,
+    availableExits,
+    setExitNode,
     connect,
     disconnect,
     toggle,

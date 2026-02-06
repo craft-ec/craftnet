@@ -2,7 +2,7 @@ import React, { useState, useCallback } from 'react';
 import { useVPN } from '../context/VPNContext';
 import './RequestPanel.css';
 
-type HttpMethod = 'GET' | 'POST';
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD';
 
 interface RequestHistoryItem {
   id: number;
@@ -33,10 +33,11 @@ export const RequestPanel: React.FC = () => {
     setResponse(null);
 
     try {
+      const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
       const result = await window.electronAPI.request(
         method,
         url.trim(),
-        method === 'POST' ? requestBody : undefined,
+        hasBody ? requestBody : undefined,
       );
 
       if (!result.success) {
@@ -90,7 +91,7 @@ export const RequestPanel: React.FC = () => {
       <h3 className="panel-title">HTTP Request</h3>
 
       <div className="method-selector">
-        {(['GET', 'POST'] as HttpMethod[]).map((m) => (
+        {(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'] as HttpMethod[]).map((m) => (
           <button
             key={m}
             className={`method-button ${method === m ? 'selected' : ''}`}
@@ -110,7 +111,7 @@ export const RequestPanel: React.FC = () => {
         onKeyDown={(e) => e.key === 'Enter' && handleSend()}
       />
 
-      {method === 'POST' && (
+      {(method === 'POST' || method === 'PUT' || method === 'PATCH') && (
         <textarea
           className="body-input"
           value={requestBody}
