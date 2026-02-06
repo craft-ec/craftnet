@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, info, error};
 
-use tunnelcraft_client::{SDKConfig, TunnelCraftSDK, TunnelResponse};
+use tunnelcraft_client::{NodeConfig, NodeMode, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse};
+use tunnelcraft_core::HopMode;
+use tunnelcraft_settlement::{SettlementClient, SettlementConfig, PurchaseCredits};
 
 use crate::ipc::IpcHandler;
 use crate::Result;
@@ -35,6 +37,37 @@ pub struct StatusResponse {
     pub connected: bool,
     pub credits: u64,
     pub pending_requests: usize,
+    pub peer_count: usize,
+    pub shards_relayed: u64,
+    pub requests_exited: u64,
+}
+
+/// Node stats response for get_node_stats IPC method
+#[derive(Debug, Serialize)]
+pub struct NodeStatsResponse {
+    pub shards_relayed: u64,
+    pub requests_exited: u64,
+    pub peers_connected: usize,
+    pub credits_earned: u64,
+    pub credits_spent: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub bytes_relayed: u64,
+}
+
+impl From<ClientNodeStats> for NodeStatsResponse {
+    fn from(s: ClientNodeStats) -> Self {
+        Self {
+            shards_relayed: s.shards_relayed,
+            requests_exited: s.requests_exited,
+            peers_connected: s.peers_connected,
+            credits_earned: s.credits_earned,
+            credits_spent: s.credits_spent,
+            bytes_sent: s.bytes_sent,
+            bytes_received: s.bytes_received,
+            bytes_relayed: s.bytes_relayed,
+        }
+    }
 }
 
 /// Connect parameters
@@ -43,8 +76,8 @@ pub struct ConnectParams {
     pub hops: Option<u8>,
 }
 
-/// Commands sent to the SDK task
-enum SdkCommand {
+/// Commands sent to the node task
+enum NodeCommand {
     Connect(oneshot::Sender<std::result::Result<(), String>>),
     Disconnect(oneshot::Sender<std::result::Result<(), String>>),
     Request {
@@ -52,50 +85,94 @@ enum SdkCommand {
         url: String,
         reply: oneshot::Sender<std::result::Result<TunnelResponse, String>>,
     },
+    GetStatus(oneshot::Sender<NodeStatusInfo>),
+    GetStats(oneshot::Sender<ClientNodeStats>),
 }
 
-/// SDK status info (simpler version for channel communication)
+/// Node status info (simpler version for channel communication)
 #[derive(Debug, Clone, Default)]
-struct SdkStatusInfo {
+struct NodeStatusInfo {
     connected: bool,
     credits: u64,
     pending_requests: usize,
     peer_count: usize,
+    shards_relayed: u64,
+    requests_exited: u64,
 }
 
 /// Daemon service
 pub struct DaemonService {
     state: Arc<RwLock<DaemonState>>,
-    cmd_tx: Arc<RwLock<Option<mpsc::Sender<SdkCommand>>>>,
-    sdk_status: Arc<RwLock<SdkStatusInfo>>,
+    cmd_tx: Arc<RwLock<Option<mpsc::Sender<NodeCommand>>>>,
+    node_status: Arc<RwLock<NodeStatusInfo>>,
+    /// Privacy level for next connection
+    privacy_level: Arc<RwLock<HopMode>>,
+    /// Event broadcast channel
+    event_tx: broadcast::Sender<String>,
+    /// Mock settlement client for purchase_credits
+    settlement_client: Arc<SettlementClient>,
 }
 
 impl DaemonService {
     /// Create a new daemon service
     pub fn new() -> Result<Self> {
+        let (event_tx, _) = broadcast::channel(64);
+        let settlement_config = SettlementConfig::mock();
+        let settlement_client = Arc::new(SettlementClient::new(settlement_config, [0u8; 32]));
+
         Ok(Self {
             state: Arc::new(RwLock::new(DaemonState::Ready)),
             cmd_tx: Arc::new(RwLock::new(None)),
-            sdk_status: Arc::new(RwLock::new(SdkStatusInfo::default())),
+            node_status: Arc::new(RwLock::new(NodeStatusInfo::default())),
+            privacy_level: Arc::new(RwLock::new(HopMode::Standard)),
+            event_tx,
+            settlement_client,
         })
     }
 
-    /// Initialize and start the SDK in a background task
-    pub async fn init(&self, config: SDKConfig) -> Result<()> {
-        info!("Initializing TunnelCraft SDK...");
+    /// Get the event broadcast sender (for IpcServer to clone)
+    pub fn event_sender(&self) -> broadcast::Sender<String> {
+        self.event_tx.clone()
+    }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SdkCommand>(32);
-        let sdk_status = self.sdk_status.clone();
+    /// Send an event to all connected IPC clients
+    fn send_event(&self, event: &str, data: &serde_json::Value) {
+        let msg = serde_json::json!({"event": event, "data": data});
+        let _ = self.event_tx.send(msg.to_string());
+    }
 
-        // Spawn SDK task
+    /// Set state and broadcast event
+    async fn set_state(&self, new_state: DaemonState) {
+        let mut state = self.state.write().await;
+        *state = new_state;
+        drop(state);
+        let state_str = serde_json::to_value(new_state).unwrap_or_default();
+        self.send_event("state_change", &serde_json::json!({"state": state_str}));
+    }
+
+    /// Initialize and start the node in a background task
+    pub async fn init(&self) -> Result<()> {
+        info!("Initializing TunnelCraft Node...");
+
+        let privacy_level = *self.privacy_level.read().await;
+        let config = NodeConfig {
+            mode: NodeMode::Both,
+            hop_mode: privacy_level,
+            ..Default::default()
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<NodeCommand>(32);
+        let node_status = self.node_status.clone();
+
+        // Spawn node task
         tokio::spawn(async move {
-            if let Err(e) = run_sdk_task(config, cmd_rx, sdk_status).await {
-                error!("SDK task error: {}", e);
+            if let Err(e) = run_node_task(config, cmd_rx, node_status).await {
+                error!("Node task error: {}", e);
             }
         });
 
         *self.cmd_tx.write().await = Some(cmd_tx);
-        info!("SDK task started");
+        info!("Node task started");
         Ok(())
     }
 
@@ -107,48 +184,85 @@ impl DaemonService {
     /// Get status
     pub async fn status(&self) -> StatusResponse {
         let state = *self.state.read().await;
-        let sdk_status = self.sdk_status.read().await;
 
+        // Try to get fresh status from node
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx.send(NodeCommand::GetStatus(reply_tx)).await.is_ok() {
+                drop(cmd_tx);
+                if let Ok(info) = reply_rx.await {
+                    let mut ns = self.node_status.write().await;
+                    *ns = info.clone();
+                    return StatusResponse {
+                        state,
+                        connected: info.connected,
+                        credits: info.credits,
+                        pending_requests: info.pending_requests,
+                        peer_count: info.peer_count,
+                        shards_relayed: info.shards_relayed,
+                        requests_exited: info.requests_exited,
+                    };
+                }
+            }
+        }
+
+        // Fallback to cached status
+        let ns = self.node_status.read().await;
         StatusResponse {
             state,
-            connected: sdk_status.connected,
-            credits: sdk_status.credits,
-            pending_requests: sdk_status.pending_requests,
+            connected: ns.connected,
+            credits: ns.credits,
+            pending_requests: ns.pending_requests,
+            peer_count: ns.peer_count,
+            shards_relayed: ns.shards_relayed,
+            requests_exited: ns.requests_exited,
         }
+    }
+
+    /// Get node stats
+    pub async fn get_node_stats(&self) -> Option<NodeStatsResponse> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx.send(NodeCommand::GetStats(reply_tx)).await.is_ok() {
+                drop(cmd_tx);
+                if let Ok(stats) = reply_rx.await {
+                    return Some(NodeStatsResponse::from(stats));
+                }
+            }
+        }
+        None
     }
 
     /// Connect to VPN
     pub async fn connect(&self, params: ConnectParams) -> Result<()> {
         info!("Connecting to VPN with hops: {:?}", params.hops);
 
-        // Initialize SDK if not already done
+        // Initialize node if not already done
         {
             let cmd_tx = self.cmd_tx.read().await;
             if cmd_tx.is_none() {
                 drop(cmd_tx);
-                self.init(SDKConfig::default()).await?;
+                self.init().await?;
             }
         }
 
-        {
-            let mut state = self.state.write().await;
-            *state = DaemonState::Connecting;
-        }
+        self.set_state(DaemonState::Connecting).await;
 
         let cmd_tx = self.cmd_tx.read().await;
         if let Some(ref tx) = *cmd_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            tx.send(SdkCommand::Connect(reply_tx)).await
-                .map_err(|_| crate::DaemonError::SdkError("SDK channel closed".to_string()))?;
+            tx.send(NodeCommand::Connect(reply_tx)).await
+                .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
 
-            drop(cmd_tx); // Release lock before waiting
+            drop(cmd_tx);
 
             reply_rx.await
-                .map_err(|_| crate::DaemonError::SdkError("SDK reply channel closed".to_string()))?
+                .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
                 .map_err(|e| crate::DaemonError::SdkError(e))?;
 
-            let mut state = self.state.write().await;
-            *state = DaemonState::Connected;
+            self.set_state(DaemonState::Connected).await;
             info!("Connected to VPN");
         }
 
@@ -159,28 +273,22 @@ impl DaemonService {
     pub async fn disconnect(&self) -> Result<()> {
         info!("Disconnecting from VPN");
 
-        {
-            let mut state = self.state.write().await;
-            *state = DaemonState::Disconnecting;
-        }
+        self.set_state(DaemonState::Disconnecting).await;
 
         let cmd_tx = self.cmd_tx.read().await;
         if let Some(ref tx) = *cmd_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            tx.send(SdkCommand::Disconnect(reply_tx)).await
-                .map_err(|_| crate::DaemonError::SdkError("SDK channel closed".to_string()))?;
+            tx.send(NodeCommand::Disconnect(reply_tx)).await
+                .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
 
-            drop(cmd_tx); // Release lock before waiting
+            drop(cmd_tx);
 
             reply_rx.await
-                .map_err(|_| crate::DaemonError::SdkError("SDK reply channel closed".to_string()))?
+                .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
                 .map_err(|e| crate::DaemonError::SdkError(e))?;
         }
 
-        {
-            let mut state = self.state.write().await;
-            *state = DaemonState::Ready;
-        }
+        self.set_state(DaemonState::Ready).await;
 
         info!("Disconnected from VPN");
         Ok(())
@@ -188,7 +296,43 @@ impl DaemonService {
 
     /// Get credit balance
     pub async fn get_credits(&self) -> u64 {
-        self.sdk_status.read().await.credits
+        self.node_status.read().await.credits
+    }
+
+    /// Purchase credits using mock settlement
+    pub async fn purchase_credits(&self, amount: u64) -> Result<u64> {
+        let credit_secret = SettlementClient::generate_credit_secret();
+        let credit_hash = SettlementClient::hash_credit_secret(&credit_secret);
+
+        let purchase = PurchaseCredits {
+            credit_hash,
+            amount,
+        };
+
+        self.settlement_client.purchase_credits(purchase).await
+            .map_err(|e| crate::DaemonError::SdkError(format!("Purchase failed: {}", e)))?;
+
+        let balance = self.settlement_client.verify_credit(credit_hash).await
+            .map_err(|e| crate::DaemonError::SdkError(format!("Verify failed: {}", e)))?;
+
+        info!("Purchased {} credits, new balance: {}", amount, balance);
+        Ok(balance)
+    }
+
+    /// Set privacy level for the next connection
+    pub async fn set_privacy_level(&self, level: &str) -> Result<()> {
+        let hop_mode = match level {
+            "light" => HopMode::Light,
+            "standard" => HopMode::Standard,
+            "paranoid" => HopMode::Paranoid,
+            _ => return Err(crate::DaemonError::InvalidRequest(
+                format!("Unknown privacy level: {}. Use light, standard, or paranoid", level)
+            )),
+        };
+
+        *self.privacy_level.write().await = hop_mode;
+        info!("Privacy level set to: {}", level);
+        Ok(())
     }
 
     /// Make an HTTP request through the tunnel
@@ -196,82 +340,95 @@ impl DaemonService {
         let cmd_tx = self.cmd_tx.read().await;
         if let Some(ref tx) = *cmd_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            tx.send(SdkCommand::Request {
+            tx.send(NodeCommand::Request {
                 method: method.to_string(),
                 url: url.to_string(),
                 reply: reply_tx,
             }).await
-                .map_err(|_| crate::DaemonError::SdkError("SDK channel closed".to_string()))?;
+                .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
 
-            drop(cmd_tx); // Release lock before waiting
+            drop(cmd_tx);
 
             reply_rx.await
-                .map_err(|_| crate::DaemonError::SdkError("SDK reply channel closed".to_string()))?
+                .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
                 .map_err(|e| crate::DaemonError::SdkError(e))
         } else {
-            Err(crate::DaemonError::SdkError("SDK not initialized".to_string()))
+            Err(crate::DaemonError::SdkError("Node not initialized".to_string()))
         }
     }
 }
 
-/// Run the SDK in its own task
-async fn run_sdk_task(
-    config: SDKConfig,
-    mut cmd_rx: mpsc::Receiver<SdkCommand>,
-    status: Arc<RwLock<SdkStatusInfo>>,
+/// Run the node in its own task using TunnelCraftNode
+async fn run_node_task(
+    config: NodeConfig,
+    mut cmd_rx: mpsc::Receiver<NodeCommand>,
+    status: Arc<RwLock<NodeStatusInfo>>,
 ) -> std::result::Result<(), String> {
-    let mut sdk = TunnelCraftSDK::new(config)
-        .await
+    let mut node = TunnelCraftNode::new(config)
         .map_err(|e| e.to_string())?;
 
-    info!("SDK initialized in background task");
+    info!("TunnelCraftNode initialized in background task");
 
     loop {
-        // Update status
-        {
-            let sdk_status = sdk.status();
-            let mut status = status.write().await;
-            status.connected = sdk_status.connected;
-            status.credits = sdk_status.credits;
-            status.pending_requests = sdk_status.pending_requests;
-            status.peer_count = sdk_status.peer_count;
-        }
-
-        // Check for commands (non-blocking)
-        match cmd_rx.try_recv() {
-            Ok(cmd) => {
+        tokio::select! {
+            // Handle commands from the daemon service
+            cmd = cmd_rx.recv() => {
                 match cmd {
-                    SdkCommand::Connect(reply) => {
-                        let result = sdk.connect().await.map_err(|e| e.to_string());
+                    Some(NodeCommand::Connect(reply)) => {
+                        let result = node.start().await.map_err(|e| e.to_string());
+                        // Update status after connect
+                        if result.is_ok() {
+                            let node_status = node.status();
+                            let mut ns = status.write().await;
+                            ns.connected = node_status.connected;
+                            ns.credits = node_status.credits;
+                            ns.peer_count = node_status.peer_count;
+                            ns.shards_relayed = node_status.stats.shards_relayed;
+                            ns.requests_exited = node_status.stats.requests_exited;
+                        }
                         let _ = reply.send(result);
                     }
-                    SdkCommand::Disconnect(reply) => {
-                        sdk.disconnect().await;
+                    Some(NodeCommand::Disconnect(reply)) => {
+                        node.stop().await;
+                        let mut ns = status.write().await;
+                        ns.connected = false;
+                        ns.peer_count = 0;
                         let _ = reply.send(Ok(()));
                     }
-                    SdkCommand::Request { method, url, reply } => {
+                    Some(NodeCommand::Request { method, url, reply }) => {
                         let result = match method.to_uppercase().as_str() {
-                            "GET" => sdk.get(&url).await,
-                            "POST" => sdk.post(&url, Vec::new()).await,
+                            "GET" => node.get(&url).await,
+                            "POST" => node.post(&url, Vec::new()).await,
                             _ => Err(tunnelcraft_client::ClientError::RequestFailed(
                                 format!("Unsupported method: {}", method)
                             )),
                         };
                         let _ = reply.send(result.map_err(|e| e.to_string()));
                     }
+                    Some(NodeCommand::GetStatus(reply)) => {
+                        let node_status = node.status();
+                        let _ = reply.send(NodeStatusInfo {
+                            connected: node_status.connected,
+                            credits: node_status.credits,
+                            pending_requests: 0,
+                            peer_count: node_status.peer_count,
+                            shards_relayed: node_status.stats.shards_relayed,
+                            requests_exited: node_status.stats.requests_exited,
+                        });
+                    }
+                    Some(NodeCommand::GetStats(reply)) => {
+                        let _ = reply.send(node.stats());
+                    }
+                    None => {
+                        info!("Command channel closed, shutting down node task");
+                        break;
+                    }
                 }
             }
-            Err(mpsc::error::TryRecvError::Empty) => {
-                // No command, continue polling network
-            }
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                info!("Command channel closed, shutting down SDK task");
-                break;
-            }
-        }
 
-        // Poll network events briefly
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            // Poll network events
+            _ = node.poll_once() => {}
+        }
     }
 
     Ok(())
@@ -324,8 +481,45 @@ impl IpcHandler for DaemonService {
                 }
 
                 "purchase_credits" => {
-                    // TODO: Implement actual credit purchase
-                    Err("Not implemented".to_string())
+                    #[derive(Deserialize)]
+                    struct PurchaseParams {
+                        amount: Option<u64>,
+                    }
+
+                    let params: PurchaseParams = params
+                        .map(|p| serde_json::from_value(p).unwrap_or(PurchaseParams { amount: None }))
+                        .unwrap_or(PurchaseParams { amount: None });
+
+                    let amount = params.amount.unwrap_or(100);
+                    let balance = self.purchase_credits(amount).await
+                        .map_err(|e| format!("Purchase error: {}", e))?;
+
+                    Ok(serde_json::json!({"success": true, "balance": balance}))
+                }
+
+                "set_privacy_level" => {
+                    #[derive(Deserialize)]
+                    struct PrivacyParams {
+                        level: String,
+                    }
+
+                    let params: PrivacyParams = params
+                        .ok_or_else(|| "Missing params".to_string())
+                        .and_then(|p| serde_json::from_value(p)
+                            .map_err(|e| format!("Invalid params: {}", e)))?;
+
+                    self.set_privacy_level(&params.level).await
+                        .map_err(|e| format!("Set privacy level error: {}", e))?;
+
+                    Ok(serde_json::json!({"success": true, "level": params.level}))
+                }
+
+                "get_node_stats" => {
+                    match self.get_node_stats().await {
+                        Some(stats) => serde_json::to_value(stats)
+                            .map_err(|e| format!("Serialize error: {}", e)),
+                        None => Ok(serde_json::json!({})),
+                    }
                 }
 
                 "request" => {
@@ -368,6 +562,9 @@ mod tests {
             connected: true,
             credits: 1000,
             pending_requests: 5,
+            peer_count: 3,
+            shards_relayed: 42,
+            requests_exited: 7,
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -461,12 +658,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ipc_handler_purchase_credits_not_implemented() {
+    async fn test_ipc_handler_purchase_credits() {
         let service = DaemonService::new().unwrap();
 
-        let result = service.handle("purchase_credits", None).await;
+        let result = service.handle("purchase_credits", Some(serde_json::json!({"amount": 500}))).await;
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert!(value["success"].as_bool().unwrap());
+        assert_eq!(value["balance"], 500);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_handler_set_privacy_level() {
+        let service = DaemonService::new().unwrap();
+
+        // Valid levels
+        for level in ["light", "standard", "paranoid"] {
+            let result = service.handle(
+                "set_privacy_level",
+                Some(serde_json::json!({"level": level})),
+            ).await;
+            assert!(result.is_ok(), "Failed for level: {}", level);
+        }
+
+        // Invalid level
+        let result = service.handle(
+            "set_privacy_level",
+            Some(serde_json::json!({"level": "invalid"})),
+        ).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Not implemented"));
+    }
+
+    #[tokio::test]
+    async fn test_ipc_handler_get_node_stats() {
+        let service = DaemonService::new().unwrap();
+
+        let result = service.handle("get_node_stats", None).await;
+        // Returns empty object when no node is running
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -500,14 +729,12 @@ mod tests {
         service.connect(ConnectParams::default()).await.unwrap();
         service.disconnect().await.unwrap();
 
-        // Give SDK task time to update status
+        // Give node task time to update status
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Status should show Ready state
         let status = service.status().await;
         assert_eq!(status.state, DaemonState::Ready);
-        // Note: connected status comes from SDK which updates async
-        // The daemon state is what we control
     }
 
     #[test]
@@ -546,6 +773,9 @@ mod tests {
             connected: true,
             credits: 12345,
             pending_requests: 42,
+            peer_count: 5,
+            shards_relayed: 100,
+            requests_exited: 10,
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -553,6 +783,7 @@ mod tests {
         assert!(json.contains("\"connected\":true"));
         assert!(json.contains("\"credits\":12345"));
         assert!(json.contains("\"pending_requests\":42"));
+        assert!(json.contains("\"peer_count\":5"));
     }
 
     #[test]
@@ -600,13 +831,11 @@ mod tests {
 
         service.connect(ConnectParams::default()).await.unwrap();
 
-        // Give SDK task time to update status
+        // Give node task time to update status
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        // After connect, credits come from the real SDK (starts at 0 unless topped up)
-        // This tests that we can read credits after connecting
+        // After connect, credits come from the node (starts at 0 unless topped up)
         let credits = service.get_credits().await;
-        // Credits start at 0 in the real SDK
         assert_eq!(credits, 0);
     }
 
@@ -621,11 +850,45 @@ mod tests {
             DaemonState::Stopping,
         ];
 
-        // Each state should be unique
         for i in 0..states.len() {
             for j in (i + 1)..states.len() {
                 assert_ne!(states[i], states[j]);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_set_privacy_level_values() {
+        let service = DaemonService::new().unwrap();
+
+        service.set_privacy_level("light").await.unwrap();
+        assert_eq!(*service.privacy_level.read().await, HopMode::Light);
+
+        service.set_privacy_level("standard").await.unwrap();
+        assert_eq!(*service.privacy_level.read().await, HopMode::Standard);
+
+        service.set_privacy_level("paranoid").await.unwrap();
+        assert_eq!(*service.privacy_level.read().await, HopMode::Paranoid);
+    }
+
+    #[tokio::test]
+    async fn test_set_privacy_level_invalid() {
+        let service = DaemonService::new().unwrap();
+        let result = service.set_privacy_level("invalid").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_event_sender() {
+        let service = DaemonService::new().unwrap();
+        let mut rx = service.event_sender().subscribe();
+
+        service.set_state(DaemonState::Connecting).await;
+
+        let msg = rx.try_recv();
+        assert!(msg.is_ok());
+        let msg = msg.unwrap();
+        assert!(msg.contains("state_change"));
+        assert!(msg.contains("connecting"));
     }
 }

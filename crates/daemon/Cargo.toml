@@ -12,6 +12,7 @@ tunnelcraft-client = { workspace = true }
 tunnelcraft-relay = { workspace = true }
 tunnelcraft-exit = { workspace = true }
 tunnelcraft-network = { workspace = true }
+tunnelcraft-settlement = { workspace = true }
 tokio = { workspace = true }
 libp2p = { workspace = true }
 serde = { workspace = true }

@@ -29,6 +29,7 @@ use tunnelcraft_network::{
     ExitStatusMessage, ExitStatusType, EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
 };
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
+use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
 
 use crate::{ClientError, RawPacketBuilder, RequestBuilder, Result, TunnelResponse};
 
@@ -550,12 +551,17 @@ impl TunnelCraftNode {
                         timeout: self.config.request_timeout,
                         ..Default::default()
                     };
-                    state.exit_handler = Some(ExitHandler::new(
-                        exit_config,
+                    let settlement_config = SettlementConfig::mock();
+                    let settlement_client = Arc::new(SettlementClient::new(
+                        settlement_config,
                         self.keypair.public_key_bytes(),
-                        self.keypair.secret_key_bytes(),
                     ));
-                    info!("Exit handler initialized");
+                    state.exit_handler = Some(ExitHandler::with_keypair_and_settlement(
+                        exit_config,
+                        self.keypair.clone(),
+                        settlement_client,
+                    ));
+                    info!("Exit handler initialized with mock settlement");
                 }
             }
         }
@@ -646,6 +652,13 @@ impl TunnelCraftNode {
 
         // Add and dial bootstrap peers
         let bootstrap_peers = self.config.bootstrap_peers.clone();
+
+        if bootstrap_peers.is_empty() {
+            // No bootstrap peers is OK for first node
+            info!("No bootstrap peers configured, running as bootstrap node");
+            return Ok(());
+        }
+
         for (peer_id, addr) in &bootstrap_peers {
             debug!("Connecting to bootstrap peer: {}", peer_id);
             if let Some(ref mut network) = self.network {
@@ -661,25 +674,16 @@ impl TunnelCraftNode {
         while tokio::time::Instant::now() < deadline {
             let connected = self.network.as_ref().map(|n| n.num_connected()).unwrap_or(0);
             if connected > 0 {
-                break;
+                info!("Connected to {} peers", connected);
+                return Ok(());
             }
             self.poll_once().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        let connected = self.network.as_ref().map(|n| n.num_connected()).unwrap_or(0);
-        if connected > 0 {
-            info!("Connected to {} peers", connected);
-            Ok(())
-        } else if self.config.bootstrap_peers.is_empty() {
-            // No bootstrap peers is OK for first node
-            info!("No bootstrap peers configured, running as bootstrap node");
-            Ok(())
-        } else {
-            Err(ClientError::ConnectionFailed(
-                "Failed to connect to any bootstrap peer".to_string(),
-            ))
-        }
+        Err(ClientError::ConnectionFailed(
+            "Failed to connect to any bootstrap peer".to_string(),
+        ))
     }
 
     /// Stop the node
@@ -1286,7 +1290,7 @@ impl TunnelCraftNode {
         if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
             // In Client mode, only handle response shards for our requests
             if shard.shard_type == ShardType::Response {
-                self.handle_response_shard(shard).await;
+                self.handle_response_shard(shard);
                 return ShardResponse::Accepted;
             }
             return ShardResponse::Rejected("Not in relay mode".to_string());
@@ -1299,7 +1303,7 @@ impl TunnelCraftNode {
             ShardType::Response => {
                 // Check if this is for one of our pending requests
                 if self.pending.contains_key(&shard.request_id) {
-                    self.handle_response_shard(shard).await;
+                    self.handle_response_shard(shard);
                     return ShardResponse::Accepted;
                 }
 
@@ -1454,7 +1458,7 @@ impl TunnelCraftNode {
     }
 
     /// Handle response shard for our own request
-    async fn handle_response_shard(&mut self, shard: Shard) {
+    fn handle_response_shard(&mut self, shard: Shard) {
         if shard.shard_type != ShardType::Response {
             return;
         }
@@ -1475,19 +1479,21 @@ impl TunnelCraftNode {
                 let pending = self.pending.remove(&request_id).unwrap();
                 let response_tx = pending.response_tx.clone();
 
-                match self.reconstruct_response(&pending) {
+                let result = self.reconstruct_response(&pending);
+                match result {
                     Ok(response) => {
                         // Calculate throughput measurements
                         let response_bytes = response.body.len();
                         self.update_exit_measurement(&pending, response_bytes);
 
-                        let mut state = self.state.write();
-                        state.stats.bytes_received += response_bytes as u64;
-                        drop(state);
-                        let _ = response_tx.send(Ok(response)).await;
+                        {
+                            let mut state = self.state.write();
+                            state.stats.bytes_received += response_bytes as u64;
+                        }
+                        let _ = response_tx.try_send(Ok(response));
                     }
                     Err(e) => {
-                        let _ = response_tx.send(Err(e)).await;
+                        let _ = response_tx.try_send(Err(e));
                     }
                 }
             }
@@ -1549,6 +1555,8 @@ impl TunnelCraftNode {
     /// Poll network once (for integration with VPN event loop)
     pub async fn poll_once(&mut self) {
         let Some(ref mut network) = self.network else {
+            // No network: yield to runtime so callers using select! don't busy-spin
+            tokio::time::sleep(Duration::from_millis(100)).await;
             return;
         };
 

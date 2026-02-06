@@ -62,6 +62,7 @@ pub use packet::{RawPacketBuilder, is_raw_packet, parse_raw_packet, RAW_PACKET_M
 
 // Legacy SDK (still available)
 pub use sdk::{SDKConfig, SDKStatus, TunnelCraftSDK, TunnelResponse};
+#[allow(deprecated)]
 pub use session::{ClientConfig, ConnectionState, TunnelCraftClient};
 
 use thiserror::Error;

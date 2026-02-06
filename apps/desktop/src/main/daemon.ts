@@ -1,6 +1,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as net from 'net';
 import { app } from 'electron';
 
 export class DaemonManager {
@@ -60,11 +61,50 @@ export class DaemonManager {
           this.process = null;
         });
 
-        // Give daemon time to start and create socket
-        setTimeout(() => {
-          this.isRunning = true;
-          resolve();
-        }, 1000);
+        // Poll for socket existence + connectivity instead of fixed timeout
+        const socketPath = process.platform === 'darwin'
+          ? '/tmp/tunnelcraft.sock'
+          : (process.env.XDG_RUNTIME_DIR || '/tmp') + '/tunnelcraft.sock';
+        const maxAttempts = 50; // 50 * 100ms = 5 seconds max
+        let attempts = 0;
+
+        const checkSocket = () => {
+          attempts++;
+          if (!fs.existsSync(socketPath)) {
+            if (attempts >= maxAttempts) {
+              this.isRunning = false;
+              reject(new Error('Daemon socket not created within timeout'));
+              return;
+            }
+            setTimeout(checkSocket, 100);
+            return;
+          }
+
+          // Socket file exists, try connecting to verify daemon is listening
+          const client = net.createConnection({ path: socketPath }, () => {
+            client.destroy();
+            this.isRunning = true;
+            resolve();
+          });
+          client.on('error', () => {
+            if (attempts >= maxAttempts) {
+              this.isRunning = false;
+              reject(new Error('Daemon socket exists but not accepting connections'));
+              return;
+            }
+            setTimeout(checkSocket, 100);
+          });
+          // Don't let the check hang
+          client.setTimeout(500, () => {
+            client.destroy();
+            if (attempts < maxAttempts) {
+              setTimeout(checkSocket, 100);
+            }
+          });
+        };
+
+        // Start polling after a brief initial delay
+        setTimeout(checkSocket, 100);
 
       } catch (error) {
         reject(error);

@@ -8,12 +8,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sha2::{Sha256, Digest};
 use tracing::{debug, info, warn};
 
 use tunnelcraft_core::{Shard, Id, PublicKey, ChainEntry, ShardType, CreditProof};
-// Note: encrypt_for_recipient removed - future enhancement would encrypt to user_pubkey
+use tunnelcraft_crypto::{SigningKeypair, sign_shard};
 use tunnelcraft_erasure::ErasureCoder;
 use tunnelcraft_settlement::{SettlementClient, SettleRequest};
 
@@ -59,6 +59,8 @@ struct PendingRequest {
     user_pubkey: PublicKey,
     /// Credit hash for settlement
     credit_hash: Id,
+    /// When this pending request was created
+    created_at: Instant,
 }
 
 /// Exit node handler
@@ -68,10 +70,8 @@ pub struct ExitHandler {
     erasure: ErasureCoder,
     /// Pending requests awaiting more shards
     pending: HashMap<Id, PendingRequest>,
-    /// Our public key for signing responses
-    our_pubkey: PublicKey,
-    /// Our secret key for encrypting responses (for future use)
-    _our_secret: [u8; 32],
+    /// Our signing keypair for signing response shards
+    keypair: SigningKeypair,
     /// Settlement client (optional - for mock/live settlement)
     settlement_client: Option<Arc<SettlementClient>>,
 }
@@ -81,9 +81,9 @@ impl ExitHandler {
     ///
     /// # Arguments
     /// * `config` - Exit configuration
-    /// * `our_pubkey` - Our public key for signing responses
-    /// * `our_secret` - Our secret key for encrypting responses (ECDH)
-    pub fn new(config: ExitConfig, our_pubkey: PublicKey, our_secret: [u8; 32]) -> Self {
+    /// * `our_pubkey` - Our public key for signing responses (kept for backward compat)
+    /// * `our_secret` - Our secret key bytes (used to reconstruct SigningKeypair)
+    pub fn new(config: ExitConfig, _our_pubkey: PublicKey, our_secret: [u8; 32]) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
             .build()
@@ -94,8 +94,24 @@ impl ExitHandler {
             http_client,
             erasure: ErasureCoder::new().expect("Failed to create erasure coder"),
             pending: HashMap::new(),
-            our_pubkey,
-            _our_secret: our_secret,
+            keypair: SigningKeypair::from_secret_bytes(&our_secret),
+            settlement_client: None,
+        }
+    }
+
+    /// Create a new exit handler with a SigningKeypair directly
+    pub fn with_keypair(config: ExitConfig, keypair: SigningKeypair) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .expect("Failed to create HTTP client");
+
+        Self {
+            config,
+            http_client,
+            erasure: ErasureCoder::new().expect("Failed to create erasure coder"),
+            pending: HashMap::new(),
+            keypair,
             settlement_client: None,
         }
     }
@@ -103,7 +119,7 @@ impl ExitHandler {
     /// Create a new exit handler with settlement client
     pub fn with_settlement(
         config: ExitConfig,
-        our_pubkey: PublicKey,
+        _our_pubkey: PublicKey,
         our_secret: [u8; 32],
         settlement_client: Arc<SettlementClient>,
     ) -> Self {
@@ -117,8 +133,28 @@ impl ExitHandler {
             http_client,
             erasure: ErasureCoder::new().expect("Failed to create erasure coder"),
             pending: HashMap::new(),
-            our_pubkey,
-            _our_secret: our_secret,
+            keypair: SigningKeypair::from_secret_bytes(&our_secret),
+            settlement_client: Some(settlement_client),
+        }
+    }
+
+    /// Create a new exit handler with a SigningKeypair and settlement client
+    pub fn with_keypair_and_settlement(
+        config: ExitConfig,
+        keypair: SigningKeypair,
+        settlement_client: Arc<SettlementClient>,
+    ) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .expect("Failed to create HTTP client");
+
+        Self {
+            config,
+            http_client,
+            erasure: ErasureCoder::new().expect("Failed to create erasure coder"),
+            pending: HashMap::new(),
+            keypair,
             settlement_client: Some(settlement_client),
         }
     }
@@ -148,6 +184,7 @@ impl ExitHandler {
                 shards: HashMap::new(),
                 user_pubkey,
                 credit_hash,
+                created_at: Instant::now(),
             }
         });
         pending.shards.insert(shard_index, shard);
@@ -218,7 +255,7 @@ impl ExitHandler {
                 request_chains,
             ).await;
         } else {
-            debug!(
+            warn!(
                 "No credit_proof found for request {}, skipping settlement",
                 hex::encode(&request_id[..8])
             );
@@ -397,21 +434,24 @@ impl ExitHandler {
             let mut shard_id: Id = [0u8; 32];
             shard_id.copy_from_slice(&hash);
 
-            // Create exit signature (placeholder)
-            let exit_signature: [u8; 64] = [0u8; 64];
-            let exit_entry = ChainEntry::new(self.our_pubkey, exit_signature, 3);
+            // Create shard with placeholder entry, then sign properly
+            let placeholder_entry = ChainEntry::new(self.keypair.public_key_bytes(), [0u8; 64], 3);
 
-            let shard = Shard::new_response(
+            let mut shard = Shard::new_response(
                 shard_id,
                 request_id,
                 credit_hash,
                 user_pubkey,
-                exit_entry,
+                placeholder_entry,
                 3,
                 payload,
                 i as u8,
                 total_shards,
             );
+
+            // Replace the placeholder chain entry with a real signature
+            shard.chain.clear();
+            sign_shard(&self.keypair, &mut shard);
 
             shards.push(shard);
         }
@@ -499,21 +539,24 @@ impl ExitHandler {
             let mut shard_id: Id = [0u8; 32];
             shard_id.copy_from_slice(&hash);
 
-            // Create exit signature (placeholder - would use actual signing)
-            let exit_signature: [u8; 64] = [0u8; 64];
-            let exit_entry = ChainEntry::new(self.our_pubkey, exit_signature, 3);
+            // Create shard with placeholder entry, then sign properly
+            let placeholder_entry = ChainEntry::new(self.keypair.public_key_bytes(), [0u8; 64], 3);
 
-            let shard = Shard::new_response(
+            let mut shard = Shard::new_response(
                 shard_id,
                 request_id,
                 credit_hash,
                 user_pubkey,
-                exit_entry,
+                placeholder_entry,
                 3,  // Hops for response
                 payload,
                 i as u8,
                 total_shards,
             );
+
+            // Replace the placeholder chain entry with a real signature
+            shard.chain.clear();
+            sign_shard(&self.keypair, &mut shard);
 
             shards.push(shard);
         }
@@ -533,12 +576,13 @@ impl ExitHandler {
     }
 
     /// Clear stale pending requests older than given duration
-    pub fn clear_stale(&mut self, _max_age: Duration) {
-        // TODO: Track timestamps and clear old entries
-        // For now, just clear all if too many pending
-        if self.pending.len() > 1000 {
-            warn!("Clearing {} stale pending requests", self.pending.len());
-            self.pending.clear();
+    pub fn clear_stale(&mut self, max_age: Duration) {
+        let before = self.pending.len();
+        let now = Instant::now();
+        self.pending.retain(|_, req| now.duration_since(req.created_at) < max_age);
+        let removed = before - self.pending.len();
+        if removed > 0 {
+            warn!("Cleared {} stale pending requests", removed);
         }
     }
 }
@@ -658,5 +702,86 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_millis(100));
         assert_eq!(config.max_request_size, 100);
         assert_eq!(config.max_response_size, 100);
+    }
+
+    #[test]
+    fn test_clear_stale_removes_old_entries() {
+        let keypair = SigningKeypair::generate();
+        let mut handler = ExitHandler::with_keypair(ExitConfig::default(), keypair);
+
+        // Manually insert a pending request
+        handler.pending.insert([1u8; 32], PendingRequest {
+            shards: HashMap::new(),
+            user_pubkey: [0u8; 32],
+            credit_hash: [0u8; 32],
+            created_at: Instant::now() - Duration::from_secs(120),
+        });
+        handler.pending.insert([2u8; 32], PendingRequest {
+            shards: HashMap::new(),
+            user_pubkey: [0u8; 32],
+            credit_hash: [0u8; 32],
+            created_at: Instant::now(),
+        });
+
+        assert_eq!(handler.pending_count(), 2);
+
+        // Clear entries older than 60 seconds
+        handler.clear_stale(Duration::from_secs(60));
+
+        assert_eq!(handler.pending_count(), 1);
+        assert!(handler.pending.contains_key(&[2u8; 32]));
+        assert!(!handler.pending.contains_key(&[1u8; 32]));
+    }
+
+    #[test]
+    fn test_clear_stale_keeps_fresh_entries() {
+        let keypair = SigningKeypair::generate();
+        let mut handler = ExitHandler::with_keypair(ExitConfig::default(), keypair);
+
+        handler.pending.insert([1u8; 32], PendingRequest {
+            shards: HashMap::new(),
+            user_pubkey: [0u8; 32],
+            credit_hash: [0u8; 32],
+            created_at: Instant::now(),
+        });
+
+        handler.clear_stale(Duration::from_secs(60));
+        assert_eq!(handler.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_handler_with_keypair() {
+        let keypair = SigningKeypair::generate();
+        let pubkey = keypair.public_key_bytes();
+        let handler = ExitHandler::with_keypair(ExitConfig::default(), keypair);
+        assert_eq!(handler.keypair.public_key_bytes(), pubkey);
+        assert_eq!(handler.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_response_shards_have_real_signatures() {
+        use tunnelcraft_crypto::verify_chain;
+
+        let keypair = SigningKeypair::generate();
+        let handler = ExitHandler::with_keypair(ExitConfig::default(), keypair);
+
+        // Create response shards with real data
+        let response = HttpResponse::new(200, HashMap::new(), b"Hello".to_vec());
+        let shards = handler.create_response_shards(
+            [1u8; 32],
+            [2u8; 32],
+            [3u8; 32],
+            &response,
+        ).unwrap();
+
+        assert!(!shards.is_empty());
+        for shard in &shards {
+            // Each shard should have exactly one chain entry (exit signature)
+            assert_eq!(shard.chain.len(), 1);
+            // The signature should not be all zeros
+            assert_ne!(shard.chain[0].signature, [0u8; 64]);
+            // The chain should verify correctly
+            assert!(verify_chain(shard).is_ok());
+        }
     }
 }

@@ -15,14 +15,21 @@
 //! - `status` - Get current connection status
 //! - `purchase_credits` - Purchase credits on-chain
 //! - `get_credits` - Get current credit balance
+//!
+//! ## Platform-Specific IPC
+//!
+//! - **macOS/Linux**: Unix domain sockets (`/tmp/tunnelcraft.sock`)
+//! - **Windows**: Named pipes (`\\.\pipe\tunnelcraft`)
 
 mod ipc;
 mod node;
 mod service;
+mod windows_pipe;
 
-pub use ipc::{IpcServer, IpcConfig};
+pub use ipc::{IpcServer, IpcConfig, IpcHandler};
 pub use node::{NodeService, NodeConfig, NodeType, NodeStats};
 pub use service::{DaemonService, DaemonState};
+pub use windows_pipe::{WindowsPipeServer, WindowsPipeConfig};
 
 use thiserror::Error;
 

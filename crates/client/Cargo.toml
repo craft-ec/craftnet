@@ -12,6 +12,7 @@ tunnelcraft-erasure = { workspace = true }
 tunnelcraft-network = { workspace = true }
 tunnelcraft-relay = { workspace = true }
 tunnelcraft-exit = { workspace = true }
+tunnelcraft-settlement = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -12,6 +12,7 @@ tunnelcraft-network = { workspace = true }
 tunnelcraft-relay = { workspace = true }
 tunnelcraft-exit = { workspace = true }
 tunnelcraft-client = { workspace = true }
+tunnelcraft-settlement = { workspace = true }
 tokio = { workspace = true }
 axum = "0.8"
 hyper = { version = "1.0", features = ["full"] }
@@ -27,3 +28,7 @@ path = "shard_flow.rs"
 [[test]]
 name = "full_tunnel_simulation"
 path = "full_tunnel_simulation.rs"
+
+[[test]]
+name = "e2e_tunnel"
+path = "e2e_tunnel.rs"

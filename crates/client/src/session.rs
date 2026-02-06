@@ -50,6 +50,7 @@ struct PendingResponse {
 }
 
 /// TunnelCraft VPN client
+#[deprecated(note = "Use TunnelCraftNode instead")]
 pub struct TunnelCraftClient {
     config: ClientConfig,
     state: ConnectionState,
@@ -67,6 +68,7 @@ pub struct TunnelCraftClient {
     pending: HashMap<Id, PendingResponse>,
 }
 
+#[allow(deprecated)]
 impl TunnelCraftClient {
     /// Create a new client
     pub fn new(config: ClientConfig, user_pubkey: PublicKey) -> Result<Self> {
@@ -265,6 +267,7 @@ impl TunnelCraftClient {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use tunnelcraft_core::ExitRegion;
