@@ -41,7 +41,16 @@ pub use protocol::{
 use thiserror::Error;
 
 /// Default socket path for Unix systems
+#[cfg(unix)]
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/tunnelcraft.sock";
+
+/// Default named pipe path for Windows
+#[cfg(windows)]
+pub const DEFAULT_PIPE_PATH: &str = r"\\.\pipe\tunnelcraft";
+
+/// Default path (platform-appropriate)
+#[cfg(windows)]
+pub const DEFAULT_SOCKET_PATH: &str = r"\\.\pipe\tunnelcraft";
 
 #[derive(Error, Debug)]
 pub enum IpcError {

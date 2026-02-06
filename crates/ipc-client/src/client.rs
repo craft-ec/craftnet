@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tracing::debug;
 
@@ -51,6 +52,16 @@ impl IpcClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
+        self.send_request_impl(method, params).await
+    }
+
+    /// Unix implementation using UnixStream
+    #[cfg(unix)]
+    async fn send_request_impl(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| {
@@ -64,7 +75,45 @@ impl IpcClient {
             })?;
 
         let (reader, mut writer) = stream.into_split();
+        self.send_and_receive(reader, &mut writer, method, params).await
+    }
 
+    /// Windows implementation using Named Pipes
+    #[cfg(windows)]
+    async fn send_request_impl(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let pipe_name = self.socket_path.to_string_lossy();
+        let client = ClientOptions::new()
+            .open(&*pipe_name)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    IpcError::DaemonNotRunning
+                } else {
+                    IpcError::ConnectionFailed(e.to_string())
+                }
+            })?;
+
+        let (reader, mut writer) = tokio::io::split(client);
+        self.send_and_receive(reader, &mut writer, method, params).await
+    }
+
+    /// Common send/receive logic shared between Unix and Windows
+    async fn send_and_receive<R, W>(
+        &self,
+        reader: R,
+        writer: &mut W,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
         // Build and send request
         let request = RpcRequest::new(method, params, self.next_id());
         let request_json = serde_json::to_string(&request)?;

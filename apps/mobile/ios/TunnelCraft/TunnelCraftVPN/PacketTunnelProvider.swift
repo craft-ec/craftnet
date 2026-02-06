@@ -19,6 +19,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // Split tunneling
     private var splitTunnelMode: String = "exclude" // "include" or "exclude"
     private var splitTunnelRules: [[String: Any]] = []
+    private var dnsCache: [String: [String]] = [:]  // domain -> resolved IPs
 
     // App Group for sharing data with main app
     private let appGroup = "group.com.tunnelcraft.vpn"
@@ -148,10 +149,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             includedRoutes.append(route)
                         }
                     } else if ruleType == "domain", let target = rule["target"] as? String {
-                        // For domains, we'd need DNS resolution or use DNS-based routing
-                        // For now, log that domain-based split tunneling requires DNS integration
-                        os_log("Domain-based split tunneling for '%{public}@' requires DNS integration",
-                               log: log, type: .info, target)
+                        // Resolve domain to IP addresses and add as routes
+                        let resolvedIPs = resolveDomain(target)
+                        for ip in resolvedIPs {
+                            includedRoutes.append(
+                                NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255")
+                            )
+                        }
                     }
                 }
             }
@@ -178,11 +182,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         if let route = parseIPRoute(target) {
                             excludedRoutes.append(route)
                         }
-                    } else if ruleType == "domain" {
-                        // Domain-based exclusion would require DNS interception
-                        if let target = rule["target"] as? String {
-                            os_log("Domain-based split tunneling for '%{public}@' requires DNS integration",
-                                   log: log, type: .info, target)
+                    } else if ruleType == "domain", let target = rule["target"] as? String {
+                        // Resolve domain to IP addresses and add as excluded routes
+                        let resolvedIPs = resolveDomain(target)
+                        for ip in resolvedIPs {
+                            excludedRoutes.append(
+                                NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255")
+                            )
                         }
                     }
                 }
@@ -238,6 +244,57 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ].map { String($0) }.joined(separator: ".")
     }
 
+    // MARK: - DNS Resolution for Split Tunneling
+
+    /// Resolve a domain name to IPv4 addresses, with caching
+    private func resolveDomain(_ domain: String) -> [String] {
+        // Check cache first
+        if let cached = dnsCache[domain] {
+            return cached
+        }
+
+        var ips: [String] = []
+
+        // Use getaddrinfo for synchronous DNS resolution
+        var hints = addrinfo()
+        hints.ai_family = AF_INET    // IPv4 only
+        hints.ai_socktype = SOCK_STREAM
+
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(domain, nil, &hints, &result)
+
+        if status == 0, let addrList = result {
+            var current: UnsafeMutablePointer<addrinfo>? = addrList
+            while let addr = current {
+                if addr.pointee.ai_family == AF_INET,
+                   let sockaddr = addr.pointee.ai_addr {
+                    sockaddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sockaddrIn in
+                        var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                        var inAddr = sockaddrIn.pointee.sin_addr
+                        inet_ntop(AF_INET, &inAddr, &ipBuffer, socklen_t(INET_ADDRSTRLEN))
+                        let ip = String(cString: ipBuffer)
+                        if !ips.contains(ip) {
+                            ips.append(ip)
+                        }
+                    }
+                }
+                current = addr.pointee.ai_next
+            }
+            freeaddrinfo(addrList)
+        } else {
+            os_log("DNS resolution failed for '%{public}@': %{public}@",
+                   log: log, type: .error, domain, String(cString: gai_strerror(status)))
+        }
+
+        if !ips.isEmpty {
+            os_log("Resolved '%{public}@' to %d IPs: %{public}@",
+                   log: log, type: .info, domain, ips.count, ips.joined(separator: ", "))
+            dnsCache[domain] = ips
+        }
+
+        return ips
+    }
+
     // MARK: - Split Tunneling
 
     /// Load split tunnel rules from shared UserDefaults
@@ -256,6 +313,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Reload split tunnel rules and apply new tunnel settings
     private func reloadSplitTunnelRules() {
+        dnsCache.removeAll()
         loadSplitTunnelRules()
 
         // Recreate tunnel settings with new rules

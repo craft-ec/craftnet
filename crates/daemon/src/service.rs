@@ -8,6 +8,7 @@ use tracing::{debug, info, error};
 use tunnelcraft_client::{NodeConfig, NodeMode, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse};
 use tunnelcraft_core::{ExitRegion, HopMode};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig, PurchaseCredits};
+use tunnelcraft_settings::Settings;
 
 use crate::ipc::IpcHandler;
 use crate::Result;
@@ -140,6 +141,8 @@ pub struct DaemonService {
     event_tx: broadcast::Sender<String>,
     /// Mock settlement client for purchase_credits
     settlement_client: Arc<SettlementClient>,
+    /// Persisted settings
+    settings: Arc<RwLock<Settings>>,
 }
 
 impl DaemonService {
@@ -149,15 +152,36 @@ impl DaemonService {
         let settlement_config = SettlementConfig::mock();
         let settlement_client = Arc::new(SettlementClient::new(settlement_config, [0u8; 32]));
 
+        // Load persisted settings (fall back to defaults on error)
+        let settings = Settings::load_or_default().unwrap_or_else(|e| {
+            info!("Failed to load settings, using defaults: {}", e);
+            Settings::default()
+        });
+
+        // Apply loaded settings to initial state
+        let hop_mode = match settings.network.hop_mode {
+            tunnelcraft_settings::HopMode::Direct => HopMode::Direct,
+            tunnelcraft_settings::HopMode::Light => HopMode::Light,
+            tunnelcraft_settings::HopMode::Standard => HopMode::Standard,
+            tunnelcraft_settings::HopMode::Paranoid => HopMode::Paranoid,
+        };
+        let node_mode = match settings.node.mode {
+            tunnelcraft_settings::NodeMode::Disabled => NodeMode::Client,
+            tunnelcraft_settings::NodeMode::Relay => NodeMode::Node,
+            tunnelcraft_settings::NodeMode::Exit => NodeMode::Node,
+            tunnelcraft_settings::NodeMode::Full => NodeMode::Both,
+        };
+
         Ok(Self {
             state: Arc::new(RwLock::new(DaemonState::Ready)),
             cmd_tx: Arc::new(RwLock::new(None)),
             node_status: Arc::new(RwLock::new(NodeStatusInfo::default())),
-            privacy_level: Arc::new(RwLock::new(HopMode::Standard)),
-            node_mode: Arc::new(RwLock::new(NodeMode::Both)),
+            privacy_level: Arc::new(RwLock::new(hop_mode)),
+            node_mode: Arc::new(RwLock::new(node_mode)),
             local_discovery: Arc::new(RwLock::new(true)),
             event_tx,
             settlement_client,
+            settings: Arc::new(RwLock::new(settings)),
         })
     }
 
@@ -386,6 +410,20 @@ impl DaemonService {
         }
 
         *self.node_mode.write().await = mode;
+
+        // Persist mode to settings
+        {
+            let mut settings = self.settings.write().await;
+            settings.node.mode = match mode {
+                NodeMode::Client => tunnelcraft_settings::NodeMode::Disabled,
+                NodeMode::Node => tunnelcraft_settings::NodeMode::Relay,
+                NodeMode::Both => tunnelcraft_settings::NodeMode::Full,
+            };
+            if let Err(e) = settings.save() {
+                debug!("Failed to save settings: {}", e);
+            }
+        }
+
         info!("Node mode set to: {}", mode_str);
         Ok(())
     }
@@ -418,6 +456,21 @@ impl DaemonService {
         };
 
         *self.privacy_level.write().await = hop_mode;
+
+        // Persist to settings
+        {
+            let mut settings = self.settings.write().await;
+            settings.network.hop_mode = match hop_mode {
+                HopMode::Direct => tunnelcraft_settings::HopMode::Direct,
+                HopMode::Light => tunnelcraft_settings::HopMode::Light,
+                HopMode::Standard => tunnelcraft_settings::HopMode::Standard,
+                HopMode::Paranoid => tunnelcraft_settings::HopMode::Paranoid,
+            };
+            if let Err(e) = settings.save() {
+                debug!("Failed to save settings: {}", e);
+            }
+        }
+
         info!("Privacy level set to: {}", level);
         Ok(())
     }
@@ -530,15 +583,15 @@ async fn run_node_task(
                         let _ = reply.send(Ok(()));
                     }
                     Some(NodeCommand::Request { method, url, body, headers, reply }) => {
-                        if let Some(ref hdrs) = headers {
-                            if !hdrs.is_empty() {
-                                debug!("Request includes {} custom headers (passthrough pending SDK support)", hdrs.len());
-                            }
-                        }
+                        // Convert HashMap headers to Vec<(String, String)> for node.fetch()
+                        let header_vec = headers.map(|h| {
+                            h.into_iter().collect::<Vec<(String, String)>>()
+                        });
                         let result = node.fetch(
                             &method.to_uppercase(),
                             &url,
                             body,
+                            header_vec,
                         ).await;
                         let _ = reply.send(result.map_err(|e| e.to_string()));
                     }
@@ -565,9 +618,8 @@ async fn run_node_task(
                         node.set_exit_geo(exit_region, country_code, city);
                         let _ = reply.send(Ok(()));
                     }
-                    Some(NodeCommand::SetLocalDiscovery(_enabled, reply)) => {
-                        // Local discovery is a network-level feature;
-                        // preference is stored but mDNS integration is deferred
+                    Some(NodeCommand::SetLocalDiscovery(enabled, reply)) => {
+                        node.set_local_discovery(enabled);
                         let _ = reply.send(Ok(()));
                     }
                     Some(NodeCommand::GetAvailableExits(reply)) => {

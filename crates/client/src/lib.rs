@@ -46,7 +46,6 @@ mod node;
 mod packet;
 mod request;
 mod sdk;
-mod session;
 
 // Unified node (recommended)
 pub use node::{NodeConfig, NodeMode, NodeStats, NodeStatus, NodeType, TunnelCraftNode};
@@ -62,8 +61,6 @@ pub use packet::{RawPacketBuilder, is_raw_packet, parse_raw_packet, RAW_PACKET_M
 
 // Legacy SDK (still available)
 pub use sdk::{SDKConfig, SDKStatus, TunnelCraftSDK, TunnelResponse};
-#[allow(deprecated)]
-pub use session::{ClientConfig, ConnectionState, TunnelCraftClient};
 
 use thiserror::Error;
 

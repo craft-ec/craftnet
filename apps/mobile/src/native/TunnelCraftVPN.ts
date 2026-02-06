@@ -24,6 +24,9 @@ interface TunnelCraftVPNModule {
   // Exit Node Selection
   selectExit(params: { region: string; countryCode?: string; city?: string }): Promise<void>;
 
+  // Exit Node Discovery
+  getAvailableExits(): Promise<NativeExitNode[]>;
+
   // Stats
   getStats(): Promise<NodeStats>;
 
@@ -79,6 +82,16 @@ export interface NodeStats {
   bytesSent: number;
   bytesReceived: number;
   bytesRelayed: number;
+}
+
+export interface NativeExitNode {
+  pubkey: string;
+  address: string;
+  region: string;
+  country_code: string;
+  city?: string;
+  reputation: number;
+  latency_ms: number;
 }
 
 // Get the native module
@@ -172,6 +185,13 @@ export const TunnelCraftVPN = {
    */
   async selectExit(region: string, countryCode?: string, city?: string): Promise<void> {
     return NativeVPN.selectExit({ region, countryCode, city });
+  },
+
+  /**
+   * Get available exit nodes from the network
+   */
+  async getAvailableExits(): Promise<NativeExitNode[]> {
+    return NativeVPN.getAvailableExits();
   },
 
   /**

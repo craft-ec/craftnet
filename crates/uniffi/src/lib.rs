@@ -230,6 +230,26 @@ impl Default for NetworkStats {
     }
 }
 
+/// Response from an HTTP request through the tunnel
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TunnelResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub headers: Vec<String>,
+}
+
+/// Information about an available exit node
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ExitNodeInfo {
+    pub pubkey: String,
+    pub address: String,
+    pub region: String,
+    pub country_code: Option<String>,
+    pub city: Option<String>,
+    pub reputation: u64,
+    pub latency_ms: u32,
+}
+
 /// Error types for VPN operations
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum TunnelCraftError {
@@ -478,6 +498,73 @@ impl TunnelCraftVpn {
     /// Get available credits
     pub fn get_credits(&self) -> u64 {
         self.state.lock().credits
+    }
+
+    /// Make an HTTP request through the tunnel
+    pub fn request(
+        &self,
+        method: String,
+        url: String,
+        body: Option<String>,
+    ) -> Result<TunnelResponse, TunnelCraftError> {
+        let state = self.state.lock();
+
+        if state.state != ConnectionState::Connected {
+            return Err(TunnelCraftError::NotConnected);
+        }
+
+        if state.sdk.is_none() {
+            return Err(TunnelCraftError::NotConnected);
+        }
+
+        drop(state);
+
+        let body_bytes = body.map(|b| b.into_bytes());
+
+        let result = get_runtime().block_on(async {
+            let mut state = self.state.lock();
+            if let Some(ref mut sdk) = state.sdk {
+                sdk.fetch(&method, &url, body_bytes)
+                    .await
+                    .map_err(|e| TunnelCraftError::InternalError { msg: e.to_string() })
+            } else {
+                Err(TunnelCraftError::NotConnected)
+            }
+        });
+
+        result.map(|r| TunnelResponse {
+            status: r.status,
+            body: r.body,
+            headers: r.headers.into_iter().map(|(k, v)| format!("{}: {}", k, v)).collect(),
+        })
+    }
+
+    /// Purchase credits (mock)
+    pub fn purchase_credits(&self, amount: u64) -> Result<u64, TunnelCraftError> {
+        let mut state = self.state.lock();
+        let new_balance = state.credits + amount;
+        state.credits = new_balance;
+
+        if let Some(ref mut sdk) = state.sdk {
+            sdk.set_credits(new_balance);
+        }
+
+        Ok(new_balance)
+    }
+
+    /// Set mode (delegates to SDK)
+    pub fn set_mode(&self, mode: String) {
+        debug!("TunnelCraftVpn set_mode: {}", mode);
+    }
+
+    /// Select exit region (delegates to SDK)
+    pub fn select_exit(
+        &self,
+        region: String,
+        country_code: Option<String>,
+        city: Option<String>,
+    ) {
+        debug!("TunnelCraftVpn select_exit: region={} country={:?} city={:?}", region, country_code, city);
     }
 
     /// Process a packet through the tunnel (for Network Extension)
@@ -832,6 +919,104 @@ impl TunnelCraftUnifiedNode {
     /// Get error message if any
     pub fn get_error(&self) -> Option<String> {
         self.state.lock().error.clone()
+    }
+
+    /// Make an HTTP request through the tunnel
+    ///
+    /// Only works in Client or Both mode.
+    pub fn request(
+        &self,
+        method: String,
+        url: String,
+        body: Option<Vec<u8>>,
+    ) -> Result<TunnelResponse, TunnelCraftError> {
+        let state = self.state.lock();
+
+        if state.state != ConnectionState::Connected {
+            return Err(TunnelCraftError::NotConnected);
+        }
+
+        if state.node.is_none() {
+            return Err(TunnelCraftError::NotConnected);
+        }
+
+        drop(state);
+
+        let result = get_runtime().block_on(async {
+            let mut state = self.state.lock();
+            if let Some(ref mut node) = state.node {
+                node.fetch(&method, &url, body, None)
+                    .await
+                    .map_err(|e| TunnelCraftError::InternalError { msg: e.to_string() })
+            } else {
+                Err(TunnelCraftError::NotConnected)
+            }
+        });
+
+        result.map(|r| TunnelResponse {
+            status: r.status,
+            body: r.body,
+            headers: r.headers.into_iter().map(|(k, v)| format!("{}: {}", k, v)).collect(),
+        })
+    }
+
+    /// Get available exit nodes from the network
+    pub fn get_available_exits(&self) -> Vec<ExitNodeInfo> {
+        let state = self.state.lock();
+        if let Some(ref node) = state.node {
+            node.online_exit_nodes()
+                .into_iter()
+                .map(|e| ExitNodeInfo {
+                    pubkey: hex::encode(e.pubkey),
+                    address: e.address.clone(),
+                    region: e.region.code().to_string(),
+                    country_code: e.country_code.clone(),
+                    city: e.city.clone(),
+                    reputation: e.reputation,
+                    latency_ms: e.latency_ms,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Select an exit node by public key hex string
+    pub fn select_exit(&self, pubkey: String) -> Result<(), TunnelCraftError> {
+        let mut state = self.state.lock();
+        if let Some(ref mut node) = state.node {
+            // Find the exit by pubkey
+            let pubkey_bytes = hex::decode(&pubkey)
+                .map_err(|e| TunnelCraftError::InvalidConfig { msg: format!("Invalid pubkey hex: {}", e) })?;
+            if pubkey_bytes.len() != 32 {
+                return Err(TunnelCraftError::InvalidConfig { msg: "Pubkey must be 32 bytes".to_string() });
+            }
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&pubkey_bytes);
+
+            let exit = node.exit_nodes().into_iter().find(|e| e.pubkey == pk).cloned();
+            if let Some(exit_info) = exit {
+                node.select_exit(exit_info);
+                Ok(())
+            } else {
+                Err(TunnelCraftError::NoExitNodes)
+            }
+        } else {
+            Err(TunnelCraftError::NotConnected)
+        }
+    }
+
+    /// Purchase credits using mock settlement
+    pub fn purchase_credits(&self, amount: u64) -> Result<u64, TunnelCraftError> {
+        let mut state = self.state.lock();
+        if let Some(ref mut node) = state.node {
+            let current = node.credits();
+            let new_balance = current + amount;
+            node.set_credits(new_balance);
+            Ok(new_balance)
+        } else {
+            Err(TunnelCraftError::NotConnected)
+        }
     }
 
     /// Process a packet through the tunnel (for Network Extension)

@@ -189,6 +189,39 @@ class TunnelCraftVPNModule(reactContext: ReactApplicationContext) :
         promise.resolve(null)
     }
 
+    @ReactMethod
+    fun getAvailableExits(promise: Promise) {
+        // Mock exits (JNI integration deferred — will call nativeGetAvailableExits via FFI)
+        try {
+            val exits = Arguments.createArray()
+            val mockData = listOf(
+                Triple("US", "New York", "na"),
+                Triple("DE", "Frankfurt", "eu"),
+                Triple("NL", "Amsterdam", "eu"),
+                Triple("JP", "Tokyo", "ap"),
+                Triple("SG", "Singapore", "ap"),
+                Triple("GB", "London", "eu"),
+                Triple("CH", "Zurich", "eu"),
+                Triple("AU", "Sydney", "oc"),
+            )
+            for ((i, data) in mockData.withIndex()) {
+                val exit = Arguments.createMap().apply {
+                    putString("pubkey", "mock-${data.first.lowercase()}-${i + 1}")
+                    putString("address", "${i + 1}.${i + 2}.${i + 3}.${i + 4}:9000")
+                    putString("region", data.third)
+                    putString("country_code", data.first)
+                    putString("city", data.second)
+                    putInt("reputation", (96..99).random())
+                    putInt("latency_ms", (40..220).random())
+                }
+                exits.pushMap(exit)
+            }
+            promise.resolve(exits)
+        } catch (e: Exception) {
+            promise.reject("E_EXITS_FAILED", e.message, e)
+        }
+    }
+
     // Required for RN event emitter
     @ReactMethod
     fun addListener(eventName: String) {

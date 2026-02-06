@@ -357,9 +357,9 @@ impl ExitHandler {
 
     /// Handle a raw IP packet
     ///
-    /// This processes raw IP packets for true VPN functionality.
-    /// Currently implements a basic echo for testing - production would
-    /// forward to a TUN interface and capture responses.
+    /// Parses IP header, extracts protocol/destination, and forwards
+    /// TCP or UDP payloads to the actual destination. Constructs a
+    /// response IP packet with the data received back.
     async fn handle_raw_packet(&self, data: &[u8], request_id: &Id) -> Result<Vec<u8>> {
         let raw_packet = self.parse_raw_packet(data)?;
 
@@ -369,14 +369,6 @@ impl ExitHandler {
             hex::encode(&request_id[..8])
         );
 
-        // TODO: Full VPN implementation would:
-        // 1. Write packet to TUN interface
-        // 2. Wait for response on TUN interface
-        // 3. Return response packet
-        //
-        // For now, we forward TCP/UDP to the destination and return the response.
-        // This requires parsing the IP header and implementing raw socket forwarding.
-
         // Parse IP header to get protocol and destination
         if raw_packet.len() < 20 {
             return Err(ExitError::InvalidRequest("IP packet too short".to_string()));
@@ -384,20 +376,138 @@ impl ExitHandler {
 
         let ip_version = (raw_packet[0] >> 4) & 0x0F;
         if ip_version != 4 {
-            // For IPv6 or other protocols, just echo back for now
-            warn!("Non-IPv4 packet (version {}), echoing back", ip_version);
-            return Ok(raw_packet);
+            return Err(ExitError::InvalidRequest(
+                format!("Unsupported IP version: {} (only IPv4 supported)", ip_version),
+            ));
+        }
+
+        let ihl = (raw_packet[0] & 0x0F) as usize * 4;
+        if raw_packet.len() < ihl {
+            return Err(ExitError::InvalidRequest("IP header length exceeds packet".to_string()));
         }
 
         let protocol = raw_packet[9];
-        let dest_ip = format!("{}.{}.{}.{}",
-            raw_packet[16], raw_packet[17], raw_packet[18], raw_packet[19]);
+        let src_ip = std::net::Ipv4Addr::new(
+            raw_packet[12], raw_packet[13], raw_packet[14], raw_packet[15],
+        );
+        let dest_ip = std::net::Ipv4Addr::new(
+            raw_packet[16], raw_packet[17], raw_packet[18], raw_packet[19],
+        );
 
-        debug!("Raw packet: version={}, protocol={}, dest={}", ip_version, protocol, dest_ip);
+        debug!(
+            "Raw packet: version={}, protocol={}, src={}, dest={}",
+            ip_version, protocol, src_ip, dest_ip
+        );
 
-        // For now, echo back the packet (simulated response)
-        // Production implementation needs TUN interface or raw socket forwarding
-        Ok(raw_packet)
+        let timeout_duration = Duration::from_secs(10);
+
+        match protocol {
+            6 => {
+                // TCP
+                if raw_packet.len() < ihl + 4 {
+                    return Err(ExitError::InvalidRequest("TCP header too short".to_string()));
+                }
+                let dest_port = u16::from_be_bytes([raw_packet[ihl], raw_packet[ihl + 1]]);
+                let src_port = u16::from_be_bytes([raw_packet[ihl + 2], raw_packet[ihl + 3]]);
+                let tcp_header_len = ((raw_packet[ihl + 12] >> 4) as usize) * 4;
+                let payload_start = ihl + tcp_header_len;
+                let payload = if raw_packet.len() > payload_start {
+                    &raw_packet[payload_start..]
+                } else {
+                    &[]
+                };
+
+                debug!("TCP {}:{} -> {}:{} ({} bytes payload)", src_ip, src_port, dest_ip, dest_port, payload.len());
+
+                let response_payload = tokio::time::timeout(timeout_duration, async {
+                    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(dest_ip), dest_port);
+                    let mut stream = tokio::net::TcpStream::connect(addr).await
+                        .map_err(|e| ExitError::InvalidRequest(format!("TCP connect failed: {e}")))?;
+
+                    if !payload.is_empty() {
+                        use tokio::io::AsyncWriteExt;
+                        stream.write_all(payload).await
+                            .map_err(|e| ExitError::InvalidRequest(format!("TCP write failed: {e}")))?;
+                    }
+
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 65535];
+                    let n = stream.read(&mut buf).await
+                        .map_err(|e| ExitError::InvalidRequest(format!("TCP read failed: {e}")))?;
+                    buf.truncate(n);
+                    Ok::<Vec<u8>, ExitError>(buf)
+                })
+                .await
+                .map_err(|_| ExitError::Timeout)??;
+
+                // Build response IP packet (swap src/dest, include response payload)
+                Ok(self.build_ip_response(&raw_packet, ihl, &response_payload))
+            }
+            17 => {
+                // UDP
+                if raw_packet.len() < ihl + 8 {
+                    return Err(ExitError::InvalidRequest("UDP header too short".to_string()));
+                }
+                let dest_port = u16::from_be_bytes([raw_packet[ihl], raw_packet[ihl + 1]]);
+                let src_port = u16::from_be_bytes([raw_packet[ihl + 2], raw_packet[ihl + 3]]);
+                let payload = &raw_packet[ihl + 8..];
+
+                debug!("UDP {}:{} -> {}:{} ({} bytes payload)", src_ip, src_port, dest_ip, dest_port, payload.len());
+
+                let response_payload = tokio::time::timeout(timeout_duration, async {
+                    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await
+                        .map_err(|e| ExitError::InvalidRequest(format!("UDP bind failed: {e}")))?;
+                    let dest_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(dest_ip), dest_port);
+                    socket.send_to(payload, dest_addr).await
+                        .map_err(|e| ExitError::InvalidRequest(format!("UDP send failed: {e}")))?;
+
+                    let mut buf = vec![0u8; 65535];
+                    let (n, _) = socket.recv_from(&mut buf).await
+                        .map_err(|e| ExitError::InvalidRequest(format!("UDP recv failed: {e}")))?;
+                    buf.truncate(n);
+                    Ok::<Vec<u8>, ExitError>(buf)
+                })
+                .await
+                .map_err(|_| ExitError::Timeout)??;
+
+                Ok(self.build_ip_response(&raw_packet, ihl, &response_payload))
+            }
+            _ => {
+                Err(ExitError::InvalidRequest(
+                    format!("Unsupported IP protocol: {} (only TCP=6 and UDP=17 supported)", protocol),
+                ))
+            }
+        }
+    }
+
+    /// Build a response IP packet by swapping src/dest addresses
+    /// and attaching the response payload
+    fn build_ip_response(&self, original: &[u8], ihl: usize, payload: &[u8]) -> Vec<u8> {
+        let total_len = ihl + payload.len();
+        let mut response = vec![0u8; total_len];
+
+        // Copy original IP header
+        response[..ihl].copy_from_slice(&original[..ihl]);
+
+        // Swap source and destination IP addresses
+        response[12..16].copy_from_slice(&original[16..20]); // new src = old dest
+        response[16..20].copy_from_slice(&original[12..16]); // new dest = old src
+
+        // Update total length
+        let total_len_u16 = total_len as u16;
+        response[2] = (total_len_u16 >> 8) as u8;
+        response[3] = total_len_u16 as u8;
+
+        // Clear checksum (set to 0 for recalculation by the OS/stack)
+        response[10] = 0;
+        response[11] = 0;
+
+        // Append payload
+        if !payload.is_empty() {
+            response[ihl..].copy_from_slice(payload);
+        }
+
+        response
     }
 
     /// Create response shards for raw packet data

@@ -474,6 +474,9 @@ pub struct TunnelCraftNode {
     exit_downlink_kbps: u32,
     /// Node start time (for uptime calculation)
     start_time: std::time::Instant,
+
+    /// Whether mDNS local discovery is enabled
+    local_discovery_enabled: bool,
 }
 
 impl TunnelCraftNode {
@@ -514,6 +517,7 @@ impl TunnelCraftNode {
             exit_uplink_kbps: 0,
             exit_downlink_kbps: 0,
             start_time: std::time::Instant::now(),
+            local_discovery_enabled: true,
         })
     }
 
@@ -1051,12 +1055,12 @@ impl TunnelCraftNode {
 
     /// Make an HTTP GET request through the tunnel (Client/Both mode)
     pub async fn get(&mut self, url: &str) -> Result<TunnelResponse> {
-        self.fetch("GET", url, None).await
+        self.fetch("GET", url, None, None).await
     }
 
     /// Make an HTTP POST request through the tunnel
     pub async fn post(&mut self, url: &str, body: Vec<u8>) -> Result<TunnelResponse> {
-        self.fetch("POST", url, Some(body)).await
+        self.fetch("POST", url, Some(body), None).await
     }
 
     /// Make an HTTP request through the tunnel
@@ -1065,6 +1069,7 @@ impl TunnelCraftNode {
         method: &str,
         url: &str,
         body: Option<Vec<u8>>,
+        headers: Option<Vec<(String, String)>>,
     ) -> Result<TunnelResponse> {
         // Check mode
         if !matches!(self.mode, NodeMode::Client | NodeMode::Both) {
@@ -1092,6 +1097,11 @@ impl TunnelCraftNode {
 
         // Build request
         let mut builder = RequestBuilder::new(method, url).hop_mode(self.config.hop_mode);
+        if let Some(hdrs) = headers {
+            for (key, value) in hdrs {
+                builder = builder.header(&key, &value);
+            }
+        }
         if let Some(body_data) = body {
             builder = builder.body(body_data);
         }
@@ -1650,6 +1660,10 @@ impl TunnelCraftNode {
                 use libp2p::mdns::Event;
                 match mdns_event {
                     Event::Discovered(peers) => {
+                        if !self.local_discovery_enabled {
+                            debug!("mDNS discovery disabled, ignoring {} peers", peers.len());
+                            return;
+                        }
                         for (peer_id, addr) in peers {
                             debug!("mDNS discovered peer {} at {}", peer_id, addr);
                             if let Some(ref mut network) = self.network {
@@ -1857,6 +1871,21 @@ impl TunnelCraftNode {
     /// Get our own uptime (how long this node has been running)
     pub fn uptime(&self) -> u64 {
         self.start_time.elapsed().as_secs()
+    }
+
+    /// Set whether mDNS local discovery is enabled
+    ///
+    /// When disabled, mDNS-discovered peers are ignored (not added to relay list).
+    /// The mDNS behaviour itself remains active (libp2p doesn't support runtime removal),
+    /// but discovered peers are simply not used.
+    pub fn set_local_discovery(&mut self, enabled: bool) {
+        self.local_discovery_enabled = enabled;
+        info!("Local discovery set to: {}", enabled);
+    }
+
+    /// Check if local discovery is enabled
+    pub fn local_discovery_enabled(&self) -> bool {
+        self.local_discovery_enabled
     }
 }
 

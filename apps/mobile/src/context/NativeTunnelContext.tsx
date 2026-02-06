@@ -21,6 +21,7 @@ import TunnelCraftVPN, {
   VPNStatus,
   NetworkStats,
   VPNConfig,
+  NativeExitNode,
 } from '../native/TunnelCraftVPN';
 import { NodeMode } from '../theme/colors';
 import { TunnelContext, TunnelContextType, AvailableExit } from './TunnelContext';
@@ -137,6 +138,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     { id: '7', countryCode: 'CH', countryName: 'Switzerland', city: 'Zurich', region: 'eu', latencyMs: 122, reputation: 99 },
     { id: '8', countryCode: 'AU', countryName: 'Australia', city: 'Sydney', region: 'oc', latencyMs: 210, reputation: 96 },
   ]);
+  const exitsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const appState = useRef(AppState.currentState);
   const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -214,6 +216,52 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     return () => {
       if (statsIntervalRef.current) {
         clearInterval(statsIntervalRef.current);
+      }
+    };
+  }, [isConnected]);
+
+  // Poll available exits when connected
+  useEffect(() => {
+    if (!isConnected) {
+      if (exitsIntervalRef.current) {
+        clearInterval(exitsIntervalRef.current);
+        exitsIntervalRef.current = null;
+      }
+      return;
+    }
+
+    const countryNames: Record<string, string> = {
+      US: 'United States', DE: 'Germany', NL: 'Netherlands', JP: 'Japan',
+      SG: 'Singapore', GB: 'United Kingdom', CH: 'Switzerland', AU: 'Australia',
+      CA: 'Canada', FR: 'France', SE: 'Sweden', NO: 'Norway', FI: 'Finland',
+      KR: 'South Korea', BR: 'Brazil', IN: 'India', IE: 'Ireland',
+    };
+
+    const pollExits = async () => {
+      try {
+        const nativeExits = await TunnelCraftVPN.getAvailableExits();
+        if (nativeExits && nativeExits.length > 0) {
+          setAvailableExits(nativeExits.map((exit: NativeExitNode, idx: number) => ({
+            id: exit.pubkey || String(idx + 1),
+            countryCode: exit.country_code,
+            countryName: countryNames[exit.country_code] || exit.country_code,
+            city: exit.city,
+            region: (exit.region as ExitRegion) || 'auto',
+            latencyMs: exit.latency_ms,
+            reputation: exit.reputation,
+          })));
+        }
+      } catch {
+        // Keep fallback exits on error
+      }
+    };
+
+    pollExits();
+    exitsIntervalRef.current = setInterval(pollExits, 30000);
+
+    return () => {
+      if (exitsIntervalRef.current) {
+        clearInterval(exitsIntervalRef.current);
       }
     };
   }, [isConnected]);

@@ -450,6 +450,47 @@ class TunnelCraftVPNModule: RCTEventEmitter {
         resolve(nil)
     }
 
+    @objc(getAvailableExits:withRejecter:)
+    func getAvailableExits(
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        // Development mode: return mock exits
+        if isDevelopmentMode {
+            let mockExits: [[String: Any]] = [
+                ["pubkey": "mock-us-1", "address": "1.2.3.4:9000", "region": "na", "country_code": "US", "city": "New York", "reputation": 98, "latency_ms": 45],
+                ["pubkey": "mock-de-1", "address": "5.6.7.8:9000", "region": "eu", "country_code": "DE", "city": "Frankfurt", "reputation": 99, "latency_ms": 120],
+                ["pubkey": "mock-nl-1", "address": "9.10.11.12:9000", "region": "eu", "country_code": "NL", "city": "Amsterdam", "reputation": 97, "latency_ms": 115],
+                ["pubkey": "mock-jp-1", "address": "13.14.15.16:9000", "region": "ap", "country_code": "JP", "city": "Tokyo", "reputation": 97, "latency_ms": 180],
+                ["pubkey": "mock-sg-1", "address": "17.18.19.20:9000", "region": "ap", "country_code": "SG", "city": "Singapore", "reputation": 98, "latency_ms": 165],
+                ["pubkey": "mock-gb-1", "address": "21.22.23.24:9000", "region": "eu", "country_code": "GB", "city": "London", "reputation": 98, "latency_ms": 110],
+                ["pubkey": "mock-ch-1", "address": "25.26.27.28:9000", "region": "eu", "country_code": "CH", "city": "Zurich", "reputation": 99, "latency_ms": 122],
+                ["pubkey": "mock-au-1", "address": "29.30.31.32:9000", "region": "oc", "country_code": "AU", "city": "Sydney", "reputation": 96, "latency_ms": 210],
+            ]
+            resolve(mockExits)
+            return
+        }
+
+        // Production mode: call UniFFI
+        if let client = vpnClient {
+            let exits = client.getAvailableExits()
+            let result = exits.map { exit -> [String: Any] in
+                return [
+                    "pubkey": exit.pubkey,
+                    "address": exit.address,
+                    "region": exit.region,
+                    "country_code": exit.countryCode,
+                    "city": exit.city ?? NSNull(),
+                    "reputation": exit.reputation,
+                    "latency_ms": exit.latencyMs,
+                ]
+            }
+            resolve(result)
+        } else {
+            resolve([])
+        }
+    }
+
     // MARK: - VPN Configuration
 
     private func createVPNConfiguration(_ config: NSDictionary) async throws {

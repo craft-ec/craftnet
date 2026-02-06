@@ -115,6 +115,14 @@ interface TunnelProviderProps {
   children: ReactNode;
 }
 
+// Country code to name mapping
+const countryNames: Record<string, string> = {
+  US: 'United States', DE: 'Germany', NL: 'Netherlands', JP: 'Japan',
+  SG: 'Singapore', GB: 'United Kingdom', CH: 'Switzerland', AU: 'Australia',
+  CA: 'Canada', FR: 'France', SE: 'Sweden', NO: 'Norway', FI: 'Finland',
+  KR: 'South Korea', BR: 'Brazil', IN: 'India', IE: 'Ireland',
+};
+
 // Fallback exit nodes (shown until real discovery populates)
 const fallbackExits: AvailableExit[] = [
   { id: '1', countryCode: 'US', countryName: 'United States', city: 'New York', region: 'na', latencyMs: 45, reputation: 98 },
@@ -132,7 +140,8 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
   const [mode, setModeState] = useState<NodeMode>('both');
   const [privacyLevel, setPrivacyLevelState] = useState<PrivacyLevel>('standard');
   const [exitSelection, setExitSelectionState] = useState<ExitSelection>({ type: 'region', region: 'auto' });
-  const [availableExits] = useState<AvailableExit[]>(fallbackExits);
+  const [availableExits, setAvailableExits] = useState<AvailableExit[]>(fallbackExits);
+  const exitsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [detectedLocation, setDetectedLocation] = useState<DetectedLocation | null>(null);
   const [isDetectingLocation, setIsDetectingLocation] = useState(false);
   const [stats, setStats] = useState<NodeStats>(defaultStats);
@@ -215,6 +224,45 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
     return () => {
       if (uptimeIntervalRef.current) {
         clearInterval(uptimeIntervalRef.current);
+      }
+    };
+  }, [isConnected]);
+
+  // Poll available exits when connected
+  useEffect(() => {
+    if (!isConnected) {
+      if (exitsIntervalRef.current) {
+        clearInterval(exitsIntervalRef.current);
+        exitsIntervalRef.current = null;
+      }
+      return;
+    }
+
+    const pollExits = async () => {
+      try {
+        const nativeExits = await TunnelCraftVPN.getAvailableExits();
+        if (nativeExits && nativeExits.length > 0) {
+          setAvailableExits(nativeExits.map((exit, idx) => ({
+            id: exit.pubkey || String(idx + 1),
+            countryCode: exit.country_code,
+            countryName: countryNames[exit.country_code] || exit.country_code,
+            city: exit.city,
+            region: (exit.region as ExitRegion) || 'auto',
+            latencyMs: exit.latency_ms,
+            reputation: exit.reputation,
+          })));
+        }
+      } catch {
+        // Keep fallback exits on error
+      }
+    };
+
+    pollExits();
+    exitsIntervalRef.current = setInterval(pollExits, 30000);
+
+    return () => {
+      if (exitsIntervalRef.current) {
+        clearInterval(exitsIntervalRef.current);
       }
     };
   }, [isConnected]);
