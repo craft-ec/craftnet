@@ -77,3 +77,31 @@
 .buy-button:disabled {
   opacity: 0.5;
 }
+
+.balance-amount.low {
+  color: var(--warning);
+}
+
+.balance-amount.critical {
+  color: var(--error);
+}
+
+.credit-warning {
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  margin-bottom: 12px;
+}
+
+.credit-warning.low {
+  background: rgba(234, 179, 8, 0.1);
+  color: var(--warning);
+  border: 1px solid rgba(234, 179, 8, 0.2);
+}
+
+.credit-warning.critical {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--error);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}

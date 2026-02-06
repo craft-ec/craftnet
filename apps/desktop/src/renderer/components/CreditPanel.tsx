@@ -24,10 +24,22 @@ export const CreditPanel: React.FC = () => {
       <h3 className="panel-title">Credits</h3>
       <div className="credit-balance">
         <div className="balance-display">
-          <span className="balance-amount">{credits}</span>
+          <span className={`balance-amount ${credits <= 20 ? 'critical' : credits <= 100 ? 'low' : ''}`}>
+            {credits}
+          </span>
           <span className="balance-label">credits</span>
         </div>
       </div>
+      {credits <= 20 && (
+        <div className="credit-warning critical">
+          Credits critically low — top up to continue sending requests
+        </div>
+      )}
+      {credits > 20 && credits <= 100 && (
+        <div className="credit-warning low">
+          Credits running low
+        </div>
+      )}
       <div className="purchase-row">
         <input
           type="number"

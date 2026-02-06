@@ -1,0 +1,139 @@
+.settings-panel {
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.settings-panel .panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text-secondary);
+}
+
+.settings-section {
+  margin-bottom: 14px;
+}
+
+.settings-section:last-child {
+  margin-bottom: 0;
+}
+
+.section-label {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.setting-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.setting-row:last-child {
+  border-bottom: none;
+}
+
+.setting-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-label {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.setting-value {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.setting-value-earned {
+  color: var(--success, #22c55e);
+  font-weight: 600;
+}
+
+.setting-value-mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+}
+
+/* Toggle switch */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+}
+
+.toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-tertiary);
+  border-radius: 10px;
+  transition: background 0.2s ease;
+}
+
+.toggle-slider::before {
+  content: '';
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  bottom: 2px;
+  background: var(--text-muted);
+  border-radius: 50%;
+  transition: all 0.2s ease;
+}
+
+.toggle.on .toggle-slider {
+  background: var(--mode-accent, var(--accent));
+}
+
+.toggle.on .toggle-slider::before {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+.toggle.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* Links */
+.setting-link {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  font-size: 13px;
+  color: var(--text-primary);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+.setting-link:hover {
+  color: var(--mode-accent, var(--accent));
+}
+
+.link-arrow {
+  font-size: 18px;
+  color: var(--text-muted);
+}

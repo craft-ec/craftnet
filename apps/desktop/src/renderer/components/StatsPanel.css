@@ -55,3 +55,44 @@
   font-size: 11px;
   color: var(--text-muted);
 }
+
+/* Earnings Summary */
+.earnings-summary {
+  margin-top: 12px;
+  padding: 12px;
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+}
+
+.earnings-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+}
+
+.earnings-row.earnings-net {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  margin-top: 4px;
+  padding-top: 8px;
+}
+
+.earnings-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.earnings-value {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-secondary);
+}
+
+.earnings-value.earned {
+  color: var(--success);
+}
+
+.earnings-value.spent {
+  color: var(--error);
+}

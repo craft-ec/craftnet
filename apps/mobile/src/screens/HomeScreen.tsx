@@ -131,6 +131,22 @@ export function HomeScreen() {
             </View>
           </View>
 
+          {/* Credit Warning */}
+          {credits <= 20 && (
+            <View style={[styles.creditWarning, styles.creditWarningCritical]}>
+              <Text style={styles.creditWarningText}>
+                Credits critically low — top up to continue sending requests
+              </Text>
+            </View>
+          )}
+          {credits > 20 && credits <= 100 && (
+            <View style={[styles.creditWarning, styles.creditWarningLow]}>
+              <Text style={[styles.creditWarningText, { color: palette.amber[500] }]}>
+                Credits running low
+              </Text>
+            </View>
+          )}
+
           {/* Connection Section - Always expanded by default */}
           <CollapsibleSection
             title="Connection"
@@ -605,6 +621,28 @@ const styles = StyleSheet.create({
     ...typography.bodySmall,
     color: theme.text.tertiary,
     marginTop: 2,
+  },
+
+  creditWarning: {
+    marginHorizontal: spacing.lg,
+    marginBottom: spacing.md,
+    padding: spacing.md,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  creditWarningLow: {
+    backgroundColor: 'rgba(234, 179, 8, 0.08)',
+    borderColor: 'rgba(234, 179, 8, 0.2)',
+  },
+  creditWarningCritical: {
+    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+    borderColor: 'rgba(239, 68, 68, 0.2)',
+  },
+  creditWarningText: {
+    ...typography.bodySmall,
+    color: palette.error,
+    fontWeight: '600',
+    textAlign: 'center',
   },
 
   bottomSpacer: {

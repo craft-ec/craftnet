@@ -1,8 +1,13 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState } from 'react';
 import { useVPN } from '../context/VPNContext';
 import './RequestPanel.css';
 
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD';
+
+interface HeaderEntry {
+  key: string;
+  value: string;
+}
 
 interface RequestHistoryItem {
   id: number;
@@ -13,11 +18,20 @@ interface RequestHistoryItem {
   timestamp: number;
 }
 
+const HOP_COSTS: Record<string, number> = {
+  direct: 0,
+  light: 1,
+  standard: 2,
+  paranoid: 3,
+};
+
 export const RequestPanel: React.FC = () => {
-  const { status } = useVPN();
+  const { status, privacyLevel, credits } = useVPN();
   const [method, setMethod] = useState<HttpMethod>('GET');
   const [url, setUrl] = useState('');
   const [requestBody, setRequestBody] = useState('');
+  const [headers, setHeaders] = useState<HeaderEntry[]>([]);
+  const [showHeaders, setShowHeaders] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [response, setResponse] = useState<{ status: number; body: string } | null>(null);
   const [history, setHistory] = useState<RequestHistoryItem[]>([]);
@@ -27,6 +41,21 @@ export const RequestPanel: React.FC = () => {
     return null;
   }
 
+  const estimatedCost = 1 + (HOP_COSTS[privacyLevel] || 2);
+  const canAfford = credits >= estimatedCost;
+
+  const addHeader = () => {
+    setHeaders((prev) => [...prev, { key: '', value: '' }]);
+  };
+
+  const updateHeader = (index: number, field: 'key' | 'value', val: string) => {
+    setHeaders((prev) => prev.map((h, i) => (i === index ? { ...h, [field]: val } : h)));
+  };
+
+  const removeHeader = (index: number) => {
+    setHeaders((prev) => prev.filter((_, i) => i !== index));
+  };
+
   const handleSend = async () => {
     if (!url.trim()) return;
     setIsLoading(true);
@@ -34,10 +63,18 @@ export const RequestPanel: React.FC = () => {
 
     try {
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
+      const headerObj: Record<string, string> = {};
+      for (const h of headers) {
+        if (h.key.trim()) {
+          headerObj[h.key.trim()] = h.value;
+        }
+      }
+
       const result = await window.electronAPI.request(
         method,
         url.trim(),
         hasBody ? requestBody : undefined,
+        Object.keys(headerObj).length > 0 ? headerObj : undefined,
       );
 
       if (!result.success) {
@@ -111,6 +148,41 @@ export const RequestPanel: React.FC = () => {
         onKeyDown={(e) => e.key === 'Enter' && handleSend()}
       />
 
+      {/* Headers */}
+      <button
+        className="headers-toggle"
+        onClick={() => setShowHeaders(!showHeaders)}
+      >
+        Headers {headers.length > 0 && `(${headers.length})`} {showHeaders ? '▾' : '▸'}
+      </button>
+
+      {showHeaders && (
+        <div className="headers-section">
+          {headers.map((h, i) => (
+            <div key={i} className="header-row">
+              <input
+                className="header-input header-key"
+                value={h.key}
+                onChange={(e) => updateHeader(i, 'key', e.target.value)}
+                placeholder="Key"
+              />
+              <input
+                className="header-input header-value"
+                value={h.value}
+                onChange={(e) => updateHeader(i, 'value', e.target.value)}
+                placeholder="Value"
+              />
+              <button className="header-remove" onClick={() => removeHeader(i)}>
+                &times;
+              </button>
+            </div>
+          ))}
+          <button className="add-header-button" onClick={addHeader}>
+            + Add Header
+          </button>
+        </div>
+      )}
+
       {(method === 'POST' || method === 'PUT' || method === 'PATCH') && (
         <textarea
           className="body-input"
@@ -120,6 +192,15 @@ export const RequestPanel: React.FC = () => {
           rows={3}
         />
       )}
+
+      {/* Cost estimation */}
+      <div className="cost-estimate">
+        <span className="cost-label">Est. cost:</span>
+        <span className={`cost-value ${!canAfford ? 'cost-insufficient' : ''}`}>
+          {estimatedCost} credit{estimatedCost !== 1 ? 's' : ''}
+        </span>
+        {!canAfford && <span className="cost-warning">Insufficient credits</span>}
+      </div>
 
       <button
         className="send-button"

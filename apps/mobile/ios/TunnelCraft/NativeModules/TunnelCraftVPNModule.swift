@@ -354,13 +354,15 @@ class TunnelCraftVPNModule: RCTEventEmitter {
         let method = params["method"] as? String ?? "GET"
         let urlString = params["url"] as? String ?? ""
         let body = params["body"] as? String
+        let headers = params["headers"] as? [String: String]
+        let headerCount = headers?.count ?? 0
 
         // Development mode: return mock response
         if isDevelopmentMode {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 resolve([
                     "status": 200,
-                    "body": "{\"mock\":true,\"method\":\"\(method)\",\"url\":\"\(urlString)\",\"message\":\"Mock response from TunnelCraft\"}"
+                    "body": "{\"mock\":true,\"method\":\"\(method)\",\"url\":\"\(urlString)\",\"headers\":\(headerCount),\"message\":\"Mock response from TunnelCraft\"}"
                 ])
             }
             return

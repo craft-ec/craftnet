@@ -7820,6 +7820,7 @@ dependencies = [
  "tunnelcraft-exit",
  "tunnelcraft-network",
  "tunnelcraft-relay",
+ "tunnelcraft-settlement",
 ]
 
 [[package]]
@@ -7869,6 +7870,7 @@ dependencies = [
  "tunnelcraft-exit",
  "tunnelcraft-network",
  "tunnelcraft-relay",
+ "tunnelcraft-settlement",
 ]
 
 [[package]]
@@ -8007,6 +8009,7 @@ dependencies = [
  "tunnelcraft-exit",
  "tunnelcraft-network",
  "tunnelcraft-relay",
+ "tunnelcraft-settlement",
 ]
 
 [[package]]

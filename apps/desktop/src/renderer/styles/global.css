@@ -18,6 +18,34 @@
   --error: #ef4444;
   --border: rgba(148, 163, 184, 0.2);
   --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+  --mode-accent: #3b82f6;
+  --mode-accent-hover: #2563eb;
+  --mode-glow: rgba(59, 130, 246, 0.15);
+}
+
+/* Mode-based theming */
+.mode-client {
+  --mode-accent: #06b6d4;
+  --mode-accent-hover: #0891b2;
+  --mode-glow: rgba(6, 182, 212, 0.15);
+  --accent: #06b6d4;
+  --accent-hover: #0891b2;
+}
+
+.mode-node {
+  --mode-accent: #f59e0b;
+  --mode-accent-hover: #d97706;
+  --mode-glow: rgba(245, 158, 11, 0.15);
+  --accent: #f59e0b;
+  --accent-hover: #d97706;
+}
+
+.mode-both {
+  --mode-accent: #8b5cf6;
+  --mode-accent-hover: #7c3aed;
+  --mode-glow: rgba(139, 92, 246, 0.15);
+  --accent: #8b5cf6;
+  --accent-hover: #7c3aed;
 }
 
 body {

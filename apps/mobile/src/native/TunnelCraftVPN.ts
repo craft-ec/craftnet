@@ -19,7 +19,7 @@ interface TunnelCraftVPNModule {
   purchaseCredits(amount: number): Promise<{ balance: number }>;
 
   // HTTP Request
-  request(params: { method: string; url: string; body?: string }): Promise<{ status: number; body: string }>;
+  request(params: { method: string; url: string; body?: string; headers?: Record<string, string> }): Promise<{ status: number; body: string }>;
 
   // Constants
   getConstants(): {
@@ -146,8 +146,8 @@ export const TunnelCraftVPN = {
   /**
    * Send an HTTP request through the VPN tunnel
    */
-  async request(method: string, url: string, body?: string): Promise<{ status: number; body: string }> {
-    return NativeVPN.request({ method, url, body });
+  async request(method: string, url: string, body?: string, headers?: Record<string, string>): Promise<{ status: number; body: string }> {
+    return NativeVPN.request({ method, url, body, headers });
   },
 
   /**

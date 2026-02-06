@@ -121,6 +121,28 @@ export const StatsPanel: React.FC = () => {
               </div>
             </div>
           </div>
+
+          {/* Earnings Summary */}
+          <div className="earnings-summary">
+            <div className="earnings-row">
+              <span className="earnings-label">Earned</span>
+              <span className="earnings-value earned">+{nodeStats.credits_earned}</span>
+            </div>
+            <div className="earnings-row">
+              <span className="earnings-label">Spent</span>
+              <span className="earnings-value spent">-{nodeStats.credits_spent}</span>
+            </div>
+            <div className="earnings-row earnings-net">
+              <span className="earnings-label">Net</span>
+              <span className={`earnings-value ${nodeStats.credits_earned - nodeStats.credits_spent >= 0 ? 'earned' : 'spent'}`}>
+                {nodeStats.credits_earned - nodeStats.credits_spent >= 0 ? '+' : ''}{nodeStats.credits_earned - nodeStats.credits_spent}
+              </span>
+            </div>
+            <div className="earnings-row">
+              <span className="earnings-label">Relayed Data</span>
+              <span className="earnings-value">{formatBytes(nodeStats.bytes_relayed)}</span>
+            </div>
+          </div>
         </>
       )}
     </div>

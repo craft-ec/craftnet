@@ -170,3 +170,79 @@
   background: rgba(239, 68, 68, 0.2);
   color: #ef4444;
 }
+
+/* Score Breakdown */
+.score-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 10px;
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+}
+
+.score-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.score-bar-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  width: 50px;
+  flex-shrink: 0;
+}
+
+.score-bar-track {
+  flex: 1;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.score-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.score-bar-value {
+  font-size: 11px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-secondary);
+  width: 30px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* Region Filter */
+.region-filter {
+  display: flex;
+  gap: 4px;
+  margin: 8px 0;
+}
+
+.region-button {
+  flex: 1;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  transition: all 0.15s ease;
+}
+
+.region-button:hover {
+  color: var(--text-secondary);
+}
+
+.region-button.active {
+  background: var(--accent);
+  color: #fff;
+}

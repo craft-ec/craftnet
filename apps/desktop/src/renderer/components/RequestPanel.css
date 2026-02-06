@@ -87,6 +87,126 @@
   color: var(--text-muted);
 }
 
+/* Headers */
+.headers-toggle {
+  width: 100%;
+  padding: 6px 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  margin-bottom: 4px;
+  transition: color 0.15s ease;
+}
+
+.headers-toggle:hover {
+  color: var(--text-secondary);
+}
+
+.headers-section {
+  margin-bottom: 10px;
+}
+
+.header-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+  align-items: center;
+}
+
+.header-input {
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  border: 1px solid transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.header-input:focus {
+  border-color: var(--accent);
+}
+
+.header-input::placeholder {
+  color: var(--text-muted);
+}
+
+.header-key {
+  flex: 2;
+}
+
+.header-value {
+  flex: 3;
+}
+
+.header-remove {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+
+.header-remove:hover {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+
+.add-header-button {
+  width: 100%;
+  padding: 5px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-muted);
+  font-size: 12px;
+  transition: all 0.15s ease;
+}
+
+.add-header-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Cost Estimation */
+.cost-estimate {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.cost-label {
+  color: var(--text-muted);
+}
+
+.cost-value {
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.cost-value.cost-insufficient {
+  color: var(--error);
+}
+
+.cost-warning {
+  color: var(--error);
+  font-size: 11px;
+  font-weight: 600;
+}
+
 .send-button {
   width: 100%;
   padding: 10px;

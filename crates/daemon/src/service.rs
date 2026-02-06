@@ -425,13 +425,11 @@ async fn run_node_task(
                         let _ = reply.send(Ok(()));
                     }
                     Some(NodeCommand::Request { method, url, reply }) => {
-                        let result = match method.to_uppercase().as_str() {
-                            "GET" => node.get(&url).await,
-                            "POST" => node.post(&url, Vec::new()).await,
-                            _ => Err(tunnelcraft_client::ClientError::RequestFailed(
-                                format!("Unsupported method: {}", method)
-                            )),
-                        };
+                        let result = node.fetch(
+                            &method.to_uppercase(),
+                            &url,
+                            None,
+                        ).await;
                         let _ = reply.send(result.map_err(|e| e.to_string()));
                     }
                     Some(NodeCommand::GetStatus(reply)) => {

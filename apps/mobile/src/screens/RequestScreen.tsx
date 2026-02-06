@@ -31,17 +31,34 @@ interface HistoryItem {
   timestamp: number;
 }
 
+interface HeaderEntry {
+  key: string;
+  value: string;
+}
+
+const HOP_COSTS: Record<string, number> = {
+  direct: 0,
+  light: 1,
+  standard: 2,
+  paranoid: 3,
+};
+
 export function RequestScreen() {
-  const { mode, isConnected, request } = useTunnel();
+  const { mode, isConnected, request, privacyLevel, credits } = useTunnel();
   const colors = modeColors[mode];
 
   const [method, setMethod] = useState<HttpMethod>('GET');
   const [url, setUrl] = useState('');
   const [requestBody, setRequestBody] = useState('');
+  const [headers, setHeaders] = useState<HeaderEntry[]>([]);
+  const [showHeaders, setShowHeaders] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [response, setResponse] = useState<{ status: number; body: string } | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [nextId, setNextId] = useState(1);
+
+  const estimatedCost = 1 + (HOP_COSTS[privacyLevel] || 2);
+  const canAfford = credits >= estimatedCost;
 
   const handleSend = useCallback(async () => {
     if (!url.trim() || !isConnected) return;
@@ -150,6 +167,57 @@ export function RequestScreen() {
               onSubmitEditing={handleSend}
             />
 
+            {/* Headers */}
+            <Pressable
+              style={styles.headersToggle}
+              onPress={() => setShowHeaders(!showHeaders)}
+            >
+              <Text style={styles.headersToggleText}>
+                Headers {headers.length > 0 ? `(${headers.length})` : ''} {showHeaders ? '▾' : '▸'}
+              </Text>
+            </Pressable>
+
+            {showHeaders && (
+              <View style={styles.headersSection}>
+                {headers.map((h, i) => (
+                  <View key={i} style={styles.headerRow}>
+                    <TextInput
+                      style={[styles.headerInput, styles.headerKey]}
+                      value={h.key}
+                      onChangeText={(val) => {
+                        setHeaders((prev) => prev.map((hdr, idx) => idx === i ? { ...hdr, key: val } : hdr));
+                      }}
+                      placeholder="Key"
+                      placeholderTextColor={theme.text.tertiary}
+                      autoCapitalize="none"
+                    />
+                    <TextInput
+                      style={[styles.headerInput, styles.headerValue]}
+                      value={h.value}
+                      onChangeText={(val) => {
+                        setHeaders((prev) => prev.map((hdr, idx) => idx === i ? { ...hdr, value: val } : hdr));
+                      }}
+                      placeholder="Value"
+                      placeholderTextColor={theme.text.tertiary}
+                      autoCapitalize="none"
+                    />
+                    <Pressable
+                      style={styles.headerRemove}
+                      onPress={() => setHeaders((prev) => prev.filter((_, idx) => idx !== i))}
+                    >
+                      <Text style={styles.headerRemoveText}>&times;</Text>
+                    </Pressable>
+                  </View>
+                ))}
+                <Pressable
+                  style={styles.addHeaderButton}
+                  onPress={() => setHeaders((prev) => [...prev, { key: '', value: '' }])}
+                >
+                  <Text style={styles.addHeaderText}>+ Add Header</Text>
+                </Pressable>
+              </View>
+            )}
+
             {/* Body Input (POST, PUT, PATCH) */}
             {(method === 'POST' || method === 'PUT' || method === 'PATCH') && (
               <>
@@ -166,6 +234,17 @@ export function RequestScreen() {
                 />
               </>
             )}
+
+            {/* Cost Estimation */}
+            <View style={styles.costRow}>
+              <Text style={styles.costLabel}>Est. cost:</Text>
+              <Text style={[styles.costValue, !canAfford && styles.costInsufficient]}>
+                {estimatedCost} credit{estimatedCost !== 1 ? 's' : ''}
+              </Text>
+              {!canAfford && (
+                <Text style={styles.costWarning}>Insufficient credits</Text>
+              )}
+            </View>
 
             {/* Send Button */}
             <Pressable
@@ -356,6 +435,85 @@ const styles = StyleSheet.create({
   bodyInput: {
     minHeight: 80,
     fontFamily: 'JetBrainsMono-Regular',
+  },
+  headersToggle: {
+    paddingVertical: spacing.sm,
+    marginTop: spacing.md,
+  },
+  headersToggleText: {
+    ...typography.labelSmall,
+    color: theme.text.tertiary,
+  },
+  headersSection: {
+    marginBottom: spacing.sm,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    gap: 6,
+    marginBottom: 6,
+    alignItems: 'center',
+  },
+  headerInput: {
+    backgroundColor: theme.background.secondary,
+    borderRadius: 8,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    color: theme.text.primary,
+    fontSize: 12,
+  },
+  headerKey: {
+    flex: 2,
+  },
+  headerValue: {
+    flex: 3,
+  },
+  headerRemove: {
+    width: 28,
+    height: 28,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerRemoveText: {
+    color: '#ef4444',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  addHeaderButton: {
+    paddingVertical: spacing.sm,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: theme.border.subtle,
+    alignItems: 'center',
+  },
+  addHeaderText: {
+    ...typography.labelSmall,
+    color: theme.text.tertiary,
+  },
+  costRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: spacing.sm,
+  },
+  costLabel: {
+    ...typography.bodySmall,
+    color: theme.text.tertiary,
+  },
+  costValue: {
+    ...typography.bodySmall,
+    color: theme.text.secondary,
+    fontWeight: '600',
+    fontFamily: 'JetBrainsMono-Regular',
+  },
+  costInsufficient: {
+    color: '#ef4444',
+  },
+  costWarning: {
+    ...typography.bodySmall,
+    color: '#ef4444',
+    fontWeight: '600',
   },
   sendButton: {
     marginTop: spacing.lg,

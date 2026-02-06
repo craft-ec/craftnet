@@ -36,7 +36,7 @@ export const StatusCard: React.FC = () => {
 
   return (
     <div className="status-card">
-      <div className="status-indicator" style={{ backgroundColor: getStatusColor() }} />
+      <div className={`status-indicator ${status.state}`} style={{ backgroundColor: getStatusColor() }} />
       <div className="status-info">
         <h2 className="status-text">{getStatusText()}</h2>
         {status.state === 'connected' && status.exitNode && (
