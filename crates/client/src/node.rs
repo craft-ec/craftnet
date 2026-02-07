@@ -705,15 +705,19 @@ impl TunnelCraftNode {
         }
 
         // Add and dial bootstrap peers
-        // For Client/Both mode, fall back to hardcoded defaults if none configured.
-        // For Node mode with no peers, this is a bootstrap node — skip dialing.
+        // All modes fall back to hardcoded defaults if none explicitly configured.
+        // Filter out our own peer ID to avoid self-dialing (for bootstrap nodes).
         let bootstrap_peers = if !self.config.bootstrap_peers.is_empty() {
             self.config.bootstrap_peers.clone()
-        } else if matches!(self.mode, NodeMode::Client | NodeMode::Both) {
-            tunnelcraft_network::default_bootstrap_peers()
         } else {
-            Vec::new()
+            tunnelcraft_network::default_bootstrap_peers()
         };
+        // Don't try to dial ourselves
+        let local_peer = self.local_peer_id;
+        let bootstrap_peers: Vec<_> = bootstrap_peers
+            .into_iter()
+            .filter(|(pid, _)| Some(*pid) != local_peer)
+            .collect();
 
         if bootstrap_peers.is_empty() {
             info!("No bootstrap peers configured, running as bootstrap node");
