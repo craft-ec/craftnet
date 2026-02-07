@@ -100,6 +100,9 @@ pub struct NodeConfig {
 
     /// Exit node city
     pub exit_city: Option<String>,
+
+    /// Settlement configuration (defaults to devnet)
+    pub settlement_config: SettlementConfig,
 }
 
 impl Default for NodeConfig {
@@ -116,6 +119,7 @@ impl Default for NodeConfig {
             exit_region: ExitRegion::Auto,
             exit_country_code: None,
             exit_city: None,
+            settlement_config: SettlementConfig::devnet_default(),
         }
     }
 }
@@ -571,10 +575,9 @@ impl TunnelCraftNode {
                         timeout: self.config.request_timeout,
                         ..Default::default()
                     };
-                    let settlement_config = SettlementConfig::mock();
-                    let settlement_client = Arc::new(SettlementClient::new(
-                        settlement_config,
-                        self.keypair.public_key_bytes(),
+                    let settlement_client = Arc::new(SettlementClient::with_secret_key(
+                        self.config.settlement_config.clone(),
+                        &self.keypair.secret_key_bytes(),
                     ));
                     match ExitHandler::with_keypair_and_settlement(
                         exit_config,
@@ -583,7 +586,7 @@ impl TunnelCraftNode {
                     ) {
                         Ok(handler) => {
                             state.exit_handler = Some(handler);
-                            info!("Exit handler initialized with mock settlement");
+                            info!("Exit handler initialized with devnet settlement");
                         }
                         Err(e) => error!("Failed to create exit handler: {}", e),
                     }
@@ -650,6 +653,14 @@ impl TunnelCraftNode {
 
         // Connect to bootstrap peers
         self.connect_bootstrap().await?;
+
+        // Bootstrap the Kademlia DHT so we discover peers and exit nodes
+        if let Some(ref mut network) = self.network {
+            match network.bootstrap() {
+                Ok(()) => info!("Kademlia DHT bootstrap initiated"),
+                Err(e) => warn!("DHT bootstrap failed (no peers?): {}", e),
+            }
+        }
 
         // Subscribe to exit status gossipsub topic
         if let Some(ref mut network) = self.network {
