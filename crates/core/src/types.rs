@@ -150,6 +150,15 @@ pub struct ExitInfo {
     pub latency_ms: u32,
 }
 
+/// Information about a relay node (stored in DHT)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayInfo {
+    pub pubkey: PublicKey,
+    pub address: String,
+    pub allows_last_hop: bool,
+    pub reputation: u64,
+}
+
 /// Information about a peer node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {

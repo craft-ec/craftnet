@@ -63,6 +63,8 @@ pub struct ClaimRewards {
     pub node_pubkey: PublicKey,
     /// Number of receipts this relay has (proven by Merkle proof)
     pub relay_count: u64,
+    /// Index of this relay's leaf in the Merkle tree
+    pub leaf_index: u32,
     /// Merkle proof that (node_pubkey, relay_count) is in distribution_root
     pub merkle_proof: Vec<[u8; 32]>,
 }
@@ -163,6 +165,7 @@ mod tests {
             user_pubkey: [1u8; 32],
             node_pubkey: [2u8; 32],
             relay_count: 500,
+            leaf_index: 0,
             merkle_proof: vec![[0xBB; 32], [0xCC; 32]],
         };
 

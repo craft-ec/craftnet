@@ -20,6 +20,7 @@ members = [
     "crates/settings",
     "crates/app",
     "crates/aggregator",
+    "crates/prover",
     "apps/cli",
     "tests",
 ]
@@ -51,7 +52,7 @@ chacha20poly1305 = "0.10"
 sha2 = "0.10"
 
 # P2P networking
-libp2p = { version = "0.55", features = ["tokio", "dns", "tcp", "noise", "yamux", "kad", "identify", "relay", "dcutr", "macros", "request-response", "mdns", "rendezvous", "gossipsub"] }
+libp2p = { version = "0.55", features = ["tokio", "dns", "tcp", "noise", "yamux", "kad", "identify", "relay", "dcutr", "macros", "request-response", "mdns", "rendezvous", "gossipsub", "autonat"] }
 
 # Erasure coding
 reed-solomon-erasure = "6.0"
@@ -94,6 +95,7 @@ tunnelcraft-logging = { path = "crates/logging" }
 tunnelcraft-settings = { path = "crates/settings" }
 tunnelcraft-app = { path = "crates/app" }
 tunnelcraft-aggregator = { path = "crates/aggregator" }
+tunnelcraft-prover = { path = "crates/prover" }
 
 [profile.release]
 overflow-checks = true

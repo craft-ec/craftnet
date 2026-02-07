@@ -28,6 +28,7 @@ use tunnelcraft_crypto::{sign_forward_receipt, verify_forward_receipt, SigningKe
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
+use tunnelcraft_prover::MerkleTree;
 use tunnelcraft_settlement::{
     ClaimRewards, PostDistribution, SettlementClient, SettlementConfig, Subscribe,
 };
@@ -344,7 +345,8 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 user_pubkey,
                 node_pubkey: *pubkey,
                 relay_count: count,
-                merkle_proof: vec![], // mock doesn't verify Merkle proofs
+                leaf_index: 0,
+                merkle_proof: vec![],
             })
             .await
             .expect("Claim should succeed");
@@ -464,6 +466,7 @@ async fn test_receipt_isolation_across_requests() {
             user_pubkey,
             node_pubkey: relay_pubkey,
             relay_count: total,
+            leaf_index: 0,
             merkle_proof: vec![],
         })
         .await
@@ -533,6 +536,171 @@ fn test_receipt_signature_verification() {
     }
 }
 
+/// Test that claims with valid Merkle proofs succeed through end-to-end flow:
+/// build distribution tree → post root → claim with proof → verify payout.
+#[tokio::test]
+async fn test_merkle_proof_claim() {
+    let user_pubkey = [1u8; 32];
+    let settlement_client = Arc::new(SettlementClient::new(SettlementConfig::mock(), [0u8; 32]));
+
+    let pool_balance = 1_000_000u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Create expired subscription (past grace)
+    settlement_client
+        .add_mock_subscription_with_expiry(
+            user_pubkey,
+            tunnelcraft_core::SubscriptionTier::Standard,
+            pool_balance,
+            now - 40 * 24 * 3600,
+            now - 10 * 24 * 3600,
+        )
+        .unwrap();
+
+    // 3 relays with different receipt counts
+    let relay_a = [10u8; 32];
+    let relay_b = [20u8; 32];
+    let relay_c = [30u8; 32];
+    let counts: Vec<([u8; 32], u64)> = vec![(relay_a, 50), (relay_b, 30), (relay_c, 20)];
+    let total_receipts: u64 = counts.iter().map(|(_, c)| c).sum();
+
+    // Build the Merkle tree from distribution entries
+    let tree = MerkleTree::from_entries(&counts);
+    let root = tree.root();
+
+    // Post distribution with the real Merkle root
+    settlement_client
+        .post_distribution(PostDistribution {
+            user_pubkey,
+            distribution_root: root,
+            total_receipts,
+        })
+        .await
+        .unwrap();
+
+    // Each relay claims with a valid Merkle proof
+    for (i, (relay_pubkey, count)) in counts.iter().enumerate() {
+        let proof = tree.proof(i).expect("proof should exist for leaf");
+        settlement_client
+            .claim_rewards(ClaimRewards {
+                user_pubkey,
+                node_pubkey: *relay_pubkey,
+                relay_count: *count,
+                leaf_index: i as u32,
+                merkle_proof: proof.siblings.clone(),
+            })
+            .await
+            .expect("Claim with valid Merkle proof should succeed");
+    }
+
+    // Verify payouts
+    let acct_a = settlement_client.get_node_account(relay_a).await.unwrap();
+    let acct_b = settlement_client.get_node_account(relay_b).await.unwrap();
+    let acct_c = settlement_client.get_node_account(relay_c).await.unwrap();
+
+    // 50/100 * 1_000_000 = 500_000
+    assert_eq!(acct_a.unclaimed_rewards, 500_000);
+    // 30/100 * 1_000_000 = 300_000
+    assert_eq!(acct_b.unclaimed_rewards, 300_000);
+    // 20/100 * 1_000_000 = 200_000
+    assert_eq!(acct_c.unclaimed_rewards, 200_000);
+
+    // Pool fully drained
+    let sub = settlement_client
+        .get_subscription_state(user_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sub.pool_balance, 0);
+}
+
+/// Test that a claim with an invalid Merkle proof (wrong relay_count) is rejected.
+#[tokio::test]
+async fn test_invalid_merkle_proof_rejected() {
+    let user_pubkey = [1u8; 32];
+    let settlement_client = Arc::new(SettlementClient::new(SettlementConfig::mock(), [0u8; 32]));
+
+    let pool_balance = 1_000_000u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    settlement_client
+        .add_mock_subscription_with_expiry(
+            user_pubkey,
+            tunnelcraft_core::SubscriptionTier::Standard,
+            pool_balance,
+            now - 40 * 24 * 3600,
+            now - 10 * 24 * 3600,
+        )
+        .unwrap();
+
+    let relay_a = [10u8; 32];
+    let relay_b = [20u8; 32];
+    let counts: Vec<([u8; 32], u64)> = vec![(relay_a, 50), (relay_b, 50)];
+    let total_receipts: u64 = 100;
+
+    let tree = MerkleTree::from_entries(&counts);
+    let root = tree.root();
+
+    settlement_client
+        .post_distribution(PostDistribution {
+            user_pubkey,
+            distribution_root: root,
+            total_receipts,
+        })
+        .await
+        .unwrap();
+
+    // Claim with WRONG relay_count (70 instead of 50) — leaf won't match
+    let proof = tree.proof(0).expect("proof should exist");
+    let result = settlement_client
+        .claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: relay_a,
+            relay_count: 70, // Wrong count — should fail verification
+            leaf_index: 0,
+            merkle_proof: proof.siblings.clone(),
+        })
+        .await;
+
+    assert!(
+        matches!(result, Err(tunnelcraft_settlement::SettlementError::InvalidMerkleProof)),
+        "Claim with wrong relay_count should be rejected with InvalidMerkleProof, got: {:?}",
+        result,
+    );
+
+    // Verify that the pool is untouched
+    let sub = settlement_client
+        .get_subscription_state(user_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sub.pool_balance, pool_balance);
+
+    // Also test: valid proof but wrong leaf_index
+    let proof_for_a = tree.proof(0).unwrap();
+    let result2 = settlement_client
+        .claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: relay_a,
+            relay_count: 50, // Correct count
+            leaf_index: 1,   // Wrong index — proof path won't verify
+            merkle_proof: proof_for_a.siblings.clone(),
+        })
+        .await;
+
+    assert!(
+        matches!(result2, Err(tunnelcraft_settlement::SettlementError::InvalidMerkleProof)),
+        "Claim with wrong leaf_index should be rejected with InvalidMerkleProof, got: {:?}",
+        result2,
+    );
+}
+
 /// Test proportional reward distribution with unequal receipt counts
 #[tokio::test]
 async fn test_unequal_receipt_distribution() {
@@ -594,6 +762,7 @@ async fn test_unequal_receipt_distribution() {
             user_pubkey,
             node_pubkey: node_a,
             relay_count: 7,
+            leaf_index: 0,
             merkle_proof: vec![],
         })
         .await
@@ -609,6 +778,7 @@ async fn test_unequal_receipt_distribution() {
             user_pubkey,
             node_pubkey: node_b,
             relay_count: 3,
+            leaf_index: 0,
             merkle_proof: vec![],
         })
         .await

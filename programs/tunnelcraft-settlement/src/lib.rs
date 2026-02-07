@@ -96,6 +96,7 @@ pub mod tunnelcraft_settlement {
         user_pubkey: [u8; 32],
         relay_pubkey: [u8; 32],
         relay_count: u64,
+        leaf_index: u32,
         merkle_proof: Vec<[u8; 32]>,
     ) -> Result<()> {
         let subscription = &mut ctx.accounts.subscription_account;
@@ -112,9 +113,17 @@ pub mod tunnelcraft_settlement {
             SettlementError::NoReceipts,
         );
 
-        // TODO: Verify Merkle proof of (relay_pubkey, relay_count) against distribution_root
-        // For now, we trust the caller (aggregator signature check in production)
-        let _ = merkle_proof;
+        // Verify Merkle proof of (relay_pubkey, relay_count) against distribution_root
+        require!(
+            verify_merkle_proof(
+                &relay_pubkey,
+                relay_count,
+                &merkle_proof,
+                leaf_index as usize,
+                &subscription.distribution_root,
+            ),
+            SettlementError::InvalidMerkleProof,
+        );
 
         // Calculate proportional payout from original pool balance
         let payout = (relay_count as u128)
@@ -174,6 +183,47 @@ pub mod tunnelcraft_settlement {
 }
 
 // ============================================================================
+// Merkle Proof Verification
+// ============================================================================
+
+/// Verify a Merkle proof that `(relay_pubkey, relay_count)` is included in `distribution_root`.
+///
+/// Leaf = SHA256(relay_pubkey || relay_count.to_le_bytes())
+/// At each level, combine with sibling based on leaf_index bit (0 = left, 1 = right).
+///
+/// Uses `solana_program::hash::hashv` which is standard SHA-256 — identical
+/// to `sha2::Sha256` used off-chain in `crates/prover/src/merkle.rs`.
+fn verify_merkle_proof(
+    relay_pubkey: &[u8; 32],
+    relay_count: u64,
+    proof: &[[u8; 32]],
+    leaf_index: usize,
+    distribution_root: &[u8; 32],
+) -> bool {
+    use anchor_lang::solana_program::hash::hashv;
+
+    // Compute leaf
+    let count_bytes = relay_count.to_le_bytes();
+    let leaf = hashv(&[relay_pubkey, &count_bytes]);
+    let mut current = leaf.to_bytes();
+    let mut idx = leaf_index;
+
+    // Walk up the tree
+    for sibling in proof {
+        current = if idx % 2 == 0 {
+            // Current is left child
+            hashv(&[&current, sibling]).to_bytes()
+        } else {
+            // Current is right child
+            hashv(&[sibling, &current]).to_bytes()
+        };
+        idx /= 2;
+    }
+
+    current == *distribution_root
+}
+
+// ============================================================================
 // Accounts (Context structs)
 // ============================================================================
 
@@ -210,7 +260,7 @@ pub struct PostDistributionCtx<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(user_pubkey: [u8; 32], relay_pubkey: [u8; 32])]
+#[instruction(user_pubkey: [u8; 32], relay_pubkey: [u8; 32], _relay_count: u64, _leaf_index: u32)]
 pub struct ClaimCtx<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,

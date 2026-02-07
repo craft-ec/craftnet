@@ -3,7 +3,7 @@
 //! Combines Kademlia DHT, Identify, mDNS, rendezvous, relay protocols, and shard exchange.
 
 use libp2p::{
-    dcutr, gossipsub, identify, kad, mdns, relay, rendezvous,
+    autonat, dcutr, gossipsub, identify, kad, mdns, relay, rendezvous,
     request_response::{self, OutboundRequestId, ResponseChannel},
     swarm::NetworkBehaviour,
     Multiaddr, PeerId, StreamProtocol,
@@ -59,6 +59,33 @@ pub const EXIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Consider exit offline if no heartbeat for this duration (90 seconds = 3 missed heartbeats)
 pub const EXIT_OFFLINE_THRESHOLD: Duration = Duration::from_secs(90);
 
+// ============================================================================
+// Relay DHT discovery constants (mirrors exit pattern)
+// ============================================================================
+
+/// DHT key prefix for relay node records
+pub const RELAY_DHT_KEY_PREFIX: &str = "/tunnelcraft/relays/";
+
+/// Well-known DHT key for the relay node registry
+pub const RELAY_REGISTRY_KEY: &[u8] = b"/tunnelcraft/relay-registry";
+
+/// TTL for relay records (5 minutes)
+pub const RELAY_RECORD_TTL: Duration = Duration::from_secs(300);
+
+/// Gossipsub topic for relay node status (heartbeat, load, online/offline)
+pub const RELAY_STATUS_TOPIC: &str = "tunnelcraft/relay-status/1.0.0";
+
+/// Heartbeat interval for relay nodes (30 seconds)
+pub const RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Consider relay offline if no heartbeat for this duration (90 seconds)
+pub const RELAY_OFFLINE_THRESHOLD: Duration = Duration::from_secs(90);
+
+/// Generate DHT key for a relay node's info record
+pub fn relay_dht_key(peer_id: &PeerId) -> Vec<u8> {
+    format!("{}{}", RELAY_DHT_KEY_PREFIX, peer_id).into_bytes()
+}
+
 /// Combined network behaviour for TunnelCraft nodes
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "TunnelCraftBehaviourEvent")]
@@ -79,6 +106,8 @@ pub struct TunnelCraftBehaviour {
     pub relay_client: relay::client::Behaviour,
     /// DCUtR for direct connection upgrade
     pub dcutr: dcutr::Behaviour,
+    /// AutoNAT for NAT detection
+    pub autonat: autonat::Behaviour,
     /// Shard exchange protocol
     pub shard: ShardBehaviour,
 }
@@ -94,6 +123,7 @@ pub enum TunnelCraftBehaviourEvent {
     RendezvousServer(rendezvous::server::Event),
     RelayClient(relay::client::Event),
     Dcutr(dcutr::Event),
+    AutoNat(autonat::Event),
     Shard(request_response::Event<ShardRequest, ShardResponse>),
 }
 
@@ -142,6 +172,12 @@ impl From<relay::client::Event> for TunnelCraftBehaviourEvent {
 impl From<dcutr::Event> for TunnelCraftBehaviourEvent {
     fn from(e: dcutr::Event) -> Self {
         TunnelCraftBehaviourEvent::Dcutr(e)
+    }
+}
+
+impl From<autonat::Event> for TunnelCraftBehaviourEvent {
+    fn from(e: autonat::Event) -> Self {
+        TunnelCraftBehaviourEvent::AutoNat(e)
     }
 }
 
@@ -216,6 +252,17 @@ impl TunnelCraftBehaviour {
         // DCUtR for direct connection upgrade
         let dcutr = dcutr::Behaviour::new(local_peer_id);
 
+        // AutoNAT for NAT detection
+        let autonat = autonat::Behaviour::new(
+            local_peer_id,
+            autonat::Config {
+                retry_interval: Duration::from_secs(60),
+                refresh_interval: Duration::from_secs(300),
+                confidence_max: 3,
+                ..Default::default()
+            },
+        );
+
         // Shard exchange protocol
         let shard = new_shard_behaviour();
 
@@ -228,6 +275,7 @@ impl TunnelCraftBehaviour {
             rendezvous_server,
             relay_client,
             dcutr,
+            autonat,
             shard,
         };
 
@@ -330,6 +378,69 @@ impl TunnelCraftBehaviour {
         let key = kad::RecordKey::new(&EXIT_REGISTRY_KEY);
         self.kademlia.get_providers(key)
     }
+
+    // =========================================================================
+    // Relay DHT + gossipsub methods (mirrors exit pattern)
+    // =========================================================================
+
+    /// Subscribe to the relay status topic
+    pub fn subscribe_relay_status(&mut self) -> Result<bool, gossipsub::SubscriptionError> {
+        let topic = gossipsub::IdentTopic::new(RELAY_STATUS_TOPIC);
+        self.gossipsub.subscribe(&topic)
+    }
+
+    /// Unsubscribe from the relay status topic
+    pub fn unsubscribe_relay_status(&mut self) -> bool {
+        let topic = gossipsub::IdentTopic::new(RELAY_STATUS_TOPIC);
+        self.gossipsub.unsubscribe(&topic)
+    }
+
+    /// Publish relay status message (heartbeat, load, online/offline)
+    pub fn publish_relay_status(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, gossipsub::PublishError> {
+        let topic = gossipsub::IdentTopic::new(RELAY_STATUS_TOPIC);
+        self.gossipsub.publish(topic, data)
+    }
+
+    /// Store relay node info in DHT
+    pub fn put_relay_record(&mut self, peer_id: &PeerId, record_value: Vec<u8>) -> Result<kad::QueryId, kad::store::Error> {
+        let key = kad::RecordKey::new(&relay_dht_key(peer_id));
+        let expires = std::time::Instant::now() + RELAY_RECORD_TTL;
+        let record = kad::Record {
+            key,
+            value: record_value,
+            publisher: Some(*peer_id),
+            expires: Some(expires),
+        };
+        self.kademlia.put_record(record, kad::Quorum::One)
+    }
+
+    /// Announce as relay provider
+    pub fn start_providing_relay(&mut self) -> Result<kad::QueryId, kad::store::Error> {
+        let key = kad::RecordKey::new(&RELAY_REGISTRY_KEY);
+        self.kademlia.start_providing(key)
+    }
+
+    /// Stop announcing as relay provider
+    pub fn stop_providing_relay(&mut self) {
+        let key = kad::RecordKey::new(&RELAY_REGISTRY_KEY);
+        self.kademlia.stop_providing(&key);
+    }
+
+    /// Query DHT for a relay node's detailed info
+    pub fn get_relay_record(&mut self, peer_id: &PeerId) -> kad::QueryId {
+        let key = kad::RecordKey::new(&relay_dht_key(peer_id));
+        self.kademlia.get_record(key)
+    }
+
+    /// Find all relay providers in the network
+    pub fn get_relay_providers(&mut self) -> kad::QueryId {
+        let key = kad::RecordKey::new(&RELAY_REGISTRY_KEY);
+        self.kademlia.get_providers(key)
+    }
+
+    // =========================================================================
+    // Peer record methods
+    // =========================================================================
 
     /// Store a peer's signing pubkey → PeerId mapping in DHT
     /// Clients call this so relays can route response shards by destination lookup
@@ -467,6 +578,13 @@ mod tests {
     #[test]
     fn test_event_from_dcutr() {
         fn _check_from(e: dcutr::Event) -> TunnelCraftBehaviourEvent {
+            e.into()
+        }
+    }
+
+    #[test]
+    fn test_event_from_autonat() {
+        fn _check_from(e: autonat::Event) -> TunnelCraftBehaviourEvent {
             e.into()
         }
     }

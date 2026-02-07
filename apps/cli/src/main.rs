@@ -193,6 +193,10 @@ enum NodeSubcommand {
         /// Allow being last hop (required for settlement)
         #[arg(long)]
         allow_last_hop: bool,
+
+        /// Enable aggregator mode (collect proofs, build distributions)
+        #[arg(long)]
+        aggregator: bool,
     },
 
     /// Run as exit node (also relays)
@@ -212,6 +216,10 @@ enum NodeSubcommand {
         /// HTTP request timeout in seconds
         #[arg(long, default_value = "30")]
         timeout: u64,
+
+        /// Enable aggregator mode (collect proofs, build distributions)
+        #[arg(long)]
+        aggregator: bool,
     },
 
     /// Run as full node (relay + exit)
@@ -231,6 +239,10 @@ enum NodeSubcommand {
         /// HTTP request timeout in seconds
         #[arg(long, default_value = "30")]
         timeout: u64,
+
+        /// Enable aggregator mode (collect proofs, build distributions)
+        #[arg(long)]
+        aggregator: bool,
     },
 
     /// Show node information
@@ -987,8 +999,9 @@ async fn run_node(mode: NodeSubcommand) -> Result<()> {
             bootstrap,
             keyfile,
             allow_last_hop,
+            aggregator,
         } => {
-            run_node_with_config(NodeType::Relay, &listen, &bootstrap, &keyfile, allow_last_hop, 30)
+            run_node_with_config(NodeType::Relay, &listen, &bootstrap, &keyfile, allow_last_hop, 30, aggregator)
                 .await
         }
         NodeSubcommand::Exit {
@@ -996,13 +1009,15 @@ async fn run_node(mode: NodeSubcommand) -> Result<()> {
             bootstrap,
             keyfile,
             timeout,
-        } => run_node_with_config(NodeType::Exit, &listen, &bootstrap, &keyfile, true, timeout).await,
+            aggregator,
+        } => run_node_with_config(NodeType::Exit, &listen, &bootstrap, &keyfile, true, timeout, aggregator).await,
         NodeSubcommand::Full {
             listen,
             bootstrap,
             keyfile,
             timeout,
-        } => run_node_with_config(NodeType::Full, &listen, &bootstrap, &keyfile, true, timeout).await,
+            aggregator,
+        } => run_node_with_config(NodeType::Full, &listen, &bootstrap, &keyfile, true, timeout, aggregator).await,
         NodeSubcommand::Info { keyfile } => show_node_info(&keyfile),
     }
 }
@@ -1027,6 +1042,7 @@ async fn run_node_with_config(
     keyfile: &PathBuf,
     allow_last_hop: bool,
     timeout_secs: u64,
+    enable_aggregator: bool,
 ) -> Result<()> {
     info!("Starting TunnelCraft node in {:?} mode", node_type);
 
@@ -1062,6 +1078,7 @@ async fn run_node_with_config(
         request_timeout: Duration::from_secs(timeout_secs),
         libp2p_keypair: Some(libp2p_keypair),
         data_dir,
+        enable_aggregator,
         ..Default::default()
     };
 

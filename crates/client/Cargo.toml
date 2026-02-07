@@ -13,6 +13,8 @@ tunnelcraft-network = { workspace = true }
 tunnelcraft-relay = { workspace = true }
 tunnelcraft-exit = { workspace = true }
 tunnelcraft-settlement = { workspace = true }
+tunnelcraft-prover = { workspace = true }
+tunnelcraft-aggregator = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -10,6 +10,7 @@ license.workspace = true
 openssl = { workspace = true }
 
 tunnelcraft-core = { workspace = true }
+tunnelcraft-prover = { workspace = true }
 solana-program = { workspace = true }
 solana-client = "2.1"
 solana-sdk = "2.1"

@@ -9,11 +9,11 @@
 
 use std::collections::HashMap;
 
-use sha2::{Sha256, Digest};
 use tracing::{debug, info, warn};
 
 use tunnelcraft_core::PublicKey;
 use tunnelcraft_network::{ProofMessage, PoolType};
+use tunnelcraft_prover::{MerkleProof, MerkleTree};
 
 /// A single relay's proven claim for a pool
 #[derive(Debug, Clone)]
@@ -42,8 +42,21 @@ pub struct Distribution {
     pub root: [u8; 32],
     /// Total receipts across all relays
     pub total: u64,
-    /// Individual entries: (relay_pubkey, receipt_count)
+    /// Individual entries: (relay_pubkey, receipt_count), sorted by pubkey
     pub entries: Vec<(PublicKey, u64)>,
+    /// The Merkle tree (for generating per-relay proofs)
+    tree: MerkleTree,
+}
+
+impl Distribution {
+    /// Generate a Merkle proof for a specific relay.
+    ///
+    /// Returns `None` if the relay is not in the distribution.
+    pub fn proof_for_relay(&self, relay: &PublicKey) -> Option<(MerkleProof, u32)> {
+        let index = self.entries.iter().position(|(r, _)| r == relay)?;
+        let proof = self.tree.proof(index)?;
+        Some((proof, index as u32))
+    }
 }
 
 /// Network-wide statistics
@@ -163,29 +176,21 @@ impl Aggregator {
         entries.sort_by_key(|(relay, _)| *relay);
 
         let total: u64 = entries.iter().map(|(_, count)| count).sum();
-        let root = Self::compute_distribution_root(&entries);
+
+        // Build proper binary Merkle tree from entries
+        let tree_entries: Vec<([u8; 32], u64)> = entries
+            .iter()
+            .map(|(relay, count)| (*relay, *count))
+            .collect();
+        let tree = MerkleTree::from_entries(&tree_entries);
+        let root = tree.root();
 
         Some(Distribution {
             root,
             total,
             entries,
+            tree,
         })
-    }
-
-    /// Compute Merkle root of distribution entries.
-    ///
-    /// Simple hash chain for now — a real implementation would build
-    /// a proper Merkle tree for proof generation.
-    fn compute_distribution_root(entries: &[(PublicKey, u64)]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        for (relay, count) in entries {
-            hasher.update(relay);
-            hasher.update(&count.to_le_bytes());
-        }
-        let result = hasher.finalize();
-        let mut root = [0u8; 32];
-        root.copy_from_slice(&result);
-        root
     }
 
     // =========================================================================

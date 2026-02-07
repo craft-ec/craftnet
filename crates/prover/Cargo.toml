@@ -1,5 +1,5 @@
 [package]
-name = "tunnelcraft-aggregator"
+name = "tunnelcraft-prover"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,11 +7,6 @@ license.workspace = true
 
 [dependencies]
 tunnelcraft-core = { workspace = true }
-tunnelcraft-network = { workspace = true }
-tunnelcraft-settlement = { workspace = true }
-tunnelcraft-prover = { workspace = true }
-
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-hex = { workspace = true }

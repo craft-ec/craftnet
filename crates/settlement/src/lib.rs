@@ -48,6 +48,9 @@ pub enum SettlementError {
     #[error("Already claimed")]
     AlreadyClaimed,
 
+    #[error("Invalid Merkle proof")]
+    InvalidMerkleProof,
+
     #[error("Serialization error: {0}")]
     SerializationError(String),
 }

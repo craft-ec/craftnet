@@ -534,8 +534,22 @@ impl SettlementClient {
                 return Err(SettlementError::AlreadyClaimed);
             }
 
+            // Verify Merkle proof if distribution root and proof are provided
+            if let Some(root) = subscription.distribution_root {
+                if !claim.merkle_proof.is_empty() {
+                    use tunnelcraft_prover::{merkle_leaf, MerkleProof, MerkleTree};
+                    let leaf = merkle_leaf(&claim.node_pubkey, claim.relay_count);
+                    let proof = MerkleProof {
+                        siblings: claim.merkle_proof.clone(),
+                        leaf_index: claim.leaf_index as usize,
+                    };
+                    if !MerkleTree::verify(&root, &leaf, &proof) {
+                        return Err(SettlementError::InvalidMerkleProof);
+                    }
+                }
+            }
+
             // Calculate proportional share
-            // In mock mode, we trust relay_count (in live mode, Merkle proof verifies it)
             let payout = (claim.relay_count as u128 * subscription.original_pool_balance as u128
                 / subscription.total_receipts as u128) as u64;
 
@@ -575,6 +589,7 @@ impl SettlementClient {
         data.extend_from_slice(&claim.user_pubkey);
         data.extend_from_slice(&claim.node_pubkey);
         data.extend_from_slice(&claim.relay_count.to_le_bytes());
+        data.extend_from_slice(&claim.leaf_index.to_le_bytes());
         // Serialize Merkle proof
         data.extend_from_slice(&(claim.merkle_proof.len() as u32).to_le_bytes());
         for hash in &claim.merkle_proof {
@@ -970,7 +985,8 @@ mod tests {
             user_pubkey,
             node_pubkey: node1,
             relay_count: 7,
-            merkle_proof: vec![], // mock doesn't verify
+            leaf_index: 0,
+            merkle_proof: vec![],
         }).await.unwrap();
 
         let acct1 = client.get_node_account(node1).await.unwrap();
@@ -981,6 +997,7 @@ mod tests {
             user_pubkey,
             node_pubkey: node2,
             relay_count: 3,
+            leaf_index: 0,
             merkle_proof: vec![],
         }).await.unwrap();
 
@@ -1025,6 +1042,7 @@ mod tests {
             user_pubkey,
             node_pubkey: [2u8; 32],
             relay_count: 10,
+            leaf_index: 0,
             merkle_proof: vec![],
         }).await;
 
@@ -1052,6 +1070,7 @@ mod tests {
             user_pubkey,
             node_pubkey: [2u8; 32],
             relay_count: 10,
+            leaf_index: 0,
             merkle_proof: vec![],
         }).await;
 
@@ -1086,6 +1105,7 @@ mod tests {
             user_pubkey,
             node_pubkey: node,
             relay_count: 5,
+            leaf_index: 0,
             merkle_proof: vec![],
         }).await.unwrap();
 
@@ -1094,6 +1114,7 @@ mod tests {
             user_pubkey,
             node_pubkey: node,
             relay_count: 5,
+            leaf_index: 0,
             merkle_proof: vec![],
         }).await;
 

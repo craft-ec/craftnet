@@ -179,6 +179,7 @@ pub async fn build_swarm(
                 rendezvous_server: behaviour.rendezvous_server,
                 relay_client: relay_behaviour,
                 dcutr: behaviour.dcutr,
+                autonat: behaviour.autonat,
                 shard: new_shard_behaviour(),
             })
         })

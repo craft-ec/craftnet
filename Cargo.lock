@@ -2926,6 +2926,7 @@ dependencies = [
  "futures-timer",
  "getrandom 0.2.16",
  "libp2p-allow-block-list",
+ "libp2p-autonat",
  "libp2p-connection-limits",
  "libp2p-core",
  "libp2p-dcutr",
@@ -2960,6 +2961,31 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "libp2p-swarm",
+]
+
+[[package]]
+name = "libp2p-autonat"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e297bfc6cabb70c6180707f8fa05661b77ecb9cb67e8e8e1c469301358fa21d0"
+dependencies = [
+ "async-trait",
+ "asynchronous-codec",
+ "either",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-request-response",
+ "libp2p-swarm",
+ "quick-protobuf",
+ "quick-protobuf-codec",
+ "rand 0.8.5",
+ "rand_core 0.6.4",
+ "thiserror 2.0.17",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -7780,6 +7806,7 @@ dependencies = [
  "tracing",
  "tunnelcraft-core",
  "tunnelcraft-network",
+ "tunnelcraft-prover",
  "tunnelcraft-settlement",
 ]
 
@@ -7827,11 +7854,13 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tunnelcraft-aggregator",
  "tunnelcraft-core",
  "tunnelcraft-crypto",
  "tunnelcraft-erasure",
  "tunnelcraft-exit",
  "tunnelcraft-network",
+ "tunnelcraft-prover",
  "tunnelcraft-relay",
  "tunnelcraft-settlement",
 ]
@@ -7962,6 +7991,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnelcraft-prover"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tracing",
+ "tunnelcraft-core",
+]
+
+[[package]]
 name = "tunnelcraft-relay"
 version = "0.1.0"
 dependencies = [
@@ -8004,6 +8043,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tunnelcraft-core",
+ "tunnelcraft-prover",
 ]
 
 [[package]]
@@ -8025,6 +8065,7 @@ dependencies = [
  "tunnelcraft-erasure",
  "tunnelcraft-exit",
  "tunnelcraft-network",
+ "tunnelcraft-prover",
  "tunnelcraft-relay",
  "tunnelcraft-settlement",
 ]

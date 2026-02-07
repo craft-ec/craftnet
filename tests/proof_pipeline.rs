@@ -461,6 +461,7 @@ async fn test_aggregator_to_settlement_claim_flow() {
                 user_pubkey,
                 node_pubkey: *relay,
                 relay_count: *count,
+                leaf_index: 0,
                 merkle_proof: vec![],
             })
             .await
@@ -572,6 +573,7 @@ async fn test_chained_proofs_to_settlement() {
             user_pubkey,
             node_pubkey: relay,
             relay_count: 300,
+            leaf_index: 0,
             merkle_proof: vec![],
         })
         .await
@@ -641,6 +643,7 @@ async fn test_claim_blocked_without_distribution() {
             user_pubkey: user,
             node_pubkey: node,
             relay_count: 50,
+            leaf_index: 0,
             merkle_proof: vec![],
         })
         .await;
@@ -685,6 +688,7 @@ async fn test_double_claim_rejected_e2e() {
             user_pubkey: user,
             node_pubkey: node,
             relay_count: 50,
+            leaf_index: 0,
             merkle_proof: vec![],
         })
         .await
@@ -696,6 +700,7 @@ async fn test_double_claim_rejected_e2e() {
             user_pubkey: user,
             node_pubkey: node,
             relay_count: 50,
+            leaf_index: 0,
             merkle_proof: vec![],
         })
         .await;
@@ -885,6 +890,7 @@ async fn test_multi_pool_aggregation_and_claims() {
                 user_pubkey: user,
                 node_pubkey: relay,
                 relay_count: expected_count,
+                leaf_index: 0,
                 merkle_proof: vec![],
             })
             .await
