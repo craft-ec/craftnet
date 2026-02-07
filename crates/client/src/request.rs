@@ -4,6 +4,7 @@ use sha2::{Sha256, Digest};
 use rand::Rng;
 
 use tunnelcraft_core::{Shard, Id, PublicKey, HopMode};
+use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, TOTAL_SHARDS};
 
 use crate::{ClientError, Result};
@@ -89,11 +90,41 @@ impl RequestBuilder {
         user_pubkey: PublicKey,
         exit_pubkey: PublicKey,
     ) -> Result<Vec<Shard>> {
+        self.build_with_keypair(user_pubkey, exit_pubkey, None)
+    }
+
+    /// Build request shards with user_proof binding.
+    ///
+    /// When a keypair is provided, computes `user_proof = SHA256(request_id || user_pubkey || sig)`
+    /// and sets it on all shards. This binds receipts to the user's settlement pool.
+    pub fn build_signed(
+        self,
+        keypair: &SigningKeypair,
+        exit_pubkey: PublicKey,
+    ) -> Result<Vec<Shard>> {
+        let user_pubkey = keypair.public_key_bytes();
+        self.build_with_keypair(user_pubkey, exit_pubkey, Some(keypair))
+    }
+
+    fn build_with_keypair(
+        self,
+        user_pubkey: PublicKey,
+        exit_pubkey: PublicKey,
+        keypair: Option<&SigningKeypair>,
+    ) -> Result<Vec<Shard>> {
         let erasure = ErasureCoder::new()
             .map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
         // Generate request ID
         let request_id = generate_request_id();
+
+        // Compute user_proof if keypair provided
+        let user_proof = if let Some(kp) = keypair {
+            let sig = tunnelcraft_crypto::sign_data(kp, &request_id);
+            Shard::compute_user_proof(&request_id, &user_pubkey, &sig)
+        } else {
+            [0u8; 32]
+        };
 
         // Serialize request data
         let request_data = self.serialize();
@@ -111,7 +142,7 @@ impl RequestBuilder {
             // Generate unique shard ID
             let shard_id = generate_shard_id(&request_id, i as u8);
 
-            let shard = Shard::new_request(
+            let mut shard = Shard::new_request(
                 shard_id,
                 request_id,
                 user_pubkey,
@@ -121,6 +152,7 @@ impl RequestBuilder {
                 i as u8,
                 total_shards,
             );
+            shard.set_user_proof(user_proof);
 
             shards.push(shard);
         }
