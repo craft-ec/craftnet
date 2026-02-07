@@ -149,6 +149,7 @@ fn test_response_destination_verification() {
         [100u8; 32],
         request_id,
         user_pubkey, // Correct destination
+        [0u8; 32],   // user_proof
         exit_entry.clone(),
         2,
         vec![1, 2, 3, 4],
@@ -166,6 +167,7 @@ fn test_response_destination_verification() {
         [101u8; 32],
         request_id,
         attacker_pubkey, // WRONG destination
+        [0u8; 32],       // user_proof
         exit_entry,
         2,
         vec![1, 2, 3, 4],
@@ -361,6 +363,7 @@ fn test_response_without_prior_request_forwarded() {
         [1u8; 32],
         [99u8; 32], // Unknown request_id
         [4u8; 32],
+        [0u8; 32],  // user_proof
         exit_entry,
         2,
         vec![1, 2, 3],
@@ -400,6 +403,7 @@ fn test_multiple_request_shards_share_cache_entry() {
         [100u8; 32],
         request_id,
         user_pubkey,
+        [0u8; 32],  // user_proof
         exit_entry,
         2,
         vec![1, 2, 3],
@@ -436,6 +440,7 @@ fn test_relay_last_hop_response_forwarded() {
         [100u8; 32],
         request_id,
         user_pubkey,
+        [0u8; 32],  // user_proof
         exit_entry,
         1,
         vec![1, 2, 3],
@@ -557,6 +562,7 @@ fn test_complete_request_response_flow() {
             [100 + i as u8; 32],
             request_id,
             user_pubkey, // Destination is user
+            [0u8; 32],   // user_proof
             exit_entry.clone(),
             4, // More hops to avoid last-hop issues
             payload,

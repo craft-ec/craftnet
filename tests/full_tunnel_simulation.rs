@@ -264,6 +264,7 @@ async fn test_full_tunnel_small_request() {
                 [i as u8; 32], // shard_id
                 request_id,
                 user_pubkey,  // destination
+                [0u8; 32],    // user_proof
                 exit_entry.clone(),
                 3,            // hops
                 payload,
@@ -366,6 +367,7 @@ async fn test_full_tunnel_large_response() {
                 [i as u8; 32],
                 request_id,
                 user_pubkey,
+                [0u8; 32],    // user_proof
                 exit_entry.clone(),
                 3,
                 payload,
@@ -483,6 +485,7 @@ async fn test_full_tunnel_variable_sizes() {
                     [i as u8; 32],
                     request_id,
                     user_pubkey,
+                    [0u8; 32],    // user_proof
                     exit_entry.clone(),
                     3,
                     payload,

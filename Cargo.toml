@@ -19,6 +19,7 @@ members = [
     "crates/logging",
     "crates/settings",
     "crates/app",
+    "crates/aggregator",
     "apps/cli",
     "tests",
 ]
@@ -92,6 +93,7 @@ tunnelcraft-ipc-client = { path = "crates/ipc-client" }
 tunnelcraft-logging = { path = "crates/logging" }
 tunnelcraft-settings = { path = "crates/settings" }
 tunnelcraft-app = { path = "crates/app" }
+tunnelcraft-aggregator = { path = "crates/aggregator" }
 
 [profile.release]
 overflow-checks = true

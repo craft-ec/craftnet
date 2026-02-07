@@ -8,7 +8,7 @@
 //! The VPN extension runs in all modes for persistent P2P connectivity,
 //! but traffic routing is only active in Client/Both modes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,13 +20,14 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use tunnelcraft_core::{ExitInfo, ExitRegion, HopMode, Id, Shard, ShardType};
+use tunnelcraft_core::{ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, Shard, ShardType};
 use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_network::{
     build_swarm, NetworkConfig, ShardRequest, ShardResponse, TunnelCraftBehaviour,
     TunnelCraftBehaviourEvent, ExitStatusMessage, ExitStatusType,
+    ProofMessage, PoolType,
     EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
 };
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
@@ -515,7 +516,24 @@ pub struct TunnelCraftNode {
     /// Forward receipts collected from peers proving they received our shards.
     /// Key: request_id, Value: receipts for that request's shards.
     /// Used for on-chain settlement (each receipt proves work done).
-    forward_receipts: HashMap<Id, Vec<tunnelcraft_core::ForwardReceipt>>,
+    forward_receipts: HashMap<Id, Vec<ForwardReceipt>>,
+
+    // === Proof queue + backpressure ===
+
+    /// Bounded proof queue: pool (user pubkey) → pending receipts awaiting proving
+    proof_queue: HashMap<PublicKey, VecDeque<ForwardReceipt>>,
+    /// Max queue size per pool before backpressure kicks in
+    proof_queue_limit: usize,
+    /// Map request_id → (user_pubkey, pool_type) for receipt-to-pool routing
+    request_user: HashMap<Id, (PublicKey, PoolType)>,
+    /// Cumulative Merkle roots per pool: (root, cumulative_count)
+    pool_roots: HashMap<PublicKey, ([u8; 32], u64)>,
+    /// Adaptive batch size (starts at 10K, adjusts based on prover speed)
+    proof_batch_size: usize,
+    /// Prover busy flag (set while proving, cleared when done)
+    prover_busy: bool,
+    /// Last proof generation time (for adaptive batch sizing)
+    last_proof_duration: Option<Duration>,
 }
 
 impl TunnelCraftNode {
@@ -565,6 +583,13 @@ impl TunnelCraftNode {
             last_peer_announcement: None,
             pending_destination: HashMap::new(),
             forward_receipts: HashMap::new(),
+            proof_queue: HashMap::new(),
+            proof_queue_limit: 100_000,
+            request_user: HashMap::new(),
+            pool_roots: HashMap::new(),
+            proof_batch_size: 10_000,
+            prover_busy: false,
+            last_proof_duration: None,
         })
     }
 
@@ -680,6 +705,15 @@ impl TunnelCraftNode {
                 warn!("Failed to subscribe to exit status topic: {:?}", e);
             } else {
                 debug!("Subscribed to exit status topic");
+            }
+        }
+
+        // Subscribe to proof gossipsub topic (for receiving + publishing proofs)
+        if let Some(ref mut swarm) = self.swarm {
+            if let Err(e) = swarm.behaviour_mut().subscribe_proofs() {
+                warn!("Failed to subscribe to proof topic: {:?}", e);
+            } else {
+                debug!("Subscribed to proof topic");
             }
         }
 
@@ -1519,6 +1553,27 @@ impl TunnelCraftNode {
     /// Returns a ShardResponse with a signed ForwardReceipt proving we received
     /// the shard. The sender uses this receipt as on-chain settlement proof.
     async fn process_incoming_shard(&mut self, shard: Shard, _source_peer: PeerId) -> ShardResponse {
+        // Track request → user mapping for proof queue routing.
+        // user_proof is set on request shards by the client; for response shards
+        // the mapping should already exist from the request path.
+        if shard.shard_type == ShardType::Request && shard.user_proof != [0u8; 32] {
+            // TODO: Check subscription cache for pool_type (for now assume Free)
+            self.request_user.entry(shard.request_id)
+                .or_insert((shard.user_proof, PoolType::Free));
+        }
+
+        // Backpressure: if proof queue is full for this user's pool, reject.
+        // Only applies when we're relaying (Node/Both mode).
+        if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+            if let Some((pool, _)) = self.request_user.get(&shard.request_id) {
+                if let Some(queue) = self.proof_queue.get(pool) {
+                    if queue.len() >= self.proof_queue_limit {
+                        return ShardResponse::Rejected("Proof queue full (backpressure)".to_string());
+                    }
+                }
+            }
+        }
+
         // Sign a forward receipt proving we received this shard.
         // Every receiver signs a receipt so the sender can settle — except
         // the first relay on the request path (client is payer, doesn't need proof).
@@ -1528,6 +1583,7 @@ impl TunnelCraftNode {
             &self.keypair,
             &shard.request_id,
             &shard.shard_id,
+            &shard.user_proof,
         );
 
         // Only process relay/exit if in Node or Both mode
@@ -1771,11 +1827,28 @@ impl TunnelCraftNode {
 
     /// Store a forward receipt received from a peer.
     /// Receipts are grouped by request_id for later batch settlement.
-    fn store_forward_receipt(&mut self, receipt: tunnelcraft_core::ForwardReceipt) {
+    fn store_forward_receipt(&mut self, receipt: ForwardReceipt) {
+        // Store in forward_receipts for per-request tracking
         self.forward_receipts
             .entry(receipt.request_id)
             .or_default()
-            .push(receipt);
+            .push(receipt.clone());
+
+        // Route into proof queue for ZK proving (relay/exit mode only)
+        if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+            if let Some((pool, _pool_type)) = self.request_user.get(&receipt.request_id) {
+                let pool = *pool;
+                let queue = self.proof_queue.entry(pool).or_default();
+                if queue.len() < self.proof_queue_limit {
+                    queue.push_back(receipt);
+                } else {
+                    debug!(
+                        "Proof queue full for pool {} — receipt dropped (backpressure)",
+                        hex::encode(&pool[..8])
+                    );
+                }
+            }
+        }
     }
 
     /// Handle response shard for our own request
@@ -1878,6 +1951,11 @@ impl TunnelCraftNode {
 
     /// Poll network once (for integration with VPN event loop)
     pub async fn poll_once(&mut self) {
+        // Try to generate proofs from queued receipts (relay/exit mode)
+        if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+            self.try_prove();
+        }
+
         let Some(ref mut swarm) = self.swarm else {
             // No swarm: yield to runtime so callers using select! don't busy-spin
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2264,6 +2342,149 @@ impl TunnelCraftNode {
     pub fn set_bandwidth_limit(&mut self, limit_kbps: Option<u64>) {
         self.bandwidth_limit_kbps = limit_kbps;
         info!("Bandwidth limit set to: {:?} kbps", limit_kbps);
+    }
+
+    // =========================================================================
+    // Proof queue + adaptive batch prover
+    // =========================================================================
+
+    /// Try to generate a proof from queued receipts.
+    ///
+    /// Called from `poll_once()` on every tick. If the prover is busy or no
+    /// pool has enough queued receipts, this is a no-op.
+    fn try_prove(&mut self) {
+        if self.prover_busy {
+            return;
+        }
+
+        // Find the pool with the most queued receipts
+        let best_pool = self.proof_queue.iter()
+            .filter(|(_, q)| !q.is_empty())
+            .max_by_key(|(_, q)| q.len())
+            .map(|(k, q)| (*k, q.len()));
+
+        let Some((pool, queue_len)) = best_pool else {
+            return;
+        };
+
+        // Only prove if we have enough receipts (at least 1 for now; in production
+        // this would wait for a minimum batch size)
+        let batch_size = queue_len.min(self.proof_batch_size);
+        if batch_size == 0 {
+            return;
+        }
+
+        // Take receipts from the front of the queue
+        let queue = self.proof_queue.get_mut(&pool).unwrap();
+        let batch: Vec<ForwardReceipt> = queue.drain(..batch_size).collect();
+
+        // Look up pool type for this pool
+        let pool_type = self.request_user.values()
+            .find(|(p, _)| *p == pool)
+            .map(|(_, pt)| *pt)
+            .unwrap_or(PoolType::Free);
+
+        self.prover_busy = true;
+        let start = std::time::Instant::now();
+
+        // Build Merkle tree of receipt hashes (stub: just hash all receipts)
+        let new_root = Self::build_receipt_merkle_root(&batch);
+        let (prev_root, prev_count) = self.pool_roots.get(&pool)
+            .copied()
+            .unwrap_or(([0u8; 32], 0));
+
+        let cumulative_count = prev_count + batch.len() as u64;
+
+        // Generate proof message (stub proof — real ZK in Phase 8)
+        let msg = ProofMessage {
+            relay_pubkey: self.keypair.public_key_bytes(),
+            pool_pubkey: pool,
+            pool_type,
+            batch_count: batch.len() as u64,
+            cumulative_count,
+            prev_root,
+            new_root,
+            proof: vec![], // Stub — ZK proof bytes would go here
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            signature: vec![0u8; 64], // TODO: sign with relay keypair
+        };
+
+        // Publish to gossipsub
+        if let Some(ref mut swarm) = self.swarm {
+            let data = msg.to_bytes();
+            match swarm.behaviour_mut().publish_proof(data) {
+                Ok(msg_id) => {
+                    debug!(
+                        "Published proof for pool {} (batch: {}, cumulative: {}, msg: {:?})",
+                        hex::encode(&pool[..8]),
+                        batch.len(),
+                        cumulative_count,
+                        msg_id,
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to publish proof: {:?}", e);
+                }
+            }
+        }
+
+        // Update pool roots
+        self.pool_roots.insert(pool, (new_root, cumulative_count));
+
+        // Adaptive batch sizing
+        let duration = start.elapsed();
+        self.last_proof_duration = Some(duration);
+        self.adjust_batch_size(duration);
+
+        self.prover_busy = false;
+    }
+
+    /// Build a Merkle root from a batch of receipts (stub implementation).
+    ///
+    /// In production this would build a proper Merkle tree and generate
+    /// a ZK proof. For now it's a simple hash chain.
+    fn build_receipt_merkle_root(batch: &[ForwardReceipt]) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        for receipt in batch {
+            hasher.update(&receipt.request_id);
+            hasher.update(&receipt.shard_id);
+            hasher.update(&receipt.receiver_pubkey);
+            hasher.update(&receipt.user_proof);
+            hasher.update(&receipt.timestamp.to_le_bytes());
+        }
+        let result = hasher.finalize();
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&result);
+        root
+    }
+
+    /// Adjust batch size based on proving duration (adaptive).
+    ///
+    /// If proof took < 10s, increase batch size (up to 100K).
+    /// If proof took > 60s, decrease batch size (down to 10K).
+    fn adjust_batch_size(&mut self, duration: Duration) {
+        let secs = duration.as_secs();
+        if secs < 10 && self.proof_batch_size < 100_000 {
+            self.proof_batch_size = (self.proof_batch_size * 12 / 10).min(100_000);
+            debug!("Increased proof batch size to {}", self.proof_batch_size);
+        } else if secs > 60 && self.proof_batch_size > 10_000 {
+            self.proof_batch_size = (self.proof_batch_size * 8 / 10).max(10_000);
+            debug!("Decreased proof batch size to {}", self.proof_batch_size);
+        }
+    }
+
+    /// Get the current proof queue depth (for monitoring/debugging)
+    pub fn proof_queue_depth(&self) -> usize {
+        self.proof_queue.values().map(|q| q.len()).sum()
+    }
+
+    /// Get proof queue depth for a specific pool
+    pub fn pool_queue_depth(&self, pool: &PublicKey) -> usize {
+        self.proof_queue.get(pool).map(|q| q.len()).unwrap_or(0)
     }
 }
 

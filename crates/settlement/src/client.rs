@@ -4,6 +4,13 @@
 //! - **Mock Mode**: For development/testing without Solana. All operations succeed
 //!   and state is tracked in-memory.
 //! - **Live Mode**: Actual Solana RPC calls to the TunnelCraft settlement program.
+//!
+//! ## New Settlement Model
+//!
+//! Receipts stay local on the relay — never submitted on-chain individually.
+//! Instead, relays generate ZK proofs locally, gossip proven summaries,
+//! and an aggregator posts a distribution root on-chain. Relays claim
+//! proportional rewards using Merkle proofs against the distribution root.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -24,8 +31,9 @@ use tunnelcraft_core::{Id, PublicKey, ForwardReceipt, SubscriptionTier};
 
 use crate::{
     SettlementError, Result,
-    Subscribe, SubmitReceipts, ClaimRewards, Withdraw,
+    Subscribe, PostDistribution, ClaimRewards, Withdraw,
     SubscriptionState, NodeAccount, TransactionSignature,
+    EpochPhase, EPOCH_DURATION_SECS,
 };
 
 /// Settlement mode
@@ -120,10 +128,8 @@ struct MockState {
     subscriptions: HashMap<PublicKey, SubscriptionState>,
     /// Node accounts by node pubkey
     nodes: HashMap<PublicKey, NodeAccount>,
-    /// Receipt dedup set: (request_id, shard_id, receiver_pubkey) hash
-    submitted_receipts: HashMap<Id, bool>,
-    /// Receipts per node per user pool: (node_pubkey, user_pubkey) -> count
-    pool_receipts: HashMap<(PublicKey, PublicKey), u64>,
+    /// Claimed relays per user pool: (user_pubkey, node_pubkey) -> true
+    claimed_relays: HashMap<(PublicKey, PublicKey), bool>,
     /// Transaction counter for generating mock signatures
     tx_counter: u64,
 }
@@ -131,10 +137,10 @@ struct MockState {
 /// Anchor instruction discriminators for the TunnelCraft settlement program.
 /// Each is the first 8 bytes of SHA256("global:<instruction_name>").
 mod instruction {
-    pub const SUBSCRIBE:       [u8; 8] = [0xa3, 0xb1, 0xc2, 0xd4, 0xe5, 0xf6, 0x07, 0x18];
-    pub const SUBMIT_RECEIPTS: [u8; 8] = [0xb4, 0xc2, 0xd3, 0xe5, 0xf6, 0x07, 0x18, 0x29];
-    pub const CLAIM_REWARDS:   [u8; 8] = [0xc5, 0xd3, 0xe4, 0xf6, 0x07, 0x18, 0x29, 0x3a];
-    pub const WITHDRAW:        [u8; 8] = [0xb7, 0x12, 0x46, 0x9c, 0x94, 0x6d, 0xa1, 0x22];
+    pub const SUBSCRIBE:          [u8; 8] = [0xa3, 0xb1, 0xc2, 0xd4, 0xe5, 0xf6, 0x07, 0x18];
+    pub const POST_DISTRIBUTION:  [u8; 8] = [0xd6, 0xe4, 0xf5, 0x07, 0x18, 0x29, 0x3a, 0x4b];
+    pub const CLAIM_REWARDS:      [u8; 8] = [0xc5, 0xd3, 0xe4, 0xf6, 0x07, 0x18, 0x29, 0x3a];
+    pub const WITHDRAW:           [u8; 8] = [0xb7, 0x12, 0x46, 0x9c, 0x94, 0x6d, 0xa1, 0x22];
 }
 
 /// Settlement client for on-chain operations
@@ -292,22 +298,6 @@ impl SettlementClient {
         )
     }
 
-    /// Derive PDA for user pool account
-    fn pool_pda(&self, user_pubkey: &PublicKey) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[b"pool", user_pubkey],
-            &self.program_id(),
-        )
-    }
-
-    /// Derive PDA for receipt dedup
-    fn receipt_pda(&self, pool_pubkey: &Pubkey, receipt_hash: &[u8; 32]) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[b"receipt", pool_pubkey.as_ref(), receipt_hash],
-            &self.program_id(),
-        )
-    }
-
     /// Derive PDA for node account
     fn node_pda(&self, node_pubkey: &PublicKey) -> (Pubkey, u8) {
         Pubkey::find_program_address(
@@ -373,15 +363,18 @@ impl SettlementClient {
         if self.is_mock() {
             let mut state = self.mock_state.write().expect("settlement lock poisoned");
 
-            // 30 days from now
-            let expires_at = Self::now() + 30 * 24 * 3600;
+            let now = Self::now();
+            let expires_at = now + EPOCH_DURATION_SECS;
 
             let subscription = SubscriptionState {
                 user_pubkey: sub.user_pubkey,
                 tier: sub.tier,
+                created_at: now,
                 expires_at,
                 pool_balance: sub.payment_amount,
+                original_pool_balance: sub.payment_amount,
                 total_receipts: 0,
+                distribution_root: None,
             };
             state.subscriptions.insert(sub.user_pubkey, subscription);
 
@@ -397,7 +390,6 @@ impl SettlementClient {
 
         // Live mode
         let (subscription_pda, _) = self.subscription_pda(&sub.user_pubkey);
-        let (pool_pda, _) = self.pool_pda(&sub.user_pubkey);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
 
         let tier_byte = match sub.tier {
@@ -416,7 +408,6 @@ impl SettlementClient {
             accounts: vec![
                 AccountMeta::new(signer, true),
                 AccountMeta::new(subscription_pda, false),
-                AccountMeta::new(pool_pda, false),
                 AccountMeta::new_readonly(system_program::id(), false),
             ],
             data,
@@ -425,119 +416,67 @@ impl SettlementClient {
         self.send_transaction(instruction).await
     }
 
-    // ==================== Submit Receipts ====================
+    // ==================== Post Distribution ====================
 
-    /// Submit ForwardReceipts to a user's pool
+    /// Post a distribution root for a user's pool.
     ///
-    /// Each receipt is deduped on-chain. Duplicate receipts are silently skipped.
-    pub async fn submit_receipts(
+    /// Can only be called after the grace period (epoch expired + 1 day).
+    /// The aggregator calls this after collecting ZK-proven summaries.
+    pub async fn post_distribution(
         &self,
-        submit: SubmitReceipts,
+        dist: PostDistribution,
     ) -> Result<TransactionSignature> {
         info!(
-            "Submitting {} receipts for user pool {}",
-            submit.receipts.len(),
-            hex_encode(&submit.user_pubkey[..8]),
+            "Posting distribution for user pool {} (root: {}, receipts: {})",
+            hex_encode(&dist.user_pubkey[..8]),
+            hex_encode(&dist.distribution_root[..8]),
+            dist.total_receipts,
         );
 
         if self.is_mock() {
             let mut state = self.mock_state.write().expect("settlement lock poisoned");
 
-            // Verify subscription exists and is active
-            let subscription = state.subscriptions.get_mut(&submit.user_pubkey)
+            let subscription = state.subscriptions.get(&dist.user_pubkey)
                 .ok_or_else(|| SettlementError::SubscriptionNotFound(
-                    hex_encode(&submit.user_pubkey[..8])
+                    hex_encode(&dist.user_pubkey[..8])
                 ))?;
 
-            if subscription.pool_balance == 0 {
-                return Err(SettlementError::InsufficientCredits);
+            // Enforce epoch phase: must be past grace period
+            let now = Self::now();
+            let phase = subscription.phase(now);
+            if matches!(phase, EpochPhase::Active | EpochPhase::Grace) {
+                return Err(SettlementError::EpochNotComplete);
             }
 
-            let mut new_count = 0u64;
-            for receipt in &submit.receipts {
-                let dedup_hash = Self::receipt_dedup_hash(receipt);
-
-                // Skip duplicates
-                if state.submitted_receipts.contains_key(&dedup_hash) {
-                    debug!("Skipping duplicate receipt {}", hex_encode(&dedup_hash[..8]));
-                    continue;
-                }
-
-                // Mark as submitted
-                state.submitted_receipts.insert(dedup_hash, true);
-
-                // Track per-node receipts for this user pool
-                let key = (receipt.receiver_pubkey, submit.user_pubkey);
-                let count = state.pool_receipts.entry(key).or_insert(0);
-                *count += 1;
-
-                // Update node account
-                let node = state.nodes
-                    .entry(receipt.receiver_pubkey)
-                    .or_insert_with(|| NodeAccount {
-                        node_pubkey: receipt.receiver_pubkey,
-                        current_epoch_receipts: 0,
-                        lifetime_receipts: 0,
-                        unclaimed_rewards: 0,
-                        last_withdrawal_epoch: 0,
-                    });
-                node.current_epoch_receipts += 1;
-                node.lifetime_receipts += 1;
-
-                new_count += 1;
-            }
-
-            // Update subscription total receipts
-            let subscription = state.subscriptions.get_mut(&submit.user_pubkey).unwrap();
-            subscription.total_receipts += new_count;
+            let subscription = state.subscriptions.get_mut(&dist.user_pubkey).unwrap();
+            subscription.distribution_root = Some(dist.distribution_root);
+            subscription.total_receipts = dist.total_receipts;
+            subscription.original_pool_balance = subscription.pool_balance;
 
             info!(
-                "[MOCK] Submitted {} new receipts (skipped {} dupes) for user pool {}",
-                new_count,
-                submit.receipts.len() as u64 - new_count,
-                hex_encode(&submit.user_pubkey[..8]),
+                "[MOCK] Distribution posted for user pool {} (total: {})",
+                hex_encode(&dist.user_pubkey[..8]),
+                dist.total_receipts,
             );
             return Ok(Self::generate_mock_signature(&mut state));
         }
 
         // Live mode
-        let (pool_pda, _) = self.pool_pda(&submit.user_pubkey);
+        let (subscription_pda, _) = self.subscription_pda(&dist.user_pubkey);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
 
-        let receipts_data = bincode::serialize(&submit.receipts)
-            .map_err(|e| SettlementError::SerializationError(e.to_string()))?;
-
-        let mut data = instruction::SUBMIT_RECEIPTS.to_vec();
-        data.extend_from_slice(&submit.user_pubkey);
-        data.extend_from_slice(&(receipts_data.len() as u32).to_le_bytes());
-        data.extend_from_slice(&receipts_data);
-
-        let mut accounts = vec![
-            AccountMeta::new(signer, true),
-            AccountMeta::new(pool_pda, false),
-        ];
-
-        // Add receipt dedup PDAs
-        for receipt in &submit.receipts {
-            let dedup_hash = Self::receipt_dedup_hash(receipt);
-            let (receipt_pda, _) = self.receipt_pda(&pool_pda, &dedup_hash);
-            accounts.push(AccountMeta::new(receipt_pda, false));
-        }
-
-        // Add node account PDAs for each unique receiver
-        let mut seen_receivers = std::collections::HashSet::new();
-        for receipt in &submit.receipts {
-            if seen_receivers.insert(receipt.receiver_pubkey) {
-                let (node_pda, _) = self.node_pda(&receipt.receiver_pubkey);
-                accounts.push(AccountMeta::new(node_pda, false));
-            }
-        }
-
-        accounts.push(AccountMeta::new_readonly(system_program::id(), false));
+        let mut data = instruction::POST_DISTRIBUTION.to_vec();
+        data.extend_from_slice(&dist.user_pubkey);
+        data.extend_from_slice(&dist.distribution_root);
+        data.extend_from_slice(&dist.total_receipts.to_le_bytes());
 
         let instruction = Instruction {
             program_id: self.program_id(),
-            accounts,
+            accounts: vec![
+                AccountMeta::new(signer, true),
+                AccountMeta::new(subscription_pda, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
             data,
         };
 
@@ -546,18 +485,20 @@ impl SettlementClient {
 
     // ==================== Claim Rewards ====================
 
-    /// Claim proportional rewards from a user's pool
+    /// Claim proportional rewards from a user's pool using Merkle proof.
     ///
-    /// payout = (node_receipts / total_receipts) * pool_balance
+    /// payout = (relay_count / total_receipts) * pool_balance
+    ///
+    /// Requires: distribution posted, epoch past grace, relay not already claimed.
     pub async fn claim_rewards(
         &self,
         claim: ClaimRewards,
     ) -> Result<TransactionSignature> {
         info!(
-            "Claiming rewards for node {} from user pool {} (epoch {})",
+            "Claiming rewards for node {} from user pool {} ({} receipts)",
             hex_encode(&claim.node_pubkey[..8]),
             hex_encode(&claim.user_pubkey[..8]),
-            claim.epoch,
+            claim.relay_count,
         );
 
         if self.is_mock() {
@@ -569,22 +510,33 @@ impl SettlementClient {
                 ))?
                 .clone();
 
+            // Enforce epoch phase
+            let now = Self::now();
+            let phase = subscription.phase(now);
+            if matches!(phase, EpochPhase::Active | EpochPhase::Grace) {
+                return Err(SettlementError::EpochNotComplete);
+            }
+
+            // Must have distribution posted
+            if subscription.distribution_root.is_none() {
+                return Err(SettlementError::DistributionNotPosted);
+            }
+
             if subscription.total_receipts == 0 {
                 return Err(SettlementError::TransactionFailed(
                     "No receipts in pool".to_string()
                 ));
             }
 
-            // Calculate proportional share
-            let key = (claim.node_pubkey, claim.user_pubkey);
-            let node_receipts = state.pool_receipts.get(&key).copied().unwrap_or(0);
-            if node_receipts == 0 {
-                return Err(SettlementError::TransactionFailed(
-                    "Node has no receipts in this pool".to_string()
-                ));
+            // Check not already claimed
+            let claim_key = (claim.user_pubkey, claim.node_pubkey);
+            if state.claimed_relays.contains_key(&claim_key) {
+                return Err(SettlementError::AlreadyClaimed);
             }
 
-            let payout = (node_receipts as u128 * subscription.pool_balance as u128
+            // Calculate proportional share
+            // In mock mode, we trust relay_count (in live mode, Merkle proof verifies it)
+            let payout = (claim.relay_count as u128 * subscription.original_pool_balance as u128
                 / subscription.total_receipts as u128) as u64;
 
             // Award to node
@@ -592,47 +544,48 @@ impl SettlementClient {
                 .entry(claim.node_pubkey)
                 .or_insert_with(|| NodeAccount {
                     node_pubkey: claim.node_pubkey,
-                    current_epoch_receipts: 0,
-                    lifetime_receipts: 0,
                     unclaimed_rewards: 0,
                     last_withdrawal_epoch: 0,
                 });
             node.unclaimed_rewards += payout;
 
-            // Remove claimed receipts to prevent double-claiming
-            state.pool_receipts.remove(&key);
+            // Mark as claimed
+            state.claimed_relays.insert(claim_key, true);
 
-            // Deduct from pool and adjust receipt count
+            // Deduct from pool
             let subscription = state.subscriptions.get_mut(&claim.user_pubkey).unwrap();
             subscription.pool_balance = subscription.pool_balance.saturating_sub(payout);
-            subscription.total_receipts = subscription.total_receipts.saturating_sub(node_receipts);
 
             info!(
-                "[MOCK] Node {} claimed {} from user pool {} ({}/{} receipts)",
+                "[MOCK] Node {} claimed {} from user pool {} ({} receipts)",
                 hex_encode(&claim.node_pubkey[..8]),
                 payout,
                 hex_encode(&claim.user_pubkey[..8]),
-                node_receipts,
-                subscription.total_receipts,
+                claim.relay_count,
             );
             return Ok(Self::generate_mock_signature(&mut state));
         }
 
         // Live mode
-        let (pool_pda, _) = self.pool_pda(&claim.user_pubkey);
+        let (subscription_pda, _) = self.subscription_pda(&claim.user_pubkey);
         let (node_pda, _) = self.node_pda(&claim.node_pubkey);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
 
         let mut data = instruction::CLAIM_REWARDS.to_vec();
         data.extend_from_slice(&claim.user_pubkey);
         data.extend_from_slice(&claim.node_pubkey);
-        data.extend_from_slice(&claim.epoch.to_le_bytes());
+        data.extend_from_slice(&claim.relay_count.to_le_bytes());
+        // Serialize Merkle proof
+        data.extend_from_slice(&(claim.merkle_proof.len() as u32).to_le_bytes());
+        for hash in &claim.merkle_proof {
+            data.extend_from_slice(hash);
+        }
 
         let instruction = Instruction {
             program_id: self.program_id(),
             accounts: vec![
                 AccountMeta::new(signer, true),
-                AccountMeta::new(pool_pda, false),
+                AccountMeta::new(subscription_pda, false),
                 AccountMeta::new(node_pda, false),
                 AccountMeta::new_readonly(system_program::id(), false),
             ],
@@ -649,10 +602,10 @@ impl SettlementClient {
         &self,
         withdraw: Withdraw,
     ) -> Result<TransactionSignature> {
-        info!("Withdrawing from epoch {}", withdraw.epoch);
+        info!("Withdrawing {} (0 = all)", withdraw.amount);
 
         if self.is_mock() {
-            info!("[MOCK] Withdrawal processed for epoch {}", withdraw.epoch);
+            info!("[MOCK] Withdrawal processed: {}", withdraw.amount);
             return Ok(self.mock_signature());
         }
 
@@ -660,7 +613,6 @@ impl SettlementClient {
         let signer = Pubkey::new_from_array(self.signer_pubkey);
 
         let mut data = instruction::WITHDRAW.to_vec();
-        data.extend_from_slice(&withdraw.epoch.to_le_bytes());
         data.extend_from_slice(&withdraw.amount.to_le_bytes());
 
         let instruction = Instruction {
@@ -698,7 +650,7 @@ impl SettlementClient {
         match rpc.get_account(&subscription_pda).await {
             Ok(account) => {
                 let data = &account.data[8..]; // Skip Anchor discriminator
-                if data.len() < 32 + 1 + 8 + 8 + 8 {
+                if data.len() < 32 + 1 + 8 + 8 + 8 + 8 {
                     return Ok(None);
                 }
 
@@ -712,16 +664,29 @@ impl SettlementClient {
                     _ => SubscriptionTier::Basic,
                 };
 
-                let expires_at = u64::from_le_bytes(data[33..41].try_into().expect("8 bytes"));
-                let pool_balance = u64::from_le_bytes(data[41..49].try_into().expect("8 bytes"));
-                let total_receipts = u64::from_le_bytes(data[49..57].try_into().expect("8 bytes"));
+                let created_at = u64::from_le_bytes(data[33..41].try_into().expect("8 bytes"));
+                let expires_at = u64::from_le_bytes(data[41..49].try_into().expect("8 bytes"));
+                let pool_balance = u64::from_le_bytes(data[49..57].try_into().expect("8 bytes"));
+                let total_receipts = u64::from_le_bytes(data[57..65].try_into().expect("8 bytes"));
+
+                // Distribution root: 1 byte flag + 32 bytes
+                let distribution_root = if data.len() >= 66 + 32 && data[65] == 1 {
+                    let mut root = [0u8; 32];
+                    root.copy_from_slice(&data[66..98]);
+                    Some(root)
+                } else {
+                    None
+                };
 
                 Ok(Some(SubscriptionState {
                     user_pubkey: pubkey,
                     tier,
+                    created_at,
                     expires_at,
                     pool_balance,
+                    original_pool_balance: pool_balance,
                     total_receipts,
+                    distribution_root,
                 }))
             }
             Err(e) => {
@@ -739,7 +704,7 @@ impl SettlementClient {
         }
     }
 
-    /// Get node's account info (receipts and rewards)
+    /// Get node's account info (rewards)
     pub async fn get_node_account(
         &self,
         node_pubkey: PublicKey,
@@ -750,8 +715,6 @@ impl SettlementClient {
             let state = self.mock_state.read().expect("settlement lock poisoned");
             return Ok(state.nodes.get(&node_pubkey).cloned().unwrap_or(NodeAccount {
                 node_pubkey,
-                current_epoch_receipts: 0,
-                lifetime_receipts: 0,
                 unclaimed_rewards: 0,
                 last_withdrawal_epoch: 0,
             }));
@@ -765,33 +728,25 @@ impl SettlementClient {
         match rpc.get_account(&node_pda).await {
             Ok(account) => {
                 let data = &account.data[8..];
-                if data.len() < 32 + 8 + 8 + 8 + 8 {
+                if data.len() < 32 + 8 + 8 {
                     return Ok(NodeAccount {
                         node_pubkey,
-                        current_epoch_receipts: 0,
-                        lifetime_receipts: 0,
                         unclaimed_rewards: 0,
                         last_withdrawal_epoch: 0,
                     });
                 }
 
-                let current_epoch_receipts = u64::from_le_bytes(data[32..40].try_into().expect("8 bytes"));
-                let lifetime_receipts = u64::from_le_bytes(data[40..48].try_into().expect("8 bytes"));
-                let unclaimed_rewards = u64::from_le_bytes(data[48..56].try_into().expect("8 bytes"));
-                let last_withdrawal_epoch = u64::from_le_bytes(data[56..64].try_into().expect("8 bytes"));
+                let unclaimed_rewards = u64::from_le_bytes(data[32..40].try_into().expect("8 bytes"));
+                let last_withdrawal_epoch = u64::from_le_bytes(data[40..48].try_into().expect("8 bytes"));
 
                 Ok(NodeAccount {
                     node_pubkey,
-                    current_epoch_receipts,
-                    lifetime_receipts,
                     unclaimed_rewards,
                     last_withdrawal_epoch,
                 })
             }
             Err(_) => Ok(NodeAccount {
                 node_pubkey,
-                current_epoch_receipts: 0,
-                lifetime_receipts: 0,
                 unclaimed_rewards: 0,
                 last_withdrawal_epoch: 0,
             }),
@@ -812,19 +767,57 @@ impl SettlementClient {
         }
 
         let mut state = self.mock_state.write().expect("settlement lock poisoned");
-        let expires_at = Self::now() + 30 * 24 * 3600;
+        let now = Self::now();
+        let expires_at = now + EPOCH_DURATION_SECS;
         state.subscriptions.insert(user_pubkey, SubscriptionState {
             user_pubkey,
             tier,
+            created_at: now,
             expires_at,
             pool_balance,
+            original_pool_balance: pool_balance,
             total_receipts: 0,
+            distribution_root: None,
         });
         info!(
             "[MOCK] Added subscription for {} ({:?}, pool: {})",
             hex_encode(&user_pubkey[..8]),
             tier,
             pool_balance,
+        );
+        Ok(())
+    }
+
+    /// Add a mock subscription with custom expiry (mock mode only, for testing epoch phases)
+    pub fn add_mock_subscription_with_expiry(
+        &self,
+        user_pubkey: PublicKey,
+        tier: SubscriptionTier,
+        pool_balance: u64,
+        created_at: u64,
+        expires_at: u64,
+    ) -> Result<()> {
+        if !self.is_mock() {
+            return Err(SettlementError::NotAuthorized);
+        }
+
+        let mut state = self.mock_state.write().expect("settlement lock poisoned");
+        state.subscriptions.insert(user_pubkey, SubscriptionState {
+            user_pubkey,
+            tier,
+            created_at,
+            expires_at,
+            pool_balance,
+            original_pool_balance: pool_balance,
+            total_receipts: 0,
+            distribution_root: None,
+        });
+        info!(
+            "[MOCK] Added subscription with expiry for {} ({:?}, pool: {}, expires: {})",
+            hex_encode(&user_pubkey[..8]),
+            tier,
+            pool_balance,
+            expires_at,
         );
         Ok(())
     }
@@ -867,6 +860,7 @@ mod tests {
             request_id: [1u8; 32],
             shard_id: [10u8; 32],
             receiver_pubkey: [2u8; 32],
+            user_proof: [5u8; 32],
             timestamp: 1000,
             signature: [0u8; 64],
         };
@@ -890,16 +884,16 @@ mod tests {
             request_id: [1u8; 32],
             shard_id: [10u8; 32],
             receiver_pubkey: [2u8; 32],
+            user_proof: [5u8; 32],
             timestamp: 1000,
             signature: [0u8; 64],
         };
 
         let receipt2 = ForwardReceipt {
-            timestamp: 2000, // Different timestamp
+            timestamp: 2000,
             ..receipt1.clone()
         };
 
-        // Same dedup hash (timestamp not included in dedup)
         assert_eq!(
             SettlementClient::receipt_dedup_hash(&receipt1),
             SettlementClient::receipt_dedup_hash(&receipt2),
@@ -928,86 +922,19 @@ mod tests {
         let sig = client.subscribe(sub).await.unwrap();
         assert_ne!(sig, [0u8; 64]);
 
-        // Verify subscription was created
         let state = client.get_subscription_state(user_pubkey).await.unwrap();
         assert!(state.is_some());
         let state = state.unwrap();
         assert_eq!(state.tier, SubscriptionTier::Standard);
         assert_eq!(state.pool_balance, 15_000_000);
+        assert!(state.created_at > 0);
+        assert!(state.distribution_root.is_none());
 
-        // Verify is_subscribed
         assert!(client.is_subscribed(user_pubkey).await.unwrap());
     }
 
     #[tokio::test]
-    async fn test_mock_submit_receipts() {
-        let config = SettlementConfig::mock();
-        let client = SettlementClient::new(config, [0u8; 32]);
-
-        let user_pubkey = [1u8; 32];
-        client.add_mock_subscription(user_pubkey, SubscriptionTier::Basic, 5_000_000).unwrap();
-
-        let receipt = ForwardReceipt {
-            request_id: [10u8; 32],
-            shard_id: [100u8; 32],
-            receiver_pubkey: [2u8; 32],
-            timestamp: 1000,
-            signature: [0u8; 64],
-        };
-
-        let submit = SubmitReceipts {
-            user_pubkey,
-            receipts: vec![receipt.clone()],
-        };
-
-        client.submit_receipts(submit).await.unwrap();
-
-        // Check node got credit
-        let node = client.get_node_account([2u8; 32]).await.unwrap();
-        assert_eq!(node.current_epoch_receipts, 1);
-        assert_eq!(node.lifetime_receipts, 1);
-
-        // Check subscription total_receipts
-        let sub = client.get_subscription_state(user_pubkey).await.unwrap().unwrap();
-        assert_eq!(sub.total_receipts, 1);
-    }
-
-    #[tokio::test]
-    async fn test_mock_receipt_dedup() {
-        let config = SettlementConfig::mock();
-        let client = SettlementClient::new(config, [0u8; 32]);
-
-        let user_pubkey = [1u8; 32];
-        client.add_mock_subscription(user_pubkey, SubscriptionTier::Basic, 5_000_000).unwrap();
-
-        let receipt = ForwardReceipt {
-            request_id: [10u8; 32],
-            shard_id: [100u8; 32],
-            receiver_pubkey: [2u8; 32],
-            timestamp: 1000,
-            signature: [0u8; 64],
-        };
-
-        // Submit same receipt twice
-        let submit1 = SubmitReceipts {
-            user_pubkey,
-            receipts: vec![receipt.clone()],
-        };
-        client.submit_receipts(submit1).await.unwrap();
-
-        let submit2 = SubmitReceipts {
-            user_pubkey,
-            receipts: vec![receipt],
-        };
-        client.submit_receipts(submit2).await.unwrap();
-
-        // Should only count once
-        let node = client.get_node_account([2u8; 32]).await.unwrap();
-        assert_eq!(node.current_epoch_receipts, 1);
-    }
-
-    #[tokio::test]
-    async fn test_mock_claim_rewards() {
+    async fn test_mock_post_distribution_and_claim() {
         let config = SettlementConfig::mock();
         let client = SettlementClient::new(config, [0u8; 32]);
 
@@ -1015,48 +942,50 @@ mod tests {
         let node1 = [2u8; 32];
         let node2 = [3u8; 32];
 
-        client.add_mock_subscription(user_pubkey, SubscriptionTier::Standard, 1_000_000).unwrap();
-
-        // Submit 3 receipts for node1, 1 for node2
-        let receipts: Vec<ForwardReceipt> = (0..4).map(|i| {
-            let mut shard_id = [0u8; 32];
-            shard_id[0] = i;
-            ForwardReceipt {
-                request_id: [10u8; 32],
-                shard_id,
-                receiver_pubkey: if i < 3 { node1 } else { node2 },
-                timestamp: 1000,
-                signature: [0u8; 64],
-            }
-        }).collect();
-
-        let submit = SubmitReceipts {
+        // Create an already-expired subscription
+        let now = SettlementClient::now();
+        client.add_mock_subscription_with_expiry(
             user_pubkey,
-            receipts,
-        };
-        client.submit_receipts(submit).await.unwrap();
+            SubscriptionTier::Standard,
+            1_000_000,
+            now - 40 * 24 * 3600, // created 40 days ago
+            now - 10 * 24 * 3600, // expired 10 days ago (past grace)
+        ).unwrap();
 
-        // Node1 claims: 3/4 * 1_000_000 = 750_000
-        let claim1 = ClaimRewards {
+        // Post distribution: node1 has 7, node2 has 3 = 10 total
+        let dist_root = [0xAA; 32];
+        client.post_distribution(PostDistribution {
+            user_pubkey,
+            distribution_root: dist_root,
+            total_receipts: 10,
+        }).await.unwrap();
+
+        // Verify distribution was stored
+        let sub = client.get_subscription_state(user_pubkey).await.unwrap().unwrap();
+        assert_eq!(sub.distribution_root, Some(dist_root));
+        assert_eq!(sub.total_receipts, 10);
+
+        // Node1 claims 7/10 * 1_000_000 = 700_000
+        client.claim_rewards(ClaimRewards {
             user_pubkey,
             node_pubkey: node1,
-            epoch: 1,
-        };
-        client.claim_rewards(claim1).await.unwrap();
+            relay_count: 7,
+            merkle_proof: vec![], // mock doesn't verify
+        }).await.unwrap();
 
         let acct1 = client.get_node_account(node1).await.unwrap();
-        assert_eq!(acct1.unclaimed_rewards, 750_000);
+        assert_eq!(acct1.unclaimed_rewards, 700_000);
 
-        // Node2 claims: 1/4 * 1_000_000 = 250_000
-        let claim2 = ClaimRewards {
+        // Node2 claims 3/10 * 1_000_000 = 300_000
+        client.claim_rewards(ClaimRewards {
             user_pubkey,
             node_pubkey: node2,
-            epoch: 1,
-        };
-        client.claim_rewards(claim2).await.unwrap();
+            relay_count: 3,
+            merkle_proof: vec![],
+        }).await.unwrap();
 
         let acct2 = client.get_node_account(node2).await.unwrap();
-        assert_eq!(acct2.unclaimed_rewards, 250_000);
+        assert_eq!(acct2.unclaimed_rewards, 300_000);
 
         // Pool should be drained
         let sub = client.get_subscription_state(user_pubkey).await.unwrap().unwrap();
@@ -1064,17 +993,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_no_subscription() {
+    async fn test_epoch_phase_enforcement_post_distribution() {
         let config = SettlementConfig::mock();
         let client = SettlementClient::new(config, [0u8; 32]);
 
-        let submit = SubmitReceipts {
-            user_pubkey: [99u8; 32],
-            receipts: vec![],
-        };
+        let user_pubkey = [1u8; 32];
 
-        let result = client.submit_receipts(submit).await;
-        assert!(matches!(result, Err(SettlementError::SubscriptionNotFound(_))));
+        // Active subscription — post_distribution should fail
+        client.add_mock_subscription(user_pubkey, SubscriptionTier::Standard, 1_000_000).unwrap();
+
+        let result = client.post_distribution(PostDistribution {
+            user_pubkey,
+            distribution_root: [0xAA; 32],
+            total_receipts: 100,
+        }).await;
+
+        assert!(matches!(result, Err(SettlementError::EpochNotComplete)));
+    }
+
+    #[tokio::test]
+    async fn test_epoch_phase_enforcement_claim() {
+        let config = SettlementConfig::mock();
+        let client = SettlementClient::new(config, [0u8; 32]);
+
+        let user_pubkey = [1u8; 32];
+
+        // Active subscription — claim should fail
+        client.add_mock_subscription(user_pubkey, SubscriptionTier::Standard, 1_000_000).unwrap();
+
+        let result = client.claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: [2u8; 32],
+            relay_count: 10,
+            merkle_proof: vec![],
+        }).await;
+
+        assert!(matches!(result, Err(SettlementError::EpochNotComplete)));
+    }
+
+    #[tokio::test]
+    async fn test_claim_requires_distribution() {
+        let config = SettlementConfig::mock();
+        let client = SettlementClient::new(config, [0u8; 32]);
+
+        let user_pubkey = [1u8; 32];
+        let now = SettlementClient::now();
+
+        // Expired subscription, past grace, but no distribution posted
+        client.add_mock_subscription_with_expiry(
+            user_pubkey,
+            SubscriptionTier::Standard,
+            1_000_000,
+            now - 40 * 24 * 3600,
+            now - 10 * 24 * 3600,
+        ).unwrap();
+
+        let result = client.claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: [2u8; 32],
+            relay_count: 10,
+            merkle_proof: vec![],
+        }).await;
+
+        assert!(matches!(result, Err(SettlementError::DistributionNotPosted)));
+    }
+
+    #[tokio::test]
+    async fn test_double_claim_rejected() {
+        let config = SettlementConfig::mock();
+        let client = SettlementClient::new(config, [0u8; 32]);
+
+        let user_pubkey = [1u8; 32];
+        let node = [2u8; 32];
+        let now = SettlementClient::now();
+
+        client.add_mock_subscription_with_expiry(
+            user_pubkey,
+            SubscriptionTier::Standard,
+            1_000_000,
+            now - 40 * 24 * 3600,
+            now - 10 * 24 * 3600,
+        ).unwrap();
+
+        client.post_distribution(PostDistribution {
+            user_pubkey,
+            distribution_root: [0xAA; 32],
+            total_receipts: 10,
+        }).await.unwrap();
+
+        // First claim succeeds
+        client.claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: node,
+            relay_count: 5,
+            merkle_proof: vec![],
+        }).await.unwrap();
+
+        // Second claim fails
+        let result = client.claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: node,
+            relay_count: 5,
+            merkle_proof: vec![],
+        }).await;
+
+        assert!(matches!(result, Err(SettlementError::AlreadyClaimed)));
     }
 
     #[tokio::test]

@@ -223,6 +223,7 @@ fn test_relay_rejects_misrouted_response() {
         [42u8; 32],       // shard_id
         request_id,       // correct request_id
         attacker_pubkey,  // WRONG destination
+        [0u8; 32],        // user_proof
         exit_entry,
         2,
         vec![1, 2, 3],

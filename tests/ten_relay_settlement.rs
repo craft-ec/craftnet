@@ -8,17 +8,18 @@
 //! 5. Exit reconstructs request, creates response shards
 //! 6. Response shards traverse 10 relays back → client
 //! 7. At each return hop, ForwardReceipts are generated (different shard_ids → no dedup)
-//! 8. All receipts are submitted to the user's settlement pool
-//! 9. Each relay claims proportional rewards
+//! 8. Receipts stay local — relays count their receipts per pool
+//! 9. Aggregator posts distribution, each relay claims proportional rewards
 //!
 //! Verifies:
 //! - ForwardReceipt generation and signature verification at every hop
 //! - Request vs response receipts are distinct (different shard_ids)
-//! - Receipt deduplication (submitting same receipt twice has no effect)
+//! - Receipt deduplication (same receipt hashes are distinct)
 //! - Proportional reward distribution across all 10 relays + exit
 //! - Pool balance fully drained after all claims
 //! - Relay signature chain accumulation (10 entries per shard)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tunnelcraft_client::RequestBuilder;
@@ -28,7 +29,7 @@ use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
 use tunnelcraft_settlement::{
-    ClaimRewards, SettlementClient, SettlementConfig, SubmitReceipts, Subscribe,
+    ClaimRewards, PostDistribution, SettlementClient, SettlementConfig, Subscribe,
 };
 
 const NUM_RELAYS: usize = 10;
@@ -116,6 +117,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 &relays[relay_idx].0,
                 &shard.request_id,
                 &shard.shard_id,
+                &[0u8; 32],
             );
 
             // Verify the receipt signature
@@ -160,7 +162,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
 
     // Exit also signs a receipt for each shard it receives
     for shard in &current_shards {
-        let receipt = sign_forward_receipt(&exit_keypair, &shard.request_id, &shard.shard_id);
+        let receipt = sign_forward_receipt(&exit_keypair, &shard.request_id, &shard.shard_id, &[0u8; 32]);
         assert!(verify_forward_receipt(&receipt));
         all_receipts.push(receipt);
     }
@@ -210,6 +212,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 &relays[relay_idx].0,
                 &shard.request_id,
                 &shard.shard_id,
+                &[0u8; 32],
             );
             assert!(verify_forward_receipt(&receipt));
 
@@ -259,53 +262,8 @@ async fn test_ten_relay_forward_receipt_settlement() {
         "Response should have some content"
     );
 
-    // === Step 6: Submit ALL receipts to settlement ===
-    settlement_client
-        .submit_receipts(SubmitReceipts {
-            user_pubkey,
-            receipts: all_receipts.clone(),
-        })
-        .await
-        .expect("Submit receipts should succeed");
-
-    // All 105 should be unique (different shard_ids for request vs response)
-    let sub = settlement_client
-        .get_subscription_state(user_pubkey)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        sub.total_receipts, total_receipts as u64,
-        "Subscription should track all {} receipts",
-        total_receipts
-    );
-
-    // === Step 7: Verify deduplication ===
-    let sub_before = sub.total_receipts;
-
-    // Submit same receipts again — should be silently skipped
-    settlement_client
-        .submit_receipts(SubmitReceipts {
-            user_pubkey,
-            receipts: all_receipts.clone(),
-        })
-        .await
-        .expect("Duplicate submit should succeed (silently skip)");
-
-    let sub_after = settlement_client
-        .get_subscription_state(user_pubkey)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        sub_before, sub_after.total_receipts,
-        "Total receipts should not change after duplicate submission"
-    );
-
-    // === Step 8: Each node claims proportional rewards ===
-    // Count receipts per node
-    let mut receipts_per_node: std::collections::HashMap<[u8; 32], u64> =
-        std::collections::HashMap::new();
+    // === Step 6: Count receipts per node (locally, as relays would) ===
+    let mut receipts_per_node: HashMap<[u8; 32], u64> = HashMap::new();
     for receipt in &all_receipts {
         *receipts_per_node.entry(receipt.receiver_pubkey).or_insert(0) += 1;
     }
@@ -334,7 +292,45 @@ async fn test_ten_relay_forward_receipt_settlement() {
     );
     assert_eq!(exit_count, 5, "Exit should have 5 receipts (forward only)");
 
-    // === Claim rewards for all nodes ===
+    // === Step 7: Expire subscription and post distribution ===
+    // In the new model, receipts stay local. The aggregator collects ZK-proven
+    // summaries and posts a distribution root on-chain after the grace period.
+    // For testing, we create an expired subscription and post distribution directly.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Override with expired subscription (past grace period)
+    settlement_client
+        .add_mock_subscription_with_expiry(
+            user_pubkey,
+            tunnelcraft_core::SubscriptionTier::Standard,
+            pool_balance,
+            now - 40 * 24 * 3600, // created 40 days ago
+            now - 10 * 24 * 3600, // expired 10 days ago (past grace)
+        )
+        .unwrap();
+
+    // Post distribution with receipt counts
+    settlement_client
+        .post_distribution(PostDistribution {
+            user_pubkey,
+            distribution_root: [0xAA; 32],
+            total_receipts: total_receipts as u64,
+        })
+        .await
+        .expect("Post distribution should succeed");
+
+    let sub = settlement_client
+        .get_subscription_state(user_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sub.total_receipts, total_receipts as u64);
+    assert_eq!(sub.distribution_root, Some([0xAA; 32]));
+
+    // === Step 8: Each node claims proportional rewards ===
     let mut total_claimed = 0u64;
     let mut node_rewards: Vec<(String, u64)> = Vec::new();
 
@@ -342,11 +338,13 @@ async fn test_ten_relay_forward_receipt_settlement() {
     all_nodes.push(exit_pubkey);
 
     for pubkey in &all_nodes {
+        let count = receipts_per_node.get(pubkey).copied().unwrap_or(0);
         settlement_client
             .claim_rewards(ClaimRewards {
                 user_pubkey,
                 node_pubkey: *pubkey,
-                epoch: 1,
+                relay_count: count,
+                merkle_proof: vec![], // mock doesn't verify Merkle proofs
             })
             .await
             .expect("Claim should succeed");
@@ -405,13 +403,20 @@ async fn test_receipt_isolation_across_requests() {
     let settlement_config = SettlementConfig::mock();
     let settlement_client = Arc::new(SettlementClient::new(settlement_config, exit_pubkey));
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Create an already-expired subscription (past grace)
     settlement_client
-        .subscribe(Subscribe {
+        .add_mock_subscription_with_expiry(
             user_pubkey,
-            tier: tunnelcraft_core::SubscriptionTier::Standard,
-            payment_amount: 500_000,
-        })
-        .await
+            tunnelcraft_core::SubscriptionTier::Standard,
+            500_000,
+            now - 40 * 24 * 3600,
+            now - 10 * 24 * 3600,
+        )
         .unwrap();
 
     let relay_keypair = SigningKeypair::generate();
@@ -426,7 +431,7 @@ async fn test_receipt_isolation_across_requests() {
             let mut shard_id = [0u8; 32];
             shard_id[0] = 1; // request 1
             shard_id[1] = i;
-            sign_forward_receipt(&relay_keypair, &request_id_1, &shard_id)
+            sign_forward_receipt(&relay_keypair, &request_id_1, &shard_id, &[0u8; 32])
         })
         .collect();
 
@@ -436,25 +441,37 @@ async fn test_receipt_isolation_across_requests() {
             let mut shard_id = [0u8; 32];
             shard_id[0] = 2; // request 2
             shard_id[1] = i;
-            sign_forward_receipt(&relay_keypair, &request_id_2, &shard_id)
+            sign_forward_receipt(&relay_keypair, &request_id_2, &shard_id, &[0u8; 32])
         })
         .collect();
 
-    let mut all_receipts = receipts_req1;
-    all_receipts.extend(receipts_req2);
+    let all_receipts = [receipts_req1, receipts_req2].concat();
+    let total = all_receipts.len() as u64; // 5 receipts total
 
+    // Post distribution with total receipt count
     settlement_client
-        .submit_receipts(SubmitReceipts {
+        .post_distribution(PostDistribution {
             user_pubkey,
-            receipts: all_receipts,
+            distribution_root: [0xBB; 32],
+            total_receipts: total,
         })
         .await
         .unwrap();
 
-    // Node should have 5 total receipts
+    // Relay claims all 5 receipts
+    settlement_client
+        .claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: relay_pubkey,
+            relay_count: total,
+            merkle_proof: vec![],
+        })
+        .await
+        .unwrap();
+
     let acct = settlement_client.get_node_account(relay_pubkey).await.unwrap();
-    assert_eq!(acct.current_epoch_receipts, 5);
-    assert_eq!(acct.lifetime_receipts, 5);
+    // 5/5 * 500_000 = 500_000 (relay is only claimer, gets entire pool)
+    assert_eq!(acct.unclaimed_rewards, 500_000);
 
     let sub = settlement_client
         .get_subscription_state(user_pubkey)
@@ -462,6 +479,7 @@ async fn test_receipt_isolation_across_requests() {
         .unwrap()
         .unwrap();
     assert_eq!(sub.total_receipts, 5);
+    assert_eq!(sub.pool_balance, 0);
 }
 
 /// Test relay chain signature accumulation with 10 relays
@@ -504,7 +522,7 @@ fn test_receipt_signature_verification() {
     for i in 0..TOTAL_SHARDS as u8 {
         let mut shard_id = [0u8; 32];
         shard_id[0] = i;
-        let receipt = sign_forward_receipt(&relay_keypair, &request_id, &shard_id);
+        let receipt = sign_forward_receipt(&relay_keypair, &request_id, &shard_id, &[0u8; 32]);
 
         assert!(verify_forward_receipt(&receipt), "Receipt for shard {} should verify", i);
         assert_eq!(receipt.request_id, request_id);
@@ -522,13 +540,21 @@ async fn test_unequal_receipt_distribution() {
     let settlement_client = Arc::new(SettlementClient::new(SettlementConfig::mock(), [0u8; 32]));
 
     let pool_balance = 1_000_000u64;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Create expired subscription (past grace)
     settlement_client
-        .subscribe(Subscribe {
+        .add_mock_subscription_with_expiry(
             user_pubkey,
-            tier: tunnelcraft_core::SubscriptionTier::Premium,
-            payment_amount: pool_balance,
-        })
-        .await
+            tunnelcraft_core::SubscriptionTier::Premium,
+            pool_balance,
+            now - 40 * 24 * 3600,
+            now - 10 * 24 * 3600,
+        )
         .unwrap();
 
     // Node A: 7 receipts, Node B: 3 receipts
@@ -537,37 +563,54 @@ async fn test_unequal_receipt_distribution() {
     let node_a = node_a_kp.public_key_bytes();
     let node_b = node_b_kp.public_key_bytes();
 
+    // Generate receipts locally (they stay on the relay)
     let mut receipts = Vec::new();
     for i in 0..7u8 {
         let mut shard_id = [0u8; 32];
         shard_id[0] = 0xA0;
         shard_id[1] = i;
-        receipts.push(sign_forward_receipt(&node_a_kp, &[10u8; 32], &shard_id));
+        receipts.push(sign_forward_receipt(&node_a_kp, &[10u8; 32], &shard_id, &[0u8; 32]));
     }
     for i in 0..3u8 {
         let mut shard_id = [0u8; 32];
         shard_id[0] = 0xB0;
         shard_id[1] = i;
-        receipts.push(sign_forward_receipt(&node_b_kp, &[20u8; 32], &shard_id));
+        receipts.push(sign_forward_receipt(&node_b_kp, &[20u8; 32], &shard_id, &[0u8; 32]));
     }
 
+    // Post distribution: 10 total receipts
     settlement_client
-        .submit_receipts(SubmitReceipts { user_pubkey, receipts })
+        .post_distribution(PostDistribution {
+            user_pubkey,
+            distribution_root: [0xCC; 32],
+            total_receipts: 10,
+        })
         .await
         .unwrap();
 
     // Node A claims: 7/10 * 1_000_000 = 700_000
     settlement_client
-        .claim_rewards(ClaimRewards { user_pubkey, node_pubkey: node_a, epoch: 1 })
+        .claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: node_a,
+            relay_count: 7,
+            merkle_proof: vec![],
+        })
         .await
         .unwrap();
 
     let acct_a = settlement_client.get_node_account(node_a).await.unwrap();
     assert_eq!(acct_a.unclaimed_rewards, 700_000);
 
-    // Node B claims: 3/3 * 300_000 = 300_000 (remaining pool)
+    // Node B claims: 3/10 * 300_000 (remaining pool) — but proportional to original:
+    // 3/10 * 1_000_000 = 300_000
     settlement_client
-        .claim_rewards(ClaimRewards { user_pubkey, node_pubkey: node_b, epoch: 1 })
+        .claim_rewards(ClaimRewards {
+            user_pubkey,
+            node_pubkey: node_b,
+            relay_count: 3,
+            merkle_proof: vec![],
+        })
         .await
         .unwrap();
 

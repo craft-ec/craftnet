@@ -164,6 +164,10 @@ pub struct PeerInfo {
 /// When relay A sends a shard to relay B, relay B signs a receipt proving
 /// delivery. Relay A uses this receipt as on-chain proof for settlement.
 /// This replaces TCP ACK (which is fakeable at the transport level).
+///
+/// The `user_proof` field binds this receipt to the originating user,
+/// preventing colluding relays from creating fake receipts against
+/// other users' pools. `user_proof = SHA256(request_id || user_pubkey || user_signature_on_request)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardReceipt {
     /// Request this shard belongs to
@@ -172,6 +176,9 @@ pub struct ForwardReceipt {
     pub shard_id: Id,
     /// Public key of the receiving node (signs this receipt)
     pub receiver_pubkey: PublicKey,
+    /// Binding proof tying this receipt to the originating user's pool.
+    /// SHA256(request_id || user_pubkey || user_signature_on_request)
+    pub user_proof: Id,
     /// Unix timestamp (seconds) when the shard was received
     pub timestamp: u64,
     /// Receiver's ed25519 signature over the receipt payload
@@ -181,17 +188,19 @@ pub struct ForwardReceipt {
 
 impl ForwardReceipt {
     /// Get the data that the receiver signs:
-    /// request_id || shard_id || receiver_pubkey || timestamp
+    /// request_id || shard_id || receiver_pubkey || user_proof || timestamp
     pub fn signable_data(
         request_id: &Id,
         shard_id: &Id,
         receiver_pubkey: &PublicKey,
+        user_proof: &Id,
         timestamp: u64,
     ) -> Vec<u8> {
-        let mut data = Vec::with_capacity(32 + 32 + 32 + 8);
+        let mut data = Vec::with_capacity(32 + 32 + 32 + 32 + 8);
         data.extend_from_slice(request_id);
         data.extend_from_slice(shard_id);
         data.extend_from_slice(receiver_pubkey);
+        data.extend_from_slice(user_proof);
         data.extend_from_slice(&timestamp.to_le_bytes());
         data
     }
@@ -294,20 +303,23 @@ mod tests {
         let request_id = [1u8; 32];
         let shard_id = [3u8; 32];
         let receiver_pubkey = [2u8; 32];
-        let data = ForwardReceipt::signable_data(&request_id, &shard_id, &receiver_pubkey, 1000);
+        let user_proof = [4u8; 32];
+        let data = ForwardReceipt::signable_data(&request_id, &shard_id, &receiver_pubkey, &user_proof, 1000);
 
-        // 32 (request_id) + 32 (shard_id) + 32 (receiver_pubkey) + 8 (timestamp) = 104
-        assert_eq!(data.len(), 104);
+        // 32 (request_id) + 32 (shard_id) + 32 (receiver_pubkey) + 32 (user_proof) + 8 (timestamp) = 136
+        assert_eq!(data.len(), 136);
         assert_eq!(&data[0..32], &request_id);
         assert_eq!(&data[32..64], &shard_id);
         assert_eq!(&data[64..96], &receiver_pubkey);
-        assert_eq!(&data[96..104], &1000u64.to_le_bytes());
+        assert_eq!(&data[96..128], &user_proof);
+        assert_eq!(&data[128..136], &1000u64.to_le_bytes());
     }
 
     #[test]
     fn test_forward_receipt_signable_data_different_inputs() {
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[2u8; 32], 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[11u8; 32], &[2u8; 32], 100);
+        let user_proof = [5u8; 32];
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[2u8; 32], &user_proof, 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[11u8; 32], &[2u8; 32], &user_proof, 100);
         // Different shard_id should produce different data
         assert_ne!(data1, data2);
     }
@@ -315,8 +327,16 @@ mod tests {
     #[test]
     fn test_forward_receipt_same_relay_different_shards() {
         // Same relay, same request — but different shard_ids (e.g. request vs response shard)
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[2u8; 32], 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[20u8; 32], &[2u8; 32], 100);
+        let user_proof = [5u8; 32];
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[2u8; 32], &user_proof, 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[20u8; 32], &[2u8; 32], &user_proof, 100);
+        assert_ne!(data1, data2);
+    }
+
+    #[test]
+    fn test_forward_receipt_different_user_proofs() {
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[2u8; 32], &[5u8; 32], 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[2u8; 32], &[6u8; 32], 100);
         assert_ne!(data1, data2);
     }
 

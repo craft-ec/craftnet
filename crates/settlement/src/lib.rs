@@ -2,15 +2,17 @@
 //!
 //! Solana client for on-chain settlement and subscription management.
 //!
-//! ## Settlement Flow (Per-User Pool Model)
+//! ## Settlement Flow (Subscription + ZK-Proven Epoch Settlement)
 //!
 //! 1. **Subscribe**: User purchases a subscription tier (Basic/Standard/Premium).
 //!    Payment goes into the user's pool PDA.
-//! 2. **Submit Receipts**: Relays batch ForwardReceipts and submit them on-chain.
-//!    Each receipt is deduped by `PDA(["receipt", pool_pda, SHA256(request_id || shard_id || receiver_pubkey)])`.
-//! 3. **Claim Rewards**: End of cycle, relays claim proportional share:
-//!    `relay_payout = (relay_receipts / total_receipts) * pool_balance`
-//! 4. **Withdraw**: Nodes withdraw accumulated rewards to their wallet.
+//! 2. **Receipts stay local**: Relays collect ForwardReceipts locally and generate
+//!    ZK proofs per pool. Proven summaries are gossiped via libp2p.
+//! 3. **Post Distribution**: After epoch + grace period, an aggregator posts a
+//!    Merkle distribution root on-chain from collected ZK-proven summaries.
+//! 4. **Claim Rewards**: Each relay claims proportional share using Merkle proof:
+//!    `relay_payout = (relay_count / total_receipts) * pool_balance`
+//! 5. **Withdraw**: Nodes withdraw accumulated rewards to their wallet.
 
 mod client;
 mod types;
@@ -39,6 +41,12 @@ pub enum SettlementError {
 
     #[error("Epoch not complete")]
     EpochNotComplete,
+
+    #[error("Distribution not posted")]
+    DistributionNotPosted,
+
+    #[error("Already claimed")]
+    AlreadyClaimed,
 
     #[error("Serialization error: {0}")]
     SerializationError(String),

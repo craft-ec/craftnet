@@ -272,6 +272,7 @@ mod tests {
                     [1u8; 32],                       // shard_id
                     [2u8; 32],                       // request_id
                     user_keypair.public_key_bytes(), // user_pubkey (also destination)
+                    [0u8; 32],                       // user_proof
                     exit_entry,
                     hops,
                     vec![5, 6, 7, 8], // payload
@@ -337,6 +338,7 @@ mod tests {
             [10u8; 32],  // different shard_id
             request_id,  // same request_id
             user_pubkey, // must match cached user
+            [0u8; 32],   // user_proof
             exit_entry,
             2,
             vec![5, 6, 7, 8],
@@ -371,6 +373,7 @@ mod tests {
             [10u8; 32],
             request_id,
             attacker_keypair.public_key_bytes(), // WRONG user - attacker
+            [0u8; 32],                           // user_proof
             exit_entry,
             2,
             vec![5, 6, 7, 8],
@@ -433,6 +436,7 @@ mod tests {
             [10u8; 32],
             [99u8; 32],  // Different request_id - not in cache
             [1u8; 32],   // Some destination
+            [0u8; 32],   // user_proof
             exit_entry,
             2,
             vec![5, 6, 7, 8],
@@ -469,6 +473,7 @@ mod tests {
             [10u8; 32],
             request_id,
             user_pubkey,
+            [0u8; 32],  // user_proof
             exit_entry,
             2,
             vec![5, 6, 7, 8],
@@ -502,6 +507,7 @@ mod tests {
             [10u8; 32],
             request_id,
             user_pubkey,
+            [0u8; 32],  // user_proof
             exit_entry,
             1,  // Will be 0 after decrement = last hop
             vec![5, 6, 7, 8],
@@ -537,6 +543,7 @@ mod tests {
             [10u8; 32],
             request_id,
             user_pubkey,
+            [0u8; 32],  // user_proof
             exit_entry.clone(),
             2,
             vec![5, 6, 7, 8],
@@ -552,6 +559,7 @@ mod tests {
             [11u8; 32],  // different shard_id
             request_id,
             user_pubkey,
+            [0u8; 32],  // user_proof
             exit_entry,
             2,
             vec![9, 10, 11, 12],
@@ -579,6 +587,7 @@ mod tests {
             [10u8; 32],
             [42u8; 32],
             [1u8; 32],
+            [0u8; 32],  // user_proof
             exit_entry,
             3,
             vec![5, 6, 7, 8],
@@ -615,6 +624,7 @@ mod tests {
             [10u8; 32],
             request_id,
             attacker_pubkey,  // Wrong destination
+            [0u8; 32],        // user_proof
             exit_entry,
             2,
             vec![5, 6, 7, 8],

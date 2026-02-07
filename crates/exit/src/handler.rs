@@ -57,6 +57,8 @@ struct PendingRequest {
     shards: HashMap<u8, Shard>,
     /// User's public key (destination for response, used for encryption)
     user_pubkey: PublicKey,
+    /// User proof binding receipts to the user's pool
+    user_proof: Id,
     /// When this pending request was created
     created_at: Instant,
 }
@@ -169,6 +171,7 @@ impl ExitHandler {
 
         let request_id = shard.request_id;
         let user_pubkey = shard.user_pubkey;
+        let user_proof = shard.user_proof;
         let shard_index = shard.shard_index;
 
         // Add shard to pending request
@@ -176,6 +179,7 @@ impl ExitHandler {
             PendingRequest {
                 shards: HashMap::new(),
                 user_pubkey,
+                user_proof,
                 created_at: Instant::now(),
             }
         });
@@ -214,6 +218,7 @@ impl ExitHandler {
             self.create_raw_response_shards(
                 request_id,
                 pending.user_pubkey,
+                pending.user_proof,
                 response_data,
                 response_hops,
             )?
@@ -237,6 +242,7 @@ impl ExitHandler {
             self.create_response_shards(
                 request_id,
                 pending.user_pubkey,
+                pending.user_proof,
                 &response,
                 response_hops,
             )?
@@ -462,6 +468,7 @@ impl ExitHandler {
         &self,
         request_id: Id,
         user_pubkey: PublicKey,
+        user_proof: Id,
         response_data: Vec<u8>,
         hops: u8,
     ) -> Result<Vec<Shard>> {
@@ -497,6 +504,7 @@ impl ExitHandler {
                 shard_id,
                 request_id,
                 user_pubkey,
+                user_proof,
                 placeholder_entry,
                 hops,
                 payload,
@@ -570,6 +578,7 @@ impl ExitHandler {
         &self,
         request_id: Id,
         user_pubkey: PublicKey,
+        user_proof: Id,
         response: &HttpResponse,
         hops: u8,
     ) -> Result<Vec<Shard>> {
@@ -601,6 +610,7 @@ impl ExitHandler {
                 shard_id,
                 request_id,
                 user_pubkey,
+                user_proof,
                 placeholder_entry,
                 hops,
                 payload,
@@ -767,11 +777,13 @@ mod tests {
         handler.pending.insert([1u8; 32], PendingRequest {
             shards: HashMap::new(),
             user_pubkey: [0u8; 32],
+            user_proof: [0u8; 32],
             created_at: Instant::now() - Duration::from_secs(120),
         });
         handler.pending.insert([2u8; 32], PendingRequest {
             shards: HashMap::new(),
             user_pubkey: [0u8; 32],
+            user_proof: [0u8; 32],
             created_at: Instant::now(),
         });
 
@@ -793,6 +805,7 @@ mod tests {
         handler.pending.insert([1u8; 32], PendingRequest {
             shards: HashMap::new(),
             user_pubkey: [0u8; 32],
+            user_proof: [0u8; 32],
             created_at: Instant::now(),
         });
 
@@ -821,6 +834,7 @@ mod tests {
         let shards = handler.create_response_shards(
             [1u8; 32],
             [2u8; 32],
+            [0u8; 32],  // user_proof
             &response,
             2,  // 2 hops
         ).unwrap();

@@ -7771,6 +7771,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnelcraft-aggregator"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tracing",
+ "tunnelcraft-core",
+ "tunnelcraft-network",
+ "tunnelcraft-settlement",
+]
+
+[[package]]
 name = "tunnelcraft-app"
 version = "0.1.0"
 dependencies = [
@@ -8003,7 +8016,9 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
+ "tunnelcraft-aggregator",
  "tunnelcraft-client",
  "tunnelcraft-core",
  "tunnelcraft-crypto",

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use sha2::{Sha256, Digest};
+
 use crate::types::{ChainEntry, Id, PublicKey};
 
 /// Shard type indicator
@@ -24,6 +26,11 @@ pub struct Shard {
     /// Destination: exit pubkey for requests, user pubkey for responses
     pub destination: PublicKey,
 
+    /// Binding proof tying this shard to the originating user for settlement.
+    /// SHA256(request_id || user_pubkey || user_signature_on_request)
+    /// Relays copy this into ForwardReceipts to bind receipts to the user's pool.
+    pub user_proof: Id,
+
     /// Number of hops remaining before reaching destination
     pub hops_remaining: u8,
 
@@ -44,6 +51,21 @@ pub struct Shard {
 }
 
 impl Shard {
+    /// Compute user_proof: SHA256(request_id || user_pubkey || user_signature_on_request)
+    ///
+    /// This binds receipts to the originating user so colluding relays can't
+    /// create fake receipts for other users' pools.
+    pub fn compute_user_proof(request_id: &Id, user_pubkey: &PublicKey, user_signature: &[u8; 64]) -> Id {
+        let mut hasher = Sha256::new();
+        hasher.update(request_id);
+        hasher.update(user_pubkey);
+        hasher.update(user_signature);
+        let result = hasher.finalize();
+        let mut proof = [0u8; 32];
+        proof.copy_from_slice(&result);
+        proof
+    }
+
     /// Create a new request shard
     pub fn new_request(
         shard_id: Id,
@@ -60,6 +82,7 @@ impl Shard {
             request_id,
             user_pubkey,
             destination,
+            user_proof: [0u8; 32], // Set by caller via set_user_proof() after signing
             hops_remaining,
             chain: Vec::new(),
             payload,
@@ -72,10 +95,12 @@ impl Shard {
     /// Create a new response shard
     ///
     /// The exit_entry should be created with the hops_remaining value at the time of signing.
+    /// Response shards inherit user_proof from the original request shard.
     pub fn new_response(
         shard_id: Id,
         request_id: Id,
         user_pubkey: PublicKey,
+        user_proof: Id,
         exit_entry: ChainEntry,
         hops_remaining: u8,
         payload: Vec<u8>,
@@ -87,6 +112,7 @@ impl Shard {
             request_id,
             user_pubkey,
             destination: user_pubkey, // Response goes back to user
+            user_proof,
             hops_remaining,
             chain: vec![exit_entry], // Chain starts with exit signature
             payload,
@@ -94,6 +120,11 @@ impl Shard {
             shard_index,
             total_shards,
         }
+    }
+
+    /// Set the user_proof after computing it from the user's request signature
+    pub fn set_user_proof(&mut self, user_proof: Id) {
+        self.user_proof = user_proof;
     }
 
     /// Add a signature to the chain (records current hops_remaining for verification)
@@ -185,6 +216,7 @@ mod tests {
             [1u8; 32],  // shard_id
             [2u8; 32],  // request_id
             [4u8; 32],  // user_pubkey
+            [0u8; 32],  // user_proof
             exit_entry,
             3,          // hops_remaining
             vec![0u8; 100],  // payload
@@ -213,7 +245,7 @@ mod tests {
     fn test_is_response() {
         let exit_entry = ChainEntry::new([10u8; 32], [0u8; 64], 3);
         let shard = Shard::new_response(
-            [1u8; 32], [2u8; 32], [4u8; 32],
+            [1u8; 32], [2u8; 32], [4u8; 32], [0u8; 32],
             exit_entry, 3, vec![], 0, 5,
         );
 

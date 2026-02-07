@@ -14,6 +14,7 @@
 mod behaviour;
 mod bootstrap;
 mod node;
+mod proof_message;
 mod protocol;
 mod status;
 
@@ -23,7 +24,9 @@ pub use behaviour::{
     EXIT_DHT_KEY_PREFIX, EXIT_REGISTRY_KEY, EXIT_RECORD_TTL, exit_dht_key,
     PEER_DHT_KEY_PREFIX, PEER_RECORD_TTL, peer_dht_key,
     EXIT_STATUS_TOPIC, EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
+    PROOF_TOPIC,
 };
+pub use proof_message::{ProofMessage, PoolType};
 pub use status::{ExitStatusMessage, ExitStatusType};
 pub use bootstrap::{
     DEFAULT_BOOTSTRAP_NODES, DEFAULT_PORT,
