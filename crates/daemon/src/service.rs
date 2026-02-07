@@ -119,7 +119,7 @@ pub struct SpeedTestResultData {
 }
 
 /// Connect parameters
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ConnectParams {
     pub hops: Option<u8>,
 }
@@ -386,6 +386,17 @@ impl DaemonService {
     /// Connect to VPN
     pub async fn connect(&self, params: ConnectParams) -> Result<()> {
         info!("Connecting to VPN with hops: {:?}", params.hops);
+
+        // Apply hops param to privacy level if provided
+        if let Some(hops) = params.hops {
+            let hop_mode = match hops {
+                0 => HopMode::Direct,
+                1 => HopMode::Light,
+                2 => HopMode::Standard,
+                _ => HopMode::Paranoid,
+            };
+            *self.privacy_level.write().await = hop_mode;
+        }
 
         // Initialize node if not already done
         {
@@ -845,13 +856,20 @@ async fn run_node_task(
 
     loop {
         tokio::select! {
+            // Drive the swarm event loop continuously (peer discovery, DHT, gossipsub)
+            _ = node.poll_once() => {}
+
             // Handle commands from the daemon service
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(NodeCommand::Connect(reply)) => {
                         let result = node.start().await.map_err(|e| e.to_string());
-                        // Update status after connect
+                        // Wait for exit node discovery before reporting connected
                         if result.is_ok() {
+                            match node.wait_for_exit(std::time::Duration::from_secs(15)).await {
+                                Ok(()) => info!("Exit node discovered, connection ready"),
+                                Err(e) => info!("No exit node found during connect (non-fatal): {}", e),
+                            }
                             let node_status = node.status();
                             let mut ns = status.write().await;
                             ns.connected = node_status.connected;
@@ -963,6 +981,7 @@ async fn run_node_task(
                     }
                     Some(NodeCommand::SetCredits(credits)) => {
                         node.set_credits(credits);
+                        status.write().await.credits = credits;
                         debug!("Node credits set to {}", credits);
                     }
                     Some(NodeCommand::SetCreditProof(proof)) => {
@@ -975,9 +994,6 @@ async fn run_node_task(
                     }
                 }
             }
-
-            // Poll network events
-            _ = node.poll_once() => {}
         }
     }
 
@@ -1028,10 +1044,13 @@ impl IpcHandler for DaemonService {
                         .map(|p| serde_json::from_value(p).unwrap_or_default())
                         .unwrap_or_default();
 
-                    self.connect(params).await
+                    self.connect(params.clone()).await
                         .map_err(|e| format!("Connect error: {}", e))?;
 
-                    Ok(serde_json::json!({"success": true}))
+                    Ok(serde_json::json!({
+                        "connected": true,
+                        "hops": params.hops
+                    }))
                 }
 
                 "disconnect" => {
