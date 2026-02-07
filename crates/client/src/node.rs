@@ -1286,9 +1286,7 @@ impl TunnelCraftNode {
             .as_ref()
             .ok_or(ClientError::NoExitNodes)?;
 
-        if self.credits < 1 {
-            return Err(ClientError::InsufficientCredits { have: 0, need: 1 });
-        }
+
 
         // Build request
         let mut builder = RequestBuilder::new(method, url).hop_mode(self.config.hop_mode);
@@ -1377,9 +1375,7 @@ impl TunnelCraftNode {
             .as_ref()
             .ok_or(ClientError::NoExitNodes)?;
 
-        if self.credits < 1 {
-            return Err(ClientError::InsufficientCredits { have: 0, need: 1 });
-        }
+
 
         let packet_len = packet.len();
         debug!("Tunneling raw packet of {} bytes", packet_len);
