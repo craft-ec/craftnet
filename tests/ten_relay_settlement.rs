@@ -362,6 +362,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 relay_count: count,
                 leaf_index: 0,
                 merkle_proof: vec![],
+                light_params: None,
             })
             .await
             .expect("Claim should succeed");
@@ -486,6 +487,7 @@ async fn test_receipt_isolation_across_requests() {
             relay_count: total,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         })
         .await
         .unwrap();
@@ -608,6 +610,7 @@ async fn test_merkle_proof_claim() {
                 relay_count: *count,
                 leaf_index: i as u32,
                 merkle_proof: proof.siblings.clone(),
+                light_params: None,
             })
             .await
             .expect("Claim with valid Merkle proof should succeed");
@@ -672,6 +675,7 @@ async fn test_invalid_merkle_proof_rejected() {
             relay_count: 70, // Wrong count — should fail verification
             leaf_index: 0,
             merkle_proof: proof.siblings.clone(),
+            light_params: None,
         })
         .await;
 
@@ -699,6 +703,7 @@ async fn test_invalid_merkle_proof_rejected() {
             relay_count: 50, // Correct count
             leaf_index: 1,   // Wrong index — proof path won't verify
             merkle_proof: proof_for_a.siblings.clone(),
+            light_params: None,
         })
         .await;
 
@@ -774,6 +779,7 @@ async fn test_unequal_receipt_distribution() {
             relay_count: 7,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         })
         .await
         .unwrap();
@@ -791,6 +797,7 @@ async fn test_unequal_receipt_distribution() {
             relay_count: 3,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         })
         .await
         .unwrap();

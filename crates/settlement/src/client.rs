@@ -35,6 +35,7 @@ use crate::{
     Subscribe, PostDistribution, ClaimRewards,
     SubscriptionState, TransactionSignature,
     EpochPhase, EPOCH_DURATION_SECS,
+    USDC_MINT_DEVNET, USDC_MINT_MAINNET,
 };
 
 /// Settlement mode
@@ -55,6 +56,8 @@ pub struct SettlementConfig {
     pub rpc_url: String,
     /// Program ID for the TunnelCraft settlement program
     pub program_id: [u8; 32],
+    /// USDC mint address (6 decimal SPL token)
+    pub usdc_mint: [u8; 32],
     /// Commitment level for transactions
     pub commitment: String,
 }
@@ -65,6 +68,7 @@ impl Default for SettlementConfig {
             mode: SettlementMode::Mock,
             rpc_url: "https://api.devnet.solana.com".to_string(),
             program_id: [0u8; 32],
+            usdc_mint: USDC_MINT_DEVNET,
             commitment: "confirmed".to_string(),
         }
     }
@@ -92,6 +96,7 @@ impl SettlementConfig {
             mode: SettlementMode::Live,
             rpc_url: "https://api.devnet.solana.com".to_string(),
             program_id,
+            usdc_mint: USDC_MINT_DEVNET,
             ..Default::default()
         }
     }
@@ -107,6 +112,7 @@ impl SettlementConfig {
             mode: SettlementMode::Live,
             rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
             program_id,
+            usdc_mint: USDC_MINT_MAINNET,
             commitment: "finalized".to_string(),
         }
     }
@@ -139,9 +145,9 @@ struct MockState {
 /// Anchor instruction discriminators for the TunnelCraft settlement program.
 /// Each is the first 8 bytes of SHA256("global:<instruction_name>").
 mod instruction {
-    pub const SUBSCRIBE:          [u8; 8] = [0xa3, 0xb1, 0xc2, 0xd4, 0xe5, 0xf6, 0x07, 0x18];
-    pub const POST_DISTRIBUTION:  [u8; 8] = [0xd6, 0xe4, 0xf5, 0x07, 0x18, 0x29, 0x3a, 0x4b];
-    pub const CLAIM_REWARDS:      [u8; 8] = [0xc5, 0xd3, 0xe4, 0xf6, 0x07, 0x18, 0x29, 0x3a];
+    pub const SUBSCRIBE:          [u8; 8] = [0xfe, 0x1c, 0xbf, 0x8a, 0x9c, 0xb3, 0xb7, 0x35];
+    pub const POST_DISTRIBUTION:  [u8; 8] = [0x0e, 0xa8, 0xf7, 0x4a, 0xbf, 0x7b, 0x15, 0xe8];
+    pub const CLAIM:              [u8; 8] = [0x3e, 0xc6, 0xd6, 0xc1, 0xd5, 0x9f, 0x6c, 0xd2];
 }
 
 /// Settlement client for on-chain operations
@@ -301,6 +307,60 @@ impl SettlementClient {
         )
     }
 
+    /// Derive associated token account address for a given wallet and mint.
+    ///
+    /// ATA PDA = find_program_address(
+    ///   [wallet, TOKEN_PROGRAM_ID, mint],
+    ///   ASSOCIATED_TOKEN_PROGRAM_ID,
+    /// )
+    fn associated_token_address(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+        // SPL Associated Token Account program ID
+        let ata_program_id = Pubkey::new_from_array([
+            140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+            11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+        ]); // ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
+        let token_program_id = Pubkey::new_from_array([
+            6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172,
+            28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+        ]); // TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+
+        let (ata, _) = Pubkey::find_program_address(
+            &[wallet.as_ref(), token_program_id.as_ref(), mint.as_ref()],
+            &ata_program_id,
+        );
+        ata
+    }
+
+    /// Get the next epoch for a user from on-chain UserMeta PDA.
+    ///
+    /// Returns 0 if the UserMeta account doesn't exist (first subscription).
+    async fn get_next_epoch_live(&self, user_pubkey: &PublicKey) -> Result<u64> {
+        let rpc = self.rpc_client.as_ref()
+            .ok_or_else(|| SettlementError::RpcError("RPC client not initialized".to_string()))?;
+
+        let (user_meta_pda, _) = self.user_meta_pda(user_pubkey);
+
+        match rpc.get_account(&user_meta_pda).await {
+            Ok(account) => {
+                let data = &account.data;
+                // UserMeta layout: 8 (discriminator) + 32 (user_pubkey) + 8 (next_epoch)
+                if data.len() < 48 {
+                    return Ok(0);
+                }
+                let next_epoch = u64::from_le_bytes(
+                    data[40..48].try_into().expect("8 bytes for next_epoch")
+                );
+                Ok(next_epoch)
+            }
+            Err(_) => Ok(0), // Account doesn't exist — first subscription
+        }
+    }
+
+    /// USDC mint pubkey from config
+    fn usdc_mint(&self) -> Pubkey {
+        Pubkey::new_from_array(self.config.usdc_mint)
+    }
+
     /// Hash a receipt for dedup: SHA256(request_id || shard_id || receiver_pubkey)
     pub fn receipt_dedup_hash(receipt: &ForwardReceipt) -> Id {
         let mut hasher = Sha256::new();
@@ -393,12 +453,16 @@ impl SettlementClient {
             return Ok((Self::generate_mock_signature(&mut state), current_epoch));
         }
 
-        // Live mode
+        // Live mode: query UserMeta to get next_epoch before building tx
+        let next_epoch = self.get_next_epoch_live(&sub.user_pubkey).await?;
+
         let (user_meta_pda, _) = self.user_meta_pda(&sub.user_pubkey);
-        // Note: epoch is determined on-chain by UserMeta.next_epoch
-        // For now we pass 0 as placeholder; the program increments internally
-        let (subscription_pda, _) = self.subscription_pda(&sub.user_pubkey, 0);
+        let (subscription_pda, _) = self.subscription_pda(&sub.user_pubkey, next_epoch);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
+        let usdc_mint = self.usdc_mint();
+
+        let payer_token_account = Self::associated_token_address(&signer, &usdc_mint);
+        let pool_token_account = Self::associated_token_address(&subscription_pda, &usdc_mint);
 
         let tier_byte = match sub.tier {
             SubscriptionTier::Basic => 0u8,
@@ -411,20 +475,34 @@ impl SettlementClient {
         data.push(tier_byte);
         data.extend_from_slice(&sub.payment_amount.to_le_bytes());
 
+        // SPL Token and ATA program IDs
+        let token_program_id = Pubkey::new_from_array([
+            6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172,
+            28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+        ]);
+        let ata_program_id = Pubkey::new_from_array([
+            140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+            11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+        ]);
+
         let instruction = Instruction {
             program_id: self.program_id(),
             accounts: vec![
-                AccountMeta::new(signer, true),
-                AccountMeta::new(user_meta_pda, false),
-                AccountMeta::new(subscription_pda, false),
-                AccountMeta::new_readonly(system_program::id(), false),
+                AccountMeta::new(signer, true),                              // payer
+                AccountMeta::new(user_meta_pda, false),                      // user_meta
+                AccountMeta::new(subscription_pda, false),                   // subscription_account
+                AccountMeta::new(payer_token_account, false),                // payer_token_account
+                AccountMeta::new(pool_token_account, false),                 // pool_token_account
+                AccountMeta::new_readonly(usdc_mint, false),                 // usdc_mint
+                AccountMeta::new_readonly(token_program_id, false),          // token_program
+                AccountMeta::new_readonly(ata_program_id, false),            // associated_token_program
+                AccountMeta::new_readonly(system_program::id(), false),      // system_program
             ],
             data,
         };
 
         let sig = self.send_transaction(instruction).await?;
-        // In live mode, epoch would be read back from the UserMeta account
-        Ok((sig, 0))
+        Ok((sig, next_epoch))
     }
 
     // ==================== Post Distribution ====================
@@ -494,9 +572,8 @@ impl SettlementClient {
         let instruction = Instruction {
             program_id: self.program_id(),
             accounts: vec![
-                AccountMeta::new(signer, true),
-                AccountMeta::new(subscription_pda, false),
-                AccountMeta::new_readonly(system_program::id(), false),
+                AccountMeta::new(signer, true),                 // signer
+                AccountMeta::new(subscription_pda, false),      // subscription_account
             ],
             data,
         };
@@ -597,28 +674,57 @@ impl SettlementClient {
         // Live mode
         let (subscription_pda, _) = self.subscription_pda(&claim.user_pubkey, claim.epoch);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
-        let relay_wallet = Pubkey::new_from_array(claim.node_pubkey);
+        let usdc_mint = self.usdc_mint();
 
-        let mut data = instruction::CLAIM_REWARDS.to_vec();
+        let pool_token_account = Self::associated_token_address(&subscription_pda, &usdc_mint);
+        let relay_wallet = Pubkey::new_from_array(claim.node_pubkey);
+        let relay_token_account = Self::associated_token_address(&relay_wallet, &usdc_mint);
+
+        let token_program_id = Pubkey::new_from_array([
+            6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172,
+            28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+        ]);
+
+        let mut data = instruction::CLAIM.to_vec();
         data.extend_from_slice(&claim.user_pubkey);
         data.extend_from_slice(&claim.epoch.to_le_bytes());
         data.extend_from_slice(&claim.node_pubkey);
         data.extend_from_slice(&claim.relay_count.to_le_bytes());
         data.extend_from_slice(&claim.leaf_index.to_le_bytes());
-        // Serialize Merkle proof
+        // Serialize Merkle proof (Anchor Vec: 4-byte LE length prefix + elements)
         data.extend_from_slice(&(claim.merkle_proof.len() as u32).to_le_bytes());
         for hash in &claim.merkle_proof {
             data.extend_from_slice(hash);
         }
 
+        // Serialize LightClaimParams (required for on-chain claim)
+        let light = claim.light_params
+            .as_ref()
+            .ok_or_else(|| SettlementError::TransactionFailed(
+                "light_params required for live-mode claim".to_string()
+            ))?;
+        // LightValidityProof { a: [u8;32], b: [u8;64], c: [u8;32] }
+        data.extend_from_slice(&light.proof_a);
+        data.extend_from_slice(&light.proof_b);
+        data.extend_from_slice(&light.proof_c);
+        // LightAddressTreeInfo { pubkey_index: u8, queue_index: u8, root_index: u16 }
+        data.push(light.address_merkle_tree_pubkey_index);
+        data.push(light.address_queue_pubkey_index);
+        data.extend_from_slice(&light.root_index.to_le_bytes());
+        // output_tree_index: u8
+        data.push(light.output_tree_index);
+
         let instruction = Instruction {
             program_id: self.program_id(),
             accounts: vec![
-                AccountMeta::new(signer, true),
-                AccountMeta::new(subscription_pda, false),
-                AccountMeta::new(relay_wallet, false),  // Direct payout target
-                AccountMeta::new_readonly(system_program::id(), false),
-                // Light System Program accounts would go here for compressed ClaimReceipt
+                AccountMeta::new(signer, true),                         // signer
+                AccountMeta::new(subscription_pda, false),              // subscription_account
+                AccountMeta::new(pool_token_account, false),            // pool_token_account
+                AccountMeta::new(relay_token_account, false),           // relay_token_account
+                AccountMeta::new_readonly(usdc_mint, false),            // usdc_mint
+                AccountMeta::new_readonly(token_program_id, false),     // token_program
+                AccountMeta::new_readonly(system_program::id(), false), // system_program
+                // Light Protocol accounts passed via remaining_accounts by the caller
             ],
             data,
         };
@@ -648,42 +754,52 @@ impl SettlementClient {
 
         match rpc.get_account(&subscription_pda).await {
             Ok(account) => {
-                let data = &account.data[8..]; // Skip Anchor discriminator
-                if data.len() < 32 + 8 + 1 + 8 + 8 + 8 + 8 + 8 {
+                let data = &account.data;
+                // SubscriptionAccount layout (after 8-byte discriminator):
+                //   0..32:  user_pubkey [u8; 32]
+                //  32..40:  epoch u64
+                //  40..41:  tier u8
+                //  41..49:  created_at i64
+                //  49..57:  expires_at i64
+                //  57..65:  pool_balance u64
+                //  65..73:  original_pool_balance u64
+                //  73..81:  total_receipts u64
+                //  81..113: distribution_root [u8; 32]
+                // 113..114: distribution_posted bool
+                const MIN_LEN: usize = 8 + 32 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 32 + 1; // = 122
+                if data.len() < MIN_LEN {
                     return Ok(None);
                 }
+                let d = &data[8..]; // skip discriminator
 
                 let mut pubkey = [0u8; 32];
-                pubkey.copy_from_slice(&data[0..32]);
+                pubkey.copy_from_slice(&d[0..32]);
 
-                let epoch_val = u64::from_le_bytes(data[32..40].try_into().expect("8 bytes"));
+                let epoch_val = u64::from_le_bytes(d[32..40].try_into().expect("8 bytes"));
 
-                let tier = match data[40] {
+                let tier = match d[40] {
                     0 => SubscriptionTier::Basic,
                     1 => SubscriptionTier::Standard,
                     2 => SubscriptionTier::Premium,
                     _ => SubscriptionTier::Basic,
                 };
 
-                let created_at = u64::from_le_bytes(data[41..49].try_into().expect("8 bytes"));
-                let expires_at = u64::from_le_bytes(data[49..57].try_into().expect("8 bytes"));
-                let pool_balance = u64::from_le_bytes(data[57..65].try_into().expect("8 bytes"));
-                let original_pool_balance = u64::from_le_bytes(data[65..73].try_into().expect("8 bytes"));
-                let total_receipts = u64::from_le_bytes(data[73..81].try_into().expect("8 bytes"));
-
-                let distribution_posted = data.len() > 81 && data[81] != 0;
+                let created_at = i64::from_le_bytes(d[41..49].try_into().expect("8 bytes"));
+                let expires_at = i64::from_le_bytes(d[49..57].try_into().expect("8 bytes"));
+                let pool_balance = u64::from_le_bytes(d[57..65].try_into().expect("8 bytes"));
+                let original_pool_balance = u64::from_le_bytes(d[65..73].try_into().expect("8 bytes"));
+                let total_receipts = u64::from_le_bytes(d[73..81].try_into().expect("8 bytes"));
 
                 let mut distribution_root = [0u8; 32];
-                if data.len() >= 82 + 32 {
-                    distribution_root.copy_from_slice(&data[82..114]);
-                }
+                distribution_root.copy_from_slice(&d[81..113]);
+                let distribution_posted = d[113] != 0;
 
                 Ok(Some(SubscriptionState {
                     user_pubkey: pubkey,
                     epoch: epoch_val,
                     tier,
-                    created_at,
-                    expires_at,
+                    created_at: created_at as u64,
+                    expires_at: expires_at as u64,
                     pool_balance,
                     original_pool_balance,
                     total_receipts,
@@ -715,9 +831,12 @@ impl SettlementClient {
             return Ok(state.subscriptions.get(&(user_pubkey, next - 1)).cloned());
         }
 
-        // Live mode: would query UserMeta PDA for next_epoch, then subscription PDA
-        // For now, default to epoch 0
-        self.get_subscription_state(user_pubkey, 0).await
+        // Live mode: query UserMeta PDA for next_epoch, then subscription PDA
+        let next_epoch = self.get_next_epoch_live(&user_pubkey).await?;
+        if next_epoch == 0 {
+            return Ok(None);
+        }
+        self.get_subscription_state(user_pubkey, next_epoch - 1).await
     }
 
     /// Check if a user has an active subscription (any epoch)
@@ -987,6 +1106,7 @@ mod tests {
             relay_count: 7,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         }).await.unwrap();
 
         // Node2 claims 3/10 * 1_000_000 = 300_000 (direct payout)
@@ -997,6 +1117,7 @@ mod tests {
             relay_count: 3,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         }).await.unwrap();
 
         // Pool should be drained
@@ -1041,6 +1162,7 @@ mod tests {
             relay_count: 10,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         }).await;
 
         assert!(matches!(result, Err(SettlementError::EpochNotComplete)));
@@ -1070,6 +1192,7 @@ mod tests {
             relay_count: 10,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         }).await;
 
         assert!(matches!(result, Err(SettlementError::DistributionNotPosted)));
@@ -1107,6 +1230,7 @@ mod tests {
             relay_count: 5,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         }).await.unwrap();
 
         // Second claim fails
@@ -1117,6 +1241,7 @@ mod tests {
             relay_count: 5,
             leaf_index: 0,
             merkle_proof: vec![],
+            light_params: None,
         }).await;
 
         assert!(matches!(result, Err(SettlementError::AlreadyClaimed)));
@@ -1136,6 +1261,7 @@ mod tests {
             mode: SettlementMode::Live,
             rpc_url: "http://localhost:8899".to_string(),
             program_id: [1u8; 32],
+            usdc_mint: USDC_MINT_DEVNET,
             commitment: "finalized".to_string(),
         };
 
@@ -1223,6 +1349,7 @@ mod tests {
         client.claim_rewards(ClaimRewards {
             user_pubkey: user, epoch: epoch0, node_pubkey: [2u8; 32],
             relay_count: 10, leaf_index: 0, merkle_proof: vec![],
+            light_params: None,
         }).await.unwrap();
 
         let sub0_after = client.get_subscription_state(user, epoch0).await.unwrap().unwrap();

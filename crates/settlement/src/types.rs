@@ -9,6 +9,18 @@
 
 use tunnelcraft_core::{PublicKey, SubscriptionTier};
 
+/// USDC mint address on Solana devnet (`4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU`)
+pub const USDC_MINT_DEVNET: [u8; 32] = [
+    59, 68, 44, 179, 145, 33, 87, 241, 58, 147, 61, 1, 52, 40, 45, 3,
+    43, 95, 254, 205, 1, 162, 219, 241, 183, 121, 6, 8, 223, 0, 46, 167,
+];
+
+/// USDC mint address on Solana mainnet (`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`)
+pub const USDC_MINT_MAINNET: [u8; 32] = [
+    198, 250, 122, 243, 190, 219, 173, 58, 61, 101, 243, 106, 171, 201, 116, 49,
+    177, 187, 228, 194, 210, 246, 224, 228, 124, 166, 2, 3, 69, 47, 93, 97,
+];
+
 /// Grace period after subscription expires before claims open (1 day)
 pub const GRACE_PERIOD_SECS: u64 = 86_400;
 
@@ -55,6 +67,19 @@ pub struct PostDistribution {
     pub total_receipts: u64,
 }
 
+/// Light Protocol parameters for on-chain claim (non-inclusion proof + address tree info).
+/// Only needed in live mode — mock mode ignores these.
+#[derive(Debug, Clone)]
+pub struct ClaimLightParams {
+    pub proof_a: [u8; 32],
+    pub proof_b: [u8; 64],
+    pub proof_c: [u8; 32],
+    pub address_merkle_tree_pubkey_index: u8,
+    pub address_queue_pubkey_index: u8,
+    pub root_index: u16,
+    pub output_tree_index: u8,
+}
+
 /// Claim rewards from a user's pool using a Merkle proof.
 ///
 /// After distribution is posted, each relay claims its share.
@@ -76,6 +101,8 @@ pub struct ClaimRewards {
     pub leaf_index: u32,
     /// Merkle proof that (node_pubkey, relay_count) is in distribution_root
     pub merkle_proof: Vec<[u8; 32]>,
+    /// Light Protocol params for compressed ClaimReceipt (None in mock mode)
+    pub light_params: Option<ClaimLightParams>,
 }
 
 /// On-chain subscription state for a user epoch
@@ -165,6 +192,7 @@ mod tests {
             relay_count: 500,
             leaf_index: 0,
             merkle_proof: vec![[0xBB; 32], [0xCC; 32]],
+            light_params: None,
         };
 
         assert_eq!(claim.user_pubkey, [1u8; 32]);
