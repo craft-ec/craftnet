@@ -34,6 +34,7 @@ use tunnelcraft_network::{
     RelayStatusMessage, RelayStatusType,
     ProofMessage, PoolType,
     SubscriptionAnnouncement, SUBSCRIPTION_TOPIC,
+    TopologyMessage, TOPOLOGY_TOPIC,
     EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
     RELAY_HEARTBEAT_INTERVAL, RELAY_OFFLINE_THRESHOLD,
     EXIT_STATUS_TOPIC, RELAY_STATUS_TOPIC, PROOF_TOPIC,
@@ -43,8 +44,24 @@ use tunnelcraft_prover::{Prover, StubProver};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
 
+use sha2::{Sha256, Digest};
+
 use crate::path::PathHop;
 use crate::{ClientError, RequestBuilder, Result, TunnelResponse};
+
+/// Derive a deterministic tunnel_id from two peer IDs.
+/// Both sides of a connection can compute this independently.
+/// `tunnel_id = SHA256(client_peer_id || gateway_peer_id || "tunnel")`
+fn derive_tunnel_id(client_peer_id: &PeerId, gateway_peer_id: &PeerId) -> Id {
+    let mut hasher = Sha256::new();
+    hasher.update(client_peer_id.to_bytes());
+    hasher.update(gateway_peer_id.to_bytes());
+    hasher.update(b"tunnel");
+    let result = hasher.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&result);
+    id
+}
 
 /// Max retry attempts for a rejected/failed outbound shard
 const MAX_SHARD_RETRIES: usize = 3;
@@ -212,6 +229,11 @@ pub struct NodeConfig {
 
     /// Enable aggregator mode (collects proof messages, builds distributions)
     pub enable_aggregator: bool,
+
+    /// Override exit handler's blocked domains list.
+    /// When None, uses the default (localhost, 127.0.0.1, 0.0.0.0).
+    /// Set to Some(vec![]) to allow all destinations (useful for testing).
+    pub exit_blocked_domains: Option<Vec<String>>,
 }
 
 impl Default for NodeConfig {
@@ -232,6 +254,7 @@ impl Default for NodeConfig {
             libp2p_keypair: None,
             data_dir: None,
             enable_aggregator: false,
+            exit_blocked_domains: None,
         }
     }
 }
@@ -396,7 +419,7 @@ impl ExitNodeStatus {
             info,
             peer_id: None,
             last_dht_seen: now,
-            last_heartbeat: None,
+            last_heartbeat: Some(now), // Treat discovery as initial heartbeat
             online: true, // Assume online until timeout
             announced_load_percent: 50,
             announced_uplink_kbps: 0,
@@ -568,6 +591,7 @@ struct RelayNodeStatus {
 
 impl RelayNodeStatus {
     fn new(info: RelayInfo, peer_id: PeerId) -> Self {
+        let now = std::time::Instant::now();
         Self {
             info,
             peer_id,
@@ -578,8 +602,8 @@ impl RelayNodeStatus {
             queue_depth: 0,
             bandwidth_kbps: 0,
             uptime_secs: 0,
-            last_heartbeat: None,
-            last_dht_seen: std::time::Instant::now(),
+            last_heartbeat: Some(now), // Treat discovery as initial heartbeat
+            last_dht_seen: now,
         }
     }
 
@@ -770,6 +794,9 @@ pub struct TunnelCraftNode {
     pool_roots: HashMap<(PublicKey, PoolType, u64), ([u8; 32], u64)>,
     /// Adaptive batch size (starts at 10K, adjusts based on prover speed)
     proof_batch_size: usize,
+    /// Maximum time receipts can sit in the proof queue before forcing a prove.
+    /// Defaults to 15 minutes. Configurable for testing.
+    proof_deadline: Duration,
     /// Prover busy flag (set while proving, cleared when done)
     prover_busy: bool,
     /// Last proof generation time (for adaptive batch sizing)
@@ -814,6 +841,11 @@ pub struct TunnelCraftNode {
     pending_tunnel: HashMap<Id, PendingTunnelRequest>,
     /// Channel for receiving tunnel bursts from SOCKS5 server
     tunnel_burst_rx: Option<mpsc::Receiver<TunnelBurst>>,
+
+    /// Topology graph for onion path selection (populated from relay/exit discovery)
+    topology: crate::path::TopologyGraph,
+    /// Last time we published our topology message (throttle to every 60s)
+    last_topology_publish: Option<std::time::Instant>,
 }
 
 impl TunnelCraftNode {
@@ -966,6 +998,7 @@ impl TunnelCraftNode {
             request_user: HashMap::new(),
             pool_roots,
             proof_batch_size: 10_000,
+            proof_deadline: PROOF_DEADLINE,
             prover_busy: false,
             last_proof_duration: None,
             receipt_file,
@@ -995,6 +1028,8 @@ impl TunnelCraftNode {
             last_bootstrap_check: None,
             pending_tunnel: HashMap::new(),
             tunnel_burst_rx: None,
+            topology: crate::path::TopologyGraph::new(),
+            last_topology_publish: None,
         })
     }
 
@@ -1031,20 +1066,26 @@ impl TunnelCraftNode {
                 }
 
                 if self.config.enable_exit && state.exit_handler.is_none() {
-                    let exit_config = ExitConfig {
+                    let mut exit_config = ExitConfig {
                         timeout: self.config.request_timeout,
                         ..Default::default()
                     };
+                    if let Some(ref blocked) = self.config.exit_blocked_domains {
+                        exit_config.blocked_domains = blocked.clone();
+                    }
                     let settlement_client = Arc::new(SettlementClient::with_secret_key(
                         self.config.settlement_config.clone(),
                         &self.keypair.secret_key_bytes(),
                     ));
-                    match ExitHandler::with_keypair_and_settlement(
+                    // Use the node's encryption keypair so exit handler can decrypt
+                    // routing_tags encrypted with our advertised encryption pubkey
+                    match ExitHandler::with_keypairs(
                         exit_config,
                         self.keypair.clone(),
-                        settlement_client,
+                        self.encryption_keypair.clone(),
                     ) {
-                        Ok(handler) => {
+                        Ok(mut handler) => {
+                            handler.set_settlement_client(settlement_client);
                             state.exit_handler = Some(handler);
                             info!("Exit handler initialized with devnet settlement");
                         }
@@ -1148,6 +1189,15 @@ impl TunnelCraftNode {
                 warn!("Failed to subscribe to subscription topic: {:?}", e);
             } else {
                 debug!("Subscribed to subscription topic");
+            }
+        }
+
+        // Subscribe to topology gossipsub topic (relay connectivity advertisements)
+        if let Some(ref mut swarm) = self.swarm {
+            if let Err(e) = swarm.behaviour_mut().subscribe_topology() {
+                warn!("Failed to subscribe to topology topic: {:?}", e);
+            } else {
+                debug!("Subscribed to topology topic");
             }
         }
 
@@ -1395,6 +1445,67 @@ impl TunnelCraftNode {
         if should_send {
             self.publish_heartbeat();
         }
+    }
+
+    /// Handle incoming topology message from gossipsub.
+    /// Verifies signature, then updates the topology graph with the relay's connected peers.
+    fn handle_topology_message(&mut self, data: &[u8], _source: Option<PeerId>) {
+        use crate::path::TopologyRelay;
+
+        let Some(msg) = TopologyMessage::from_bytes(data) else {
+            debug!("Failed to parse topology message");
+            return;
+        };
+        let Some(pubkey) = msg.pubkey_bytes() else {
+            debug!("Invalid pubkey in topology message from {}", msg.peer_id);
+            return;
+        };
+        let Some(enc_pubkey) = msg.encryption_pubkey_bytes() else {
+            debug!("Invalid encryption pubkey in topology message from {}", msg.peer_id);
+            return;
+        };
+
+        // Verify signature if present
+        if msg.signature.len() == 64 {
+            let signable = msg.signable_data();
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&msg.signature);
+            if !tunnelcraft_crypto::verify_signature(&pubkey, &signable, &sig) {
+                debug!("Invalid topology signature from {}", msg.peer_id);
+                return;
+            }
+        } else if !msg.signature.is_empty() {
+            debug!("Topology message from {} has invalid signature length {}", msg.peer_id, msg.signature.len());
+            return;
+        }
+
+        // Parse connected peers from PeerId strings to bytes
+        let connected_peers: HashSet<Vec<u8>> = msg.connected_peers.iter()
+            .filter_map(|s| s.parse::<PeerId>().ok().map(|p| p.to_bytes()))
+            .collect();
+
+        let peer_id_bytes = msg.peer_id.parse::<PeerId>()
+            .map(|p| p.to_bytes())
+            .unwrap_or_default();
+
+        if peer_id_bytes.is_empty() {
+            debug!("Invalid peer_id in topology message: {}", msg.peer_id);
+            return;
+        }
+
+        debug!(
+            "Topology update from {}: {} connected peers",
+            msg.peer_id,
+            connected_peers.len(),
+        );
+
+        self.topology.update_relay(TopologyRelay {
+            peer_id: peer_id_bytes,
+            signing_pubkey: pubkey,
+            encryption_pubkey: enc_pubkey,
+            connected_peers,
+            last_seen: std::time::Instant::now(),
+        });
     }
 
     /// Handle incoming exit status message from gossipsub
@@ -1736,6 +1847,18 @@ impl TunnelCraftNode {
         self.credits
     }
 
+    /// Set proof batch size (number of receipts before triggering a prove).
+    /// Lower values cause more frequent proofs. Useful for testing.
+    pub fn set_proof_batch_size(&mut self, size: usize) {
+        self.proof_batch_size = size;
+    }
+
+    /// Set proof deadline (max time receipts can sit before forcing a prove).
+    /// Shorter values cause faster proof generation. Useful for testing.
+    pub fn set_proof_deadline(&mut self, deadline: Duration) {
+        self.proof_deadline = deadline;
+    }
+
     /// Get total number of stored forward receipts
     pub fn receipt_count(&self) -> usize {
         self.forward_receipts.values().map(|v| v.len()).sum()
@@ -1800,16 +1923,18 @@ impl TunnelCraftNode {
             .clone();
 
         // Build exit PathHop from selected exit info
-        let exit_peer_id_bytes = exit_info.peer_id
-            .as_deref()
-            .unwrap_or("")
-            .as_bytes()
-            .to_vec();
+        let exit_peer_id = self.known_peers.get(&exit_info.pubkey).copied();
+        let exit_peer_id_bytes = exit_peer_id
+            .map(|p| p.to_bytes())
+            .unwrap_or_default();
         let exit_hop = PathHop {
             peer_id: exit_peer_id_bytes,
             signing_pubkey: exit_info.pubkey,
             encryption_pubkey: exit_info.encryption_pubkey.unwrap_or([0u8; 32]),
         };
+
+        // Build topology-based paths and LeaseSet
+        let (paths, first_hops, lease_set) = self.build_request_paths(&exit_hop)?;
 
         // Build request
         let mut builder = RequestBuilder::new(method, url);
@@ -1822,27 +1947,27 @@ impl TunnelCraftNode {
             builder = builder.body(body_data);
         }
 
-        // Build onion-routed shards (no relay paths for now — direct mode)
-        let lease_set = tunnelcraft_core::lease_set::LeaseSet {
-            session_id: [0u8; 32],
-            leases: vec![],
-        };
-        let (request_id, shards) = builder.build_onion(
+        // Build onion-routed shards with our X25519 encryption pubkey
+        // so the exit can encrypt responses that we can decrypt.
+        let (request_id, shards) = builder.build_onion_with_enc_key(
             &self.keypair,
             &exit_hop,
-            &[], // direct mode (no relay hops for now)
+            &paths,
             &lease_set,
             0, // epoch
+            self.encryption_keypair.public_key_bytes(), // response encryption key
+            [0u8; 32], // pool_pubkey (free tier default)
         )?;
 
         // Calculate request size for throughput measurement
         let request_bytes: usize = shards.iter().map(|s| s.payload.len()).sum();
 
         debug!(
-            "Created {} shards for request {} ({} bytes)",
+            "Created {} shards for request {} ({} bytes, {} hops)",
             shards.len(),
             hex::encode(&request_id[..8]),
-            request_bytes
+            request_bytes,
+            self.config.hop_mode.min_relays()
         );
 
         // Create response channel
@@ -1862,7 +1987,13 @@ impl TunnelCraftNode {
         );
 
         // Send shards
-        self.send_shards(shards).await?;
+        if first_hops.is_empty() {
+            // Direct mode: send all shards to exit
+            self.send_shards(shards, exit_peer_id).await?;
+        } else {
+            // Relayed mode: send each shard to its path's first hop
+            self.send_shards_per_hop(shards, &first_hops).await?;
+        }
 
         // Update stats
         {
@@ -1891,26 +2022,50 @@ impl TunnelCraftNode {
     /// Send shards to peers.
     ///
     /// Onion routing: each shard's header specifies its own path.
-    /// The first hop is determined by the onion header. In direct mode
-    /// (empty header), shards are sent to the exit directly or best-effort
-    /// to any connected peer.
-    async fn send_shards(&mut self, shards: Vec<Shard>) -> Result<()> {
+    /// When `target` is Some, all shards are sent directly to that peer
+    /// (used in direct mode where the exit is the first and only hop).
+    /// When `target` is None, shards are scattered to connected relay peers
+    /// (used in relayed mode where the first relay peels the onion).
+    async fn send_shards(&mut self, shards: Vec<Shard>, target: Option<PeerId>) -> Result<()> {
         if self.swarm.is_none() {
             return Err(ClientError::NotConnected);
         }
 
         info!(
-            "Sending {} shards (relay_peers={})",
+            "Sending {} shards (target={:?}, relay_peers={})",
             shards.len(),
+            target,
             self.available_relay_count(),
         );
 
-        // Cross-shard exclusion: track which peers have been used so each
-        // shard goes to a different peer (when enough peers are available).
-        let mut used_peers = HashSet::new();
-        for shard in shards {
-            if let Some(selected) = self.forward_shard(shard, None, used_peers.clone()) {
-                used_peers.insert(selected);
+        if let Some(target_peer) = target {
+            // Direct mode: send all shards to the target (exit) peer
+            for shard in shards {
+                if let Some(ref mut swarm) = self.swarm {
+                    let shard_clone = shard.clone();
+                    let request = ShardRequest { shard };
+                    let req_id = swarm.behaviour_mut().send_shard(target_peer, request);
+                    self.pending_outbound.insert(req_id, PendingOutbound {
+                        shard: shard_clone,
+                        source_peer: None,
+                        tried_peers: {
+                            let mut s = HashSet::new();
+                            s.insert(target_peer);
+                            s
+                        },
+                        attempts: 0,
+                    });
+                }
+            }
+        } else {
+            // Relayed mode: scatter shards to different relay peers
+            // Cross-shard exclusion: track which peers have been used so each
+            // shard goes to a different peer (when enough peers are available).
+            let mut used_peers = HashSet::new();
+            for shard in shards {
+                if let Some(selected) = self.forward_shard(shard, None, used_peers.clone()) {
+                    used_peers.insert(selected);
+                }
             }
         }
 
@@ -1931,14 +2086,24 @@ impl TunnelCraftNode {
     /// to decrypt the routing_tag with our encryption key.
     async fn process_incoming_shard(&mut self, shard: Shard, source_peer: PeerId) -> ShardResponse {
         // Try to decrypt routing_tag with our own encryption key.
-        // If it succeeds, this is a response shard directed to us.
-        if let Ok(_assembly_id) = tunnelcraft_crypto::decrypt_routing_tag(
+        // If it succeeds AND matches a pending request/tunnel, this is a response shard for us.
+        // Important: exit nodes can also decrypt routing_tags on REQUEST shards (since
+        // the client encrypted them with the exit's key). We distinguish by checking
+        // whether the assembly_id matches something we're waiting for.
+        if let Ok(tag) = tunnelcraft_crypto::decrypt_routing_tag(
             &self.encryption_keypair.secret_key_bytes(),
             &shard.routing_tag,
         ) {
-            // This is a response shard for us (client mode)
-            self.handle_response_shard(shard);
-            return ShardResponse::Accepted(None);
+            let assembly_id = tag.assembly_id;
+            let has_pending_request = self.pending.contains_key(&assembly_id);
+            let has_pending_tunnel = self.pending_tunnel.contains_key(&assembly_id);
+
+            if has_pending_request || has_pending_tunnel {
+                // This is a response shard for us (client mode)
+                self.handle_response_shard(shard);
+                return ShardResponse::Accepted(None);
+            }
+            // Not a response for us — fall through to relay/exit processing
         }
 
         // Not for us — process as relay or exit
@@ -1948,15 +2113,16 @@ impl TunnelCraftNode {
 
         // Check if this shard has an empty header — if so, process as exit
         if shard.header.is_empty() {
-            return self.process_as_exit(shard).await;
+            return self.process_as_exit(shard, source_peer).await;
         }
 
         // Process as relay: peel one onion layer, forward to next hop
         self.relay_shard(shard, Some(source_peer))
     }
 
-    /// Process shard as exit node
-    async fn process_as_exit(&mut self, shard: Shard) -> ShardResponse {
+    /// Process shard as exit node.
+    /// `source_peer` is the peer that sent the shard — used for direct mode response routing.
+    async fn process_as_exit(&mut self, shard: Shard, source_peer: PeerId) -> ShardResponse {
         // Take exit handler out temporarily to avoid holding lock across await
         let exit_handler = {
             let mut state = self.state.write();
@@ -1967,18 +2133,23 @@ impl TunnelCraftNode {
             return ShardResponse::Rejected("Not an exit node".to_string());
         };
 
-        let result: std::result::Result<Option<Vec<Shard>>, tunnelcraft_exit::ExitError> =
-            handler.process_shard(shard).await;
+        let result = handler.process_shard(shard).await;
 
-        // Put handler back and extract response shards
-        let response_shards = {
+        // Put handler back and extract response shards + gateway
+        let response_info = {
             let mut state = self.state.write();
             state.exit_handler = Some(handler);
 
             match result {
-                Ok(Some(shards)) => {
+                Ok(Some((shards, gateway_bytes))) => {
                     state.stats.requests_exited += 1;
-                    Some(shards)
+                    // Determine response target: gateway from LeaseSet, or source_peer (direct mode)
+                    let target = if let Some(ref gw) = gateway_bytes {
+                        PeerId::from_bytes(gw).ok().unwrap_or(source_peer)
+                    } else {
+                        source_peer
+                    };
+                    Some((shards, target))
                 }
                 Ok(None) => {
                     return ShardResponse::Accepted(None);
@@ -1990,9 +2161,9 @@ impl TunnelCraftNode {
         };
         // Lock released here
 
-        // Send response shards back through the network (same path as client sends)
-        if let Some(shards) = response_shards {
-            if let Err(e) = self.send_shards(shards).await {
+        // Send response shards to target (gateway or source_peer)
+        if let Some((shards, target)) = response_info {
+            if let Err(e) = self.send_shards(shards, Some(target)).await {
                 warn!("Failed to send response shards: {}", e);
             }
         }
@@ -2021,12 +2192,16 @@ impl TunnelCraftNode {
         // Lock released here
 
         match relay_result {
-            Ok((modified_shard, next_peer_bytes, receipt)) => {
+            Ok((modified_shard, next_peer_bytes, receipt, pool_pubkey, epoch)) => {
                 {
                     let mut state = self.state.write();
                     state.stats.shards_relayed += 1;
                     state.stats.bytes_relayed += modified_shard.payload.len() as u64;
                 }
+
+                // Route receipt to the correct pool using pool_pubkey from onion layer
+                let pool_type = if pool_pubkey == [0u8; 32] { PoolType::Free } else { PoolType::Subscribed };
+                self.request_user.insert(receipt.shard_id, (pool_pubkey, pool_type, epoch));
 
                 // Store the receipt for settlement
                 self.store_forward_receipt(receipt.clone());
@@ -2227,7 +2402,7 @@ impl TunnelCraftNode {
 
         // Route into proof queue for ZK proving (relay/exit mode only)
         if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            if let Some((pool, pool_type, epoch)) = self.request_user.get(&receipt.request_id) {
+            if let Some((pool, pool_type, epoch)) = self.request_user.get(&receipt.shard_id) {
                 let key = (*pool, *pool_type, *epoch);
                 let queue = self.proof_queue.entry(key).or_default();
                 if queue.len() < self.proof_queue_limit {
@@ -2458,20 +2633,23 @@ impl TunnelCraftNode {
         };
 
         // Build exit PathHop from selected exit info
-        let exit_peer_id_bytes = exit_info.peer_id
-            .as_deref()
-            .unwrap_or("")
-            .as_bytes()
-            .to_vec();
+        let exit_peer_id = self.known_peers.get(&exit_info.pubkey).copied();
+        let exit_peer_id_bytes = exit_peer_id
+            .map(|p| p.to_bytes())
+            .unwrap_or_default();
         let exit_hop = PathHop {
             peer_id: exit_peer_id_bytes,
             signing_pubkey: exit_info.pubkey,
             encryption_pubkey: exit_info.encryption_pubkey.unwrap_or([0u8; 32]),
         };
 
-        let lease_set = tunnelcraft_core::lease_set::LeaseSet {
-            session_id: [0u8; 32],
-            leases: vec![],
+        // Build topology-based paths and LeaseSet
+        let (paths, first_hops, lease_set) = match self.build_request_paths(&exit_hop) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = burst.response_tx.try_send(Err(e));
+                return;
+            }
         };
 
         let result = crate::tunnel::build_tunnel_shards(
@@ -2479,9 +2657,10 @@ impl TunnelCraftNode {
             &burst.data,
             &self.keypair,
             &exit_hop,
-            &[], // direct mode
+            &paths,
             &lease_set,
             0, // epoch
+            [0u8; 32], // pool_pubkey (free tier default)
         );
 
         let (request_id, shards) = match result {
@@ -2493,10 +2672,11 @@ impl TunnelCraftNode {
         };
 
         debug!(
-            "Tunnel burst: {} shards for session {}, request {}",
+            "Tunnel burst: {} shards for session {}, request {} ({} hops)",
             shards.len(),
             hex::encode(&burst.metadata.session_id[..8]),
-            hex::encode(&request_id[..8])
+            hex::encode(&request_id[..8]),
+            self.config.hop_mode.min_relays()
         );
 
         // Store pending tunnel request
@@ -2511,9 +2691,19 @@ impl TunnelCraftNode {
         );
 
         // Send shards
-        if let Err(e) = self.send_shards(shards).await {
-            if let Some(pending) = self.pending_tunnel.remove(&request_id) {
-                let _ = pending.response_tx.try_send(Err(e));
+        if first_hops.is_empty() {
+            // Direct mode: send all shards to exit
+            if let Err(e) = self.send_shards(shards, exit_peer_id).await {
+                if let Some(pending) = self.pending_tunnel.remove(&request_id) {
+                    let _ = pending.response_tx.try_send(Err(e));
+                }
+            }
+        } else {
+            // Relayed mode: send each shard to its path's first hop
+            if let Err(e) = self.send_shards_per_hop(shards, &first_hops).await {
+                if let Some(pending) = self.pending_tunnel.remove(&request_id) {
+                    let _ = pending.response_tx.try_send(Err(e));
+                }
             }
         }
     }
@@ -2656,7 +2846,304 @@ impl TunnelCraftNode {
             event = swarm.select_next_some() => {
                 self.handle_swarm_event(event).await;
             }
+            burst = async {
+                if let Some(ref mut rx) = self.tunnel_burst_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if let Some(burst) = burst {
+                    self.handle_tunnel_burst(burst).await;
+                }
+            }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+
+    /// Run periodic maintenance tasks (heartbeats, DHT discovery, cleanup).
+    /// Normally called automatically every 30s by `run()`. Call manually
+    /// when using `poll_once()` in a custom event loop.
+    pub fn run_maintenance(&mut self) {
+        self.maybe_reannounce_exit();
+        self.maybe_reannounce_peer();
+        self.maybe_send_heartbeat();
+        self.check_exit_timeouts();
+        self.discover_exits();
+        self.cleanup_stale_exits();
+        self.maybe_reannounce_relay();
+        self.maybe_send_relay_heartbeat();
+        self.discover_relays();
+        self.check_relay_timeouts();
+        self.cleanup_stale_relays();
+        self.maybe_reconnect_bootstrap();
+        self.update_topology();
+        self.maybe_publish_topology();
+    }
+
+    /// Ensure DHT-discovered relays/exits exist in the topology graph.
+    /// Does NOT overwrite `connected_peers` from gossip — only adds new entries
+    /// for relays not yet seen via topology gossip. Prunes stale entries.
+    fn update_topology(&mut self) {
+        use crate::path::TopologyRelay;
+
+        // Add relays that aren't already in topology (from DHT discovery)
+        for status in self.relay_nodes.values().filter(|s| s.online) {
+            let peer_bytes = status.peer_id.to_bytes();
+            if self.topology.get_relay(&peer_bytes).is_none() {
+                // Only add if not already present (don't overwrite gossip data)
+                self.topology.update_relay(TopologyRelay {
+                    peer_id: peer_bytes,
+                    signing_pubkey: status.info.pubkey,
+                    encryption_pubkey: status.info.encryption_pubkey.unwrap_or([0u8; 32]),
+                    connected_peers: HashSet::new(), // Will be filled by topology gossip
+                    last_seen: std::time::Instant::now(),
+                });
+            }
+        }
+
+        // Same for exit nodes
+        for status in self.exit_nodes.values().filter(|s| s.online) {
+            let Some(pid) = status.peer_id else { continue };
+            let peer_bytes = pid.to_bytes();
+            if self.topology.get_relay(&peer_bytes).is_none() {
+                self.topology.update_relay(TopologyRelay {
+                    peer_id: peer_bytes,
+                    signing_pubkey: status.info.pubkey,
+                    encryption_pubkey: status.info.encryption_pubkey.unwrap_or([0u8; 32]),
+                    connected_peers: HashSet::new(), // Will be filled by topology gossip
+                    last_seen: std::time::Instant::now(),
+                });
+            }
+        }
+
+        // Prune stale entries not seen in 5 minutes
+        self.topology.prune_stale(Duration::from_secs(300));
+    }
+
+    /// Publish our topology message via gossipsub.
+    /// Only relay/exit/full nodes in Node/Both mode publish topology.
+    fn publish_topology(&mut self) {
+        if !matches!(self.config.node_type, NodeType::Relay | NodeType::Full | NodeType::Exit) ||
+           !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+            return;
+        }
+        let Some(local_pid) = self.local_peer_id else { return };
+
+        let connected_peers: Vec<String> = self.swarm.as_ref()
+            .map(|s| s.connected_peers().map(|p| p.to_string()).collect())
+            .unwrap_or_default();
+
+        let mut msg = TopologyMessage::new(
+            self.keypair.public_key_bytes(),
+            &local_pid.to_string(),
+            self.encryption_keypair.public_key_bytes(),
+            connected_peers,
+        );
+
+        // Sign the message
+        let signable = msg.signable_data();
+        let sig = tunnelcraft_crypto::sign_data(&self.keypair, &signable);
+        msg.signature = sig.to_vec();
+
+        if let Some(ref mut swarm) = self.swarm {
+            match swarm.behaviour_mut().publish_topology(msg.to_bytes()) {
+                Ok(_) => debug!("Published topology with {} connected peers", msg.connected_peers.len()),
+                Err(e) => debug!("Failed to publish topology: {:?}", e),
+            }
+        }
+        self.last_topology_publish = Some(Instant::now());
+    }
+
+    /// Publish topology periodically (every 60s) in maintenance cycle
+    fn maybe_publish_topology(&mut self) {
+        if let Some(last) = self.last_topology_publish {
+            if last.elapsed() < Duration::from_secs(60) {
+                return;
+            }
+        }
+        self.publish_topology();
+    }
+
+    /// Build topology-based onion paths and LeaseSet for a request.
+    ///
+    /// Returns `(paths, first_hop_targets, lease_set)` where:
+    /// - `paths`: onion paths for each shard (relay hops + exit)
+    /// - `first_hop_targets`: PeerId of the first relay for each path
+    /// - `lease_set`: gateway info for response routing
+    fn build_request_paths(&self, exit_hop: &PathHop) -> Result<(Vec<crate::path::OnionPath>, Vec<PeerId>, tunnelcraft_core::lease_set::LeaseSet)> {
+        use crate::path::{PathSelector, random_id};
+        use tunnelcraft_core::lease_set::{LeaseSet, Lease};
+
+        let hop_count = self.config.hop_mode.min_relays() as usize;
+        let our_peer_id = self.local_peer_id
+            .ok_or(ClientError::NotConnected)?;
+        let our_bytes = our_peer_id.to_bytes();
+
+        if hop_count == 0 {
+            // Direct mode: no relay hops on forward path.
+            // Response path still goes through a gateway relay (exit → gateway → client).
+
+            // Select a gateway relay using topology: pick a relay that lists us
+            // in its connected_peers (from their topology gossip).
+            let gateway = self.select_gateway_relay(&our_bytes);
+
+            let (gw_peer_id, gw_enc_pubkey) = if let Some((pid, enc_pk)) = gateway {
+                (pid, enc_pk)
+            } else {
+                // No relays available — use ourselves as gateway (localhost fallback)
+                (our_peer_id, self.encryption_keypair.public_key_bytes())
+            };
+
+            // Derive deterministic tunnel_id from the connection
+            let tunnel_id = derive_tunnel_id(&our_peer_id, &gw_peer_id);
+
+            debug!(
+                "Selected gateway {} (connected={}) tunnel_id={}",
+                gw_peer_id,
+                self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&gw_peer_id)),
+                hex::encode(&tunnel_id[..8]),
+            );
+
+            let lease_set = LeaseSet {
+                session_id: random_id(),
+                leases: vec![Lease {
+                    gateway_peer_id: gw_peer_id.to_bytes(),
+                    gateway_encryption_pubkey: gw_enc_pubkey,
+                    tunnel_id,
+                    expires_at: u64::MAX,
+                }],
+            };
+            return Ok((vec![], vec![], lease_set));
+        }
+
+        // Select diverse paths through topology
+        let paths = PathSelector::select_diverse_paths(
+            &self.topology,
+            hop_count,
+            exit_hop,
+            tunnelcraft_erasure::TOTAL_SHARDS,
+        )?;
+
+        // Extract first-hop PeerIds
+        let first_hops: Vec<PeerId> = paths.iter()
+            .filter_map(|p| {
+                if p.hops.is_empty() { return None; }
+                PeerId::from_bytes(&p.hops[0].peer_id).ok()
+            })
+            .collect();
+
+        // Build LeaseSet: pick a directly-connected relay as gateway.
+        // The client is NEVER its own gateway — responses always route through
+        // a relay: exit → gateway → client.
+        let gateway = self.select_gateway_relay(&our_bytes);
+
+        let (gw_peer_id, gw_enc_pubkey) = if let Some((pid, enc_pk)) = gateway {
+            (pid, enc_pk)
+        } else {
+            (our_peer_id, self.encryption_keypair.public_key_bytes())
+        };
+
+        let tunnel_id = derive_tunnel_id(&our_peer_id, &gw_peer_id);
+
+        let lease_set = LeaseSet {
+            session_id: random_id(),
+            leases: vec![Lease {
+                gateway_peer_id: gw_peer_id.to_bytes(),
+                gateway_encryption_pubkey: gw_enc_pubkey,
+                tunnel_id,
+                expires_at: u64::MAX,
+            }],
+        };
+
+        Ok((paths, first_hops, lease_set))
+    }
+
+    /// Select a gateway relay using topology + swarm connectivity.
+    ///
+    /// Priority:
+    /// 1. Topology-aware: relay that lists us in `connected_peers` (from gossip) and is online
+    /// 2. Swarm-connected: relay we're directly connected to (fallback before gossip arrives)
+    /// 3. None: no suitable gateway found
+    fn select_gateway_relay(&self, our_bytes: &[u8]) -> Option<(PeerId, [u8; 32])> {
+        // Try topology-aware selection: relay whose gossip says it's connected to us
+        let topology_match = self.topology.relays_with_encryption()
+            .into_iter()
+            .find(|r| r.connected_peers.contains(our_bytes))
+            .and_then(|r| {
+                // Map back to relay_nodes to get PeerId + confirm it's a known relay
+                self.relay_nodes.values()
+                    .find(|s| s.info.pubkey == r.signing_pubkey && s.online)
+                    .map(|s| (s.peer_id, r.encryption_pubkey))
+            });
+
+        if topology_match.is_some() {
+            return topology_match;
+        }
+
+        // Fallback: pick a relay we're directly connected to via swarm
+        // (before topology gossip has arrived)
+        self.relay_nodes.values()
+            .find(|s| s.online && self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&s.peer_id)))
+            .or_else(|| self.relay_nodes.values()
+                .find(|s| self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&s.peer_id)))
+            )
+            .map(|gw| (gw.peer_id, gw.info.encryption_pubkey.unwrap_or([0u8; 32])))
+    }
+
+    /// Send shards to per-path first-hop targets.
+    /// Each shard is sent to `first_hops[i % first_hops.len()]`.
+    async fn send_shards_per_hop(&mut self, shards: Vec<Shard>, first_hops: &[PeerId]) -> Result<()> {
+        if first_hops.is_empty() {
+            return Err(ClientError::RequestFailed("No first-hop targets for per-path send".to_string()));
+        }
+
+        info!(
+            "Sending {} shards via {} relay paths",
+            shards.len(),
+            first_hops.len(),
+        );
+
+        for (i, shard) in shards.into_iter().enumerate() {
+            let target = first_hops[i % first_hops.len()];
+            if let Some(ref mut swarm) = self.swarm {
+                let shard_clone = shard.clone();
+                let request = ShardRequest { shard };
+                let req_id = swarm.behaviour_mut().send_shard(target, request);
+                self.pending_outbound.insert(req_id, PendingOutbound {
+                    shard: shard_clone,
+                    source_peer: None,
+                    tried_peers: {
+                        let mut s = HashSet::new();
+                        s.insert(target);
+                        s
+                    },
+                    attempts: 0,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Register a tunnel_id → client PeerId mapping in this node's relay handler.
+    /// Used for gateway mode: the client pre-registers so the gateway knows
+    /// where to forward response shards.
+    pub fn register_tunnel(&self, tunnel_id: Id, client_peer_id: Vec<u8>, expires_at: u64) {
+        let mut state = self.state.write();
+        if let Some(ref mut relay_handler) = state.relay_handler {
+            debug!(
+                "Registering tunnel {} → peer {}",
+                hex::encode(&tunnel_id[..8]),
+                if let Ok(pid) = PeerId::from_bytes(&client_peer_id) {
+                    pid.to_string()
+                } else {
+                    hex::encode(&client_peer_id[..8])
+                }
+            );
+            relay_handler.register_tunnel(tunnel_id, client_peer_id, expires_at);
+        } else {
+            debug!("register_tunnel: no relay_handler, skipping tunnel {}", hex::encode(&tunnel_id[..8]));
         }
     }
 
@@ -2746,12 +3233,30 @@ impl TunnelCraftNode {
                 if !self.unverified_relay_peers.contains(&peer_id) {
                     self.unverified_relay_peers.push(peer_id);
                 }
+                // Register a deterministic tunnel for this connection.
+                // Both sides derive the same tunnel_id from their peer IDs.
+                // This node acts as gateway: remote peer → us (tunnel lookup returns remote_peer_id).
+                if let Some(local_pid) = self.local_peer_id {
+                    let tunnel_id = derive_tunnel_id(&peer_id, &local_pid);
+                    self.register_tunnel(tunnel_id, peer_id.to_bytes(), u64::MAX);
+                }
                 let mut state = self.state.write();
                 state.stats.peers_connected += 1;
+                drop(state);
+                // Publish updated topology (new peer connected)
+                self.publish_topology();
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 debug!("Disconnected from peer: {}", peer_id);
                 self.unverified_relay_peers.retain(|p| p != &peer_id);
+                // Unregister tunnel for disconnected peer
+                if let Some(local_pid) = self.local_peer_id {
+                    let tunnel_id = derive_tunnel_id(&peer_id, &local_pid);
+                    let mut state = self.state.write();
+                    if let Some(ref mut relay_handler) = state.relay_handler {
+                        relay_handler.unregister_tunnel(&tunnel_id);
+                    }
+                }
                 // Mark DHT relay nodes as offline if disconnected
                 for status in self.relay_nodes.values_mut() {
                     if status.peer_id == peer_id {
@@ -2760,6 +3265,9 @@ impl TunnelCraftNode {
                 }
                 let mut state = self.state.write();
                 state.stats.peers_connected = state.stats.peers_connected.saturating_sub(1);
+                drop(state);
+                // Publish updated topology (peer disconnected)
+                self.publish_topology();
             }
             SwarmEvent::Behaviour(behaviour_event) => {
                 self.handle_behaviour_event(behaviour_event).await;
@@ -2814,6 +3322,7 @@ impl TunnelCraftNode {
                     let relay_hash = IdentTopic::new(RELAY_STATUS_TOPIC).hash();
                     let proof_hash = IdentTopic::new(PROOF_TOPIC).hash();
                     let sub_hash = IdentTopic::new(SUBSCRIPTION_TOPIC).hash();
+                    let topology_hash = IdentTopic::new(TOPOLOGY_TOPIC).hash();
 
                     if message.topic == exit_hash {
                         self.handle_exit_status(&message.data, Some(propagation_source));
@@ -2823,6 +3332,8 @@ impl TunnelCraftNode {
                         self.handle_proof_message(&message.data, Some(propagation_source));
                     } else if message.topic == sub_hash {
                         self.handle_subscription_announcement(&message.data);
+                    } else if message.topic == topology_hash {
+                        self.handle_topology_message(&message.data, Some(propagation_source));
                     } else {
                         debug!("Received gossipsub message on unknown topic: {:?}", message.topic);
                     }
@@ -3258,6 +3769,7 @@ impl TunnelCraftNode {
             address: self.config.listen_addr.to_string(),
             allows_last_hop: self.config.allow_last_hop,
             reputation: 0,
+            encryption_pubkey: Some(self.encryption_keypair.public_key_bytes()),
         };
 
         if let Some(ref mut swarm) = self.swarm {
@@ -3655,6 +4167,13 @@ impl TunnelCraftNode {
             .unwrap_or_default()
     }
 
+    /// Get all pool keys tracked by the aggregator (both Subscribed and Free)
+    pub fn aggregator_pool_keys(&self) -> Vec<(PublicKey, PoolType, u64)> {
+        self.aggregator.as_ref()
+            .map(|a| a.all_pool_keys())
+            .unwrap_or_default()
+    }
+
     /// Get aggregator relay stats for a specific relay (if aggregator is enabled)
     pub fn aggregator_relay_stats(&self, relay: &PublicKey) -> Vec<((PublicKey, PoolType, u64), u64)> {
         self.aggregator.as_ref()
@@ -3687,7 +4206,7 @@ impl TunnelCraftNode {
                 let batch_ready = q.len() >= self.proof_batch_size;
                 let deadline_expired = self.proof_oldest_receipt
                     .get(k)
-                    .map(|t| now.duration_since(*t) >= PROOF_DEADLINE)
+                    .map(|t| now.duration_since(*t) >= self.proof_deadline)
                     .unwrap_or(false);
                 batch_ready || deadline_expired
             })
