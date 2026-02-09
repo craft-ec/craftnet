@@ -898,10 +898,10 @@ async fn run_standalone(hops: u8, bootstrap: Option<String>, listen: String) -> 
     info!("Running in standalone mode with {} hops", hops);
 
     let hop_mode = match hops {
-        0 => HopMode::Direct,
-        1 => HopMode::Light,
-        2 => HopMode::Standard,
-        _ => HopMode::Paranoid,
+        0 => HopMode::Single,
+        1 => HopMode::Double,
+        2 => HopMode::Triple,
+        _ => HopMode::Quad,
     };
 
     let listen_addr: Multiaddr = listen.parse().context("Invalid listen address")?;
@@ -939,10 +939,10 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
     info!("Fetching {} with {} hops", url, hops);
 
     let hop_mode = match hops {
-        0 => HopMode::Direct,
-        1 => HopMode::Light,
-        2 => HopMode::Standard,
-        _ => HopMode::Paranoid,
+        0 => HopMode::Single,
+        1 => HopMode::Double,
+        2 => HopMode::Triple,
+        _ => HopMode::Quad,
     };
 
     let mut bootstrap_peers = Vec::new();

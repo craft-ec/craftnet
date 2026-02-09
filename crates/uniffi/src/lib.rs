@@ -59,13 +59,13 @@ pub enum ConnectionState {
     Error,
 }
 
-/// Privacy level (number of relay hops)
+/// Privacy level (number of relay hops including gateway)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum PrivacyLevel {
-    Direct,    // 0 hops
-    Light,     // 1 hop
-    Standard,  // 2 hops
-    Paranoid,  // 3 hops
+    Single,    // 1 hop (gateway only)
+    Double,    // 2 hops
+    Triple,    // 3 hops
+    Quad,      // 4 hops
 }
 
 /// Operating mode for the unified node
@@ -113,10 +113,10 @@ pub enum NodeType {
 impl From<PrivacyLevel> for HopMode {
     fn from(level: PrivacyLevel) -> Self {
         match level {
-            PrivacyLevel::Direct => HopMode::Direct,
-            PrivacyLevel::Light => HopMode::Light,
-            PrivacyLevel::Standard => HopMode::Standard,
-            PrivacyLevel::Paranoid => HopMode::Paranoid,
+            PrivacyLevel::Single => HopMode::Single,
+            PrivacyLevel::Double => HopMode::Double,
+            PrivacyLevel::Triple => HopMode::Triple,
+            PrivacyLevel::Quad => HopMode::Quad,
         }
     }
 }
@@ -140,7 +140,7 @@ impl Default for UnifiedNodeConfig {
     fn default() -> Self {
         Self {
             mode: NodeMode::Both,
-            privacy_level: PrivacyLevel::Standard,
+            privacy_level: PrivacyLevel::Triple,
             node_type: NodeType::Full,
             bootstrap_peer: None,
             request_timeout_secs: 30,
@@ -635,16 +635,16 @@ mod tests {
 
     #[test]
     fn test_privacy_level_conversion() {
-        assert_eq!(HopMode::from(PrivacyLevel::Direct), HopMode::Direct);
-        assert_eq!(HopMode::from(PrivacyLevel::Light), HopMode::Light);
-        assert_eq!(HopMode::from(PrivacyLevel::Standard), HopMode::Standard);
-        assert_eq!(HopMode::from(PrivacyLevel::Paranoid), HopMode::Paranoid);
+        assert_eq!(HopMode::from(PrivacyLevel::Single), HopMode::Single);
+        assert_eq!(HopMode::from(PrivacyLevel::Double), HopMode::Double);
+        assert_eq!(HopMode::from(PrivacyLevel::Triple), HopMode::Triple);
+        assert_eq!(HopMode::from(PrivacyLevel::Quad), HopMode::Quad);
     }
 
     #[test]
     fn test_default_unified_config() {
         let config = UnifiedNodeConfig::default();
-        assert_eq!(config.privacy_level, PrivacyLevel::Standard);
+        assert_eq!(config.privacy_level, PrivacyLevel::Triple);
         assert_eq!(config.mode, NodeMode::Both);
         assert_eq!(config.request_timeout_secs, 30);
         assert!(config.bootstrap_peer.is_none());
@@ -654,11 +654,11 @@ mod tests {
     fn test_create_unified_config() {
         let config = create_unified_config(
             NodeMode::Client,
-            PrivacyLevel::Paranoid,
+            PrivacyLevel::Quad,
             NodeType::Relay,
             Some("peer@/ip4/127.0.0.1/tcp/9000".to_string()),
         );
-        assert_eq!(config.privacy_level, PrivacyLevel::Paranoid);
+        assert_eq!(config.privacy_level, PrivacyLevel::Quad);
         assert_eq!(config.mode, NodeMode::Client);
         assert_eq!(config.request_timeout_secs, 30);
     }
@@ -687,9 +687,9 @@ mod tests {
         init_library();
 
         let node = TunnelCraftUnifiedNode::new(UnifiedNodeConfig::default()).unwrap();
-        assert_eq!(node.get_privacy_level(), PrivacyLevel::Standard);
+        assert_eq!(node.get_privacy_level(), PrivacyLevel::Triple);
 
-        node.set_privacy_level(PrivacyLevel::Paranoid);
-        assert_eq!(node.get_privacy_level(), PrivacyLevel::Paranoid);
+        node.set_privacy_level(PrivacyLevel::Quad);
+        assert_eq!(node.get_privacy_level(), PrivacyLevel::Quad);
     }
 }

@@ -119,11 +119,15 @@ impl PathSelector {
     ///
     /// Each consecutive hop must be connected in the topology.
     /// The last relay must be connected to the exit.
+    ///
+    /// `entry_peer`: if provided, the first hop must be connected to this peer
+    /// (used to ensure the first relay hop is reachable from the gateway).
     pub fn select_path(
         topology: &TopologyGraph,
         hop_count: usize,
         exit: &PathHop,
         exclude: &HashSet<Vec<u8>>,
+        entry_peer: Option<&[u8]>,
     ) -> Result<OnionPath> {
         if hop_count == 0 {
             return Ok(OnionPath {
@@ -159,13 +163,16 @@ impl PathSelector {
             candidates.shuffle(&mut rng);
 
             for i in 0..hop_count {
-                // Find a relay connected to the previous hop (or any relay for the first)
+                // Find a relay connected to the previous hop
                 let found = candidates.iter().find(|&&relay| {
                     if used.contains(&relay.peer_id) {
                         return false;
                     }
                     if i == 0 {
-                        // First hop: just needs to exist
+                        // First hop: must be connected to entry_peer (gateway)
+                        if let Some(entry) = entry_peer {
+                            return topology.is_connected(entry, &relay.peer_id);
+                        }
                         return true;
                     }
                     // Must be connected to previous hop
@@ -207,18 +214,22 @@ impl PathSelector {
     }
 
     /// Select N diverse paths (minimize relay overlap).
+    ///
+    /// `entry_peer`: if provided, the first hop of each path must be connected
+    /// to this peer in topology (used for gateway connectivity).
     pub fn select_diverse_paths(
         topology: &TopologyGraph,
         hop_count: usize,
         exit: &PathHop,
         count: usize,
+        entry_peer: Option<&[u8]>,
     ) -> Result<Vec<OnionPath>> {
         let mut paths = Vec::new();
         let mut used_relays: HashSet<Vec<u8>> = HashSet::new();
 
         for _ in 0..count {
             // Try with excluding previously used relays first
-            match Self::select_path(topology, hop_count, exit, &used_relays) {
+            match Self::select_path(topology, hop_count, exit, &used_relays, entry_peer) {
                 Ok(path) => {
                     for hop in &path.hops {
                         used_relays.insert(hop.peer_id.clone());
@@ -227,7 +238,7 @@ impl PathSelector {
                 }
                 Err(_) => {
                     // Fallback: allow relay reuse
-                    let path = Self::select_path(topology, hop_count, exit, &HashSet::new())?;
+                    let path = Self::select_path(topology, hop_count, exit, &HashSet::new(), entry_peer)?;
                     paths.push(path);
                 }
             }
@@ -341,7 +352,7 @@ mod tests {
         let graph = TopologyGraph::new();
         let exit = make_exit(10);
 
-        let path = PathSelector::select_path(&graph, 0, &exit, &HashSet::new()).unwrap();
+        let path = PathSelector::select_path(&graph, 0, &exit, &HashSet::new(), None).unwrap();
         assert!(path.hops.is_empty());
         assert_eq!(path.exit.peer_id, vec![10]);
     }
@@ -355,7 +366,7 @@ mod tests {
         graph.update_relay(r1);
 
         let exit = make_exit(10);
-        let path = PathSelector::select_path(&graph, 1, &exit, &HashSet::new()).unwrap();
+        let path = PathSelector::select_path(&graph, 1, &exit, &HashSet::new(), None).unwrap();
 
         assert_eq!(path.hops.len(), 1);
         assert_eq!(path.hops[0].peer_id, vec![1]);
@@ -374,7 +385,7 @@ mod tests {
         graph.update_relay(r2);
 
         let exit = make_exit(10);
-        let path = PathSelector::select_path(&graph, 2, &exit, &HashSet::new()).unwrap();
+        let path = PathSelector::select_path(&graph, 2, &exit, &HashSet::new(), None).unwrap();
 
         assert_eq!(path.hops.len(), 2);
     }
@@ -384,7 +395,7 @@ mod tests {
         let graph = TopologyGraph::new();
         let exit = make_exit(10);
 
-        let result = PathSelector::select_path(&graph, 2, &exit, &HashSet::new());
+        let result = PathSelector::select_path(&graph, 2, &exit, &HashSet::new(), None);
         assert!(result.is_err());
     }
 
@@ -405,7 +416,7 @@ mod tests {
         }
 
         let exit = make_exit(10);
-        let paths = PathSelector::select_diverse_paths(&graph, 1, &exit, 3).unwrap();
+        let paths = PathSelector::select_diverse_paths(&graph, 1, &exit, 3, None).unwrap();
 
         assert_eq!(paths.len(), 3);
     }

@@ -312,6 +312,11 @@ impl Aggregator {
         relay_totals.into_iter().collect()
     }
 
+    /// Get all pool keys (both Subscribed and Free)
+    pub fn all_pool_keys(&self) -> Vec<(PublicKey, PoolType, u64)> {
+        self.pools.keys().cloned().collect()
+    }
+
     /// Get all subscribed pools (for epoch-end distribution posting)
     pub fn subscribed_pools(&self) -> Vec<(PublicKey, PoolType, u64)> {
         self.pools.iter()

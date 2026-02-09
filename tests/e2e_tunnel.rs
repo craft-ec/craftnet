@@ -75,6 +75,7 @@ async fn test_full_tunnel_roundtrip_direct() {
             &[],           // direct mode: no relay paths
             &lease_set,
             0,             // epoch
+            [0u8; 32],     // pool_pubkey (free tier)
         )
         .expect("build_onion should succeed");
 
@@ -93,7 +94,7 @@ async fn test_full_tunnel_roundtrip_direct() {
     for shard in shards {
         let result = exit_handler.process_shard(shard).await
             .expect("Exit should accept shard");
-        if let Some(resp_shards) = result {
+        if let Some((resp_shards, _gateway)) = result {
             response_shards = Some(resp_shards);
         }
     }
@@ -203,6 +204,7 @@ fn test_erasure_reconstruction_from_subset() {
             &[],           // direct mode
             &lease_set,
             42,
+            [0u8; 32],     // pool_pubkey (free tier)
         )
         .expect("build_onion should succeed");
 
@@ -266,6 +268,7 @@ fn test_onion_relay_forward() {
         shard_id,
         payload_size: 1024,
         epoch: 7,
+        pool_pubkey: [0u8; 32],
     }];
 
     let relay_peer_id = b"relay1_peer_id";
@@ -298,7 +301,7 @@ fn test_onion_relay_forward() {
 
     // === Relay processes the shard ===
     let sender_pubkey = [10u8; 32]; // simulated sender
-    let (modified_shard, next_peer, receipt) = relay_handler
+    let (modified_shard, next_peer, receipt, _, _) = relay_handler
         .handle_shard(shard, sender_pubkey)
         .expect("Relay should successfully peel one layer");
 
@@ -361,12 +364,14 @@ fn test_onion_relay_two_hop_chain() {
             shard_id: [101u8; 32],
             payload_size: 2048,
             epoch: 5,
+            pool_pubkey: [0u8; 32],
         },
         OnionSettlement {
             blind_token: [2u8; 32],
             shard_id: [102u8; 32],
             payload_size: 2048,
             epoch: 5,
+            pool_pubkey: [0u8; 32],
         },
     ];
 
@@ -393,7 +398,7 @@ fn test_onion_relay_two_hop_chain() {
 
     // === Relay 1 peels ===
     let sender1 = [10u8; 32];
-    let (shard2, next1, receipt1) = handler1.handle_shard(shard, sender1).unwrap();
+    let (shard2, next1, receipt1, _, _) = handler1.handle_shard(shard, sender1).unwrap();
 
     assert_eq!(next1, b"r2", "Relay1 should forward to relay2");
     assert!(!shard2.header.is_empty(), "After first peel, header should still have data");
@@ -402,7 +407,7 @@ fn test_onion_relay_two_hop_chain() {
 
     // === Relay 2 peels ===
     let sender2 = relay1_signing.public_key_bytes();
-    let (shard3, next2, receipt2) = handler2.handle_shard(shard2, sender2).unwrap();
+    let (shard3, next2, receipt2, _, _) = handler2.handle_shard(shard2, sender2).unwrap();
 
     assert_eq!(next2, b"exit", "Relay2 should forward to exit");
     assert!(shard3.header.is_empty(), "After final peel, header should be empty");
@@ -431,6 +436,7 @@ fn test_wrong_key_cannot_peel_onion() {
         shard_id: [0u8; 32],
         payload_size: 100,
         epoch: 0,
+        pool_pubkey: [0u8; 32],
     }];
 
     let (header, ephemeral) = build_onion_header(
@@ -514,6 +520,7 @@ async fn test_client_relay_exit_integration() {
             &[onion_path],
             &lease_set,
             0,
+            [0u8; 32],     // pool_pubkey (free tier)
         )
         .expect("build_onion with relay path should succeed");
 
@@ -529,7 +536,7 @@ async fn test_client_relay_exit_integration() {
     let sender_pubkey = user_keypair.public_key_bytes();
 
     for shard in shards {
-        let (modified_shard, next_peer, receipt) = relay_handler
+        let (modified_shard, next_peer, receipt, _, _) = relay_handler
             .handle_shard(shard, sender_pubkey)
             .expect("Relay should peel onion layer");
 
@@ -545,7 +552,7 @@ async fn test_client_relay_exit_integration() {
     for shard in exit_bound_shards {
         let result = exit_handler.process_shard(shard).await
             .expect("Exit should accept shard");
-        if let Some(resp) = result {
+        if let Some((resp, _gateway)) = result {
             response_shards = Some(resp);
         }
     }

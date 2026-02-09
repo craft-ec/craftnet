@@ -32,6 +32,7 @@ pub fn build_tunnel_shards(
     paths: &[OnionPath],
     lease_set: &LeaseSet,
     epoch: u64,
+    pool_pubkey: PublicKey,
 ) -> Result<(Id, Vec<Shard>)> {
     let request_id = random_id();
     let assembly_id = random_id();
@@ -97,6 +98,7 @@ pub fn build_tunnel_shards(
                     shard_id,
                     payload_size: shard_payload.len() as u32,
                     epoch,
+                    pool_pubkey,
                 }
             }).collect();
 
@@ -182,6 +184,7 @@ mod tests {
             &[], // direct mode
             &lease_set,
             42,
+            [0u8; 32],
         ).unwrap();
 
         assert!(!shards.is_empty());

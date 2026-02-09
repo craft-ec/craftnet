@@ -39,33 +39,46 @@ impl ChainEntry {
     }
 }
 
-/// Minimum relay count for privacy levels.
+/// Minimum hop count for privacy levels.
 ///
-/// Controls the minimum number of relays a shard must pass through before
-/// it can be forwarded to the destination. This is a privacy guarantee,
-/// not an exact hop count — once the minimum is met, the shard takes the
-/// fastest available path to the destination (best-effort routing).
+/// Every path always starts with a gateway relay (base 1). There is no
+/// direct client → exit connection. The hop count includes the gateway.
+///
+/// | Mode     | Total hops | Path                                        |
+/// |----------|-----------|---------------------------------------------|
+/// | Direct   | 1         | client → gateway → exit                     |
+/// | Single | 1         | client → gateway → exit                       |
+/// | Double | 2         | client → gateway → relay → exit               |
+/// | Triple | 3         | client → gateway → relay → relay → exit       |
+/// | Quad   | 4         | client → gateway → relay → relay → relay → exit |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HopMode {
-    /// Direct to exit (0 relays) - fastest, no privacy
-    Direct,
-    /// 1 relay minimum - basic privacy
-    Light,
-    /// 2 relays minimum - good privacy
-    Standard,
-    /// 3 relays minimum - maximum privacy
-    Paranoid,
+    /// 1 hop (gateway only) - fastest, exit sees gateway IP
+    Single,
+    /// 2 hops - basic privacy, no single node sees both client and exit
+    Double,
+    /// 3 hops - good privacy (default)
+    Triple,
+    /// 4 hops - maximum privacy
+    Quad,
 }
 
 impl HopMode {
-    /// Minimum number of relays a shard must traverse.
+    /// Total number of relay hops (including the gateway).
+    /// Always >= 1. The gateway is always present.
     pub fn min_relays(&self) -> u8 {
         match self {
-            HopMode::Direct => 0,
-            HopMode::Light => 1,
-            HopMode::Standard => 2,
-            HopMode::Paranoid => 3,
+            HopMode::Single => 1,
+            HopMode::Double => 2,
+            HopMode::Triple => 3,
+            HopMode::Quad => 4,
         }
+    }
+
+    /// Extra relay hops beyond the gateway.
+    /// Single=0, Double=1, Triple=2, Quad=3.
+    pub fn extra_hops(&self) -> u8 {
+        self.min_relays() - 1
     }
 
     /// Deprecated: use `min_relays()` instead.
@@ -75,10 +88,10 @@ impl HopMode {
 
     pub fn from_count(count: u8) -> Self {
         match count {
-            0 => HopMode::Direct,
-            1 => HopMode::Light,
-            2 => HopMode::Standard,
-            _ => HopMode::Paranoid,
+            0 | 1 => HopMode::Single,
+            2 => HopMode::Double,
+            3 => HopMode::Triple,
+            _ => HopMode::Quad,
         }
     }
 }
@@ -174,6 +187,9 @@ pub struct RelayInfo {
     pub address: String,
     pub allows_last_hop: bool,
     pub reputation: u64,
+    /// X25519 encryption pubkey (for onion routing)
+    #[serde(default)]
+    pub encryption_pubkey: Option<[u8; 32]>,
 }
 
 /// Information about a peer node
@@ -259,38 +275,46 @@ mod tests {
 
     #[test]
     fn test_hop_mode_min_relays() {
-        assert_eq!(HopMode::Direct.min_relays(), 0);
-        assert_eq!(HopMode::Light.min_relays(), 1);
-        assert_eq!(HopMode::Standard.min_relays(), 2);
-        assert_eq!(HopMode::Paranoid.min_relays(), 3);
+        assert_eq!(HopMode::Single.min_relays(), 1);
+        assert_eq!(HopMode::Double.min_relays(), 2);
+        assert_eq!(HopMode::Triple.min_relays(), 3);
+        assert_eq!(HopMode::Quad.min_relays(), 4);
+    }
+
+    #[test]
+    fn test_hop_mode_extra_hops() {
+        assert_eq!(HopMode::Single.extra_hops(), 0);
+        assert_eq!(HopMode::Double.extra_hops(), 1);
+        assert_eq!(HopMode::Triple.extra_hops(), 2);
+        assert_eq!(HopMode::Quad.extra_hops(), 3);
     }
 
     #[test]
     fn test_hop_mode_hop_count_compat() {
         // hop_count() is a deprecated alias for min_relays()
-        assert_eq!(HopMode::Direct.hop_count(), HopMode::Direct.min_relays());
-        assert_eq!(HopMode::Paranoid.hop_count(), HopMode::Paranoid.min_relays());
+        assert_eq!(HopMode::Single.hop_count(), HopMode::Single.min_relays());
+        assert_eq!(HopMode::Quad.hop_count(), HopMode::Quad.min_relays());
     }
 
     #[test]
     fn test_hop_mode_from_count() {
-        assert_eq!(HopMode::from_count(0), HopMode::Direct);
-        assert_eq!(HopMode::from_count(1), HopMode::Light);
-        assert_eq!(HopMode::from_count(2), HopMode::Standard);
-        assert_eq!(HopMode::from_count(3), HopMode::Paranoid);
+        assert_eq!(HopMode::from_count(0), HopMode::Single);
+        assert_eq!(HopMode::from_count(1), HopMode::Single);
+        assert_eq!(HopMode::from_count(2), HopMode::Double);
+        assert_eq!(HopMode::from_count(3), HopMode::Triple);
     }
 
     #[test]
     fn test_hop_mode_from_count_high_values() {
-        // Any value >= 3 should map to Paranoid
-        assert_eq!(HopMode::from_count(4), HopMode::Paranoid);
-        assert_eq!(HopMode::from_count(10), HopMode::Paranoid);
-        assert_eq!(HopMode::from_count(255), HopMode::Paranoid);
+        // Any value >= 4 should map to Quad
+        assert_eq!(HopMode::from_count(4), HopMode::Quad);
+        assert_eq!(HopMode::from_count(10), HopMode::Quad);
+        assert_eq!(HopMode::from_count(255), HopMode::Quad);
     }
 
     #[test]
     fn test_hop_mode_roundtrip() {
-        for mode in [HopMode::Direct, HopMode::Light, HopMode::Standard, HopMode::Paranoid] {
+        for mode in [HopMode::Single, HopMode::Double, HopMode::Triple, HopMode::Quad] {
             let count = mode.min_relays();
             assert_eq!(HopMode::from_count(count), mode);
         }
@@ -298,10 +322,10 @@ mod tests {
 
     #[test]
     fn test_hop_mode_equality() {
-        assert_eq!(HopMode::Direct, HopMode::Direct);
-        assert_ne!(HopMode::Direct, HopMode::Light);
-        assert_ne!(HopMode::Light, HopMode::Standard);
-        assert_ne!(HopMode::Standard, HopMode::Paranoid);
+        assert_eq!(HopMode::Single, HopMode::Single);
+        assert_ne!(HopMode::Single, HopMode::Double);
+        assert_ne!(HopMode::Double, HopMode::Triple);
+        assert_ne!(HopMode::Triple, HopMode::Quad);
     }
 
     // ==================== ChainEntry Tests ====================
@@ -487,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_hop_mode_serialization() {
-        let mode = HopMode::Standard;
+        let mode = HopMode::Triple;
         let json = serde_json::to_string(&mode).unwrap();
         let restored: HopMode = serde_json::from_str(&json).unwrap();
         assert_eq!(mode, restored);

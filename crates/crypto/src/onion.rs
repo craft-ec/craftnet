@@ -232,6 +232,7 @@ mod tests {
             shard_id: [idx + 100; 32],
             payload_size: 1024,
             epoch: 42,
+            pool_pubkey: [0u8; 32],
         }
     }
 

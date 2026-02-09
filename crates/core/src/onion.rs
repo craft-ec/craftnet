@@ -38,6 +38,10 @@ pub struct OnionSettlement {
     pub payload_size: u32,
     /// Subscription epoch (anti-replay)
     pub epoch: u64,
+    /// Ephemeral subscription pubkey identifying the user's pool PDA.
+    /// [0u8; 32] for free-tier (no subscription).
+    #[serde(default)]
+    pub pool_pubkey: PublicKey,
 }
 
 /// Shard type indicator (moved here from shard.rs — only visible inside encrypted payload)
@@ -172,6 +176,7 @@ mod tests {
                 shard_id: [7u8; 32],
                 payload_size: 1024,
                 epoch: 42,
+                pool_pubkey: [0u8; 32],
             },
             remaining_header: vec![8, 9, 10],
             is_terminal: false,
@@ -197,6 +202,7 @@ mod tests {
                 shard_id: [0u8; 32],
                 payload_size: 0,
                 epoch: 0,
+                pool_pubkey: [0u8; 32],
             },
             remaining_header: vec![],
             is_terminal: true,

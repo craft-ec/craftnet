@@ -231,7 +231,9 @@ impl ExitHandler {
     /// 2. Group by assembly_id
     /// 3. When all chunks ready: reconstruct → decrypt → process
     /// 4. Create response shards using LeaseSet
-    pub async fn process_shard(&mut self, shard: Shard) -> Result<Option<Vec<Shard>>> {
+    /// Returns `(response_shards, gateway_peer_id_bytes)` where gateway is from the LeaseSet.
+    /// If no LeaseSet gateway, gateway is None (direct mode — caller should use source_peer).
+    pub async fn process_shard(&mut self, shard: Shard) -> Result<Option<(Vec<Shard>, Option<Vec<u8>>)>> {
         // Decrypt routing_tag to get assembly_id + shard/chunk metadata
         let tag = decrypt_routing_tag(
             &self.encryption_keypair.secret_key_bytes(),
@@ -329,19 +331,20 @@ impl ExitHandler {
         let response = self.execute_request(&http_request).await?;
         let response_data = response.to_bytes();
 
+        let gateway = exit_payload.lease_set.leases.first().map(|l| l.gateway_peer_id.clone());
         let response_shards = self.create_response_shards(
             &exit_payload,
             &response_data,
         )?;
 
-        Ok(Some(response_shards))
+        Ok(Some((response_shards, gateway)))
     }
 
     /// Process a tunnel-mode payload
     async fn process_tunnel_payload(
         &mut self,
         exit_payload: &ExitPayload,
-    ) -> Result<Option<Vec<Shard>>> {
+    ) -> Result<Option<(Vec<Shard>, Option<Vec<u8>>)>> {
         let request_data = &exit_payload.data;
         if request_data.len() < 4 {
             return Err(ExitError::InvalidRequest("Tunnel payload too short".to_string()));
@@ -375,15 +378,16 @@ impl ExitHandler {
         ).await?;
 
         if response_bytes.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Some((Vec::new(), None)));
         }
 
+        let gateway = exit_payload.lease_set.leases.first().map(|l| l.gateway_peer_id.clone());
         let response_shards = self.create_response_shards(
             exit_payload,
             &response_bytes,
         )?;
 
-        Ok(Some(response_shards))
+        Ok(Some((response_shards, gateway)))
     }
 
     /// Check if all chunks for an assembly have enough shards
@@ -529,12 +533,9 @@ impl ExitHandler {
             .map_err(|e| ExitError::ErasureDecodeError(e.to_string()))?;
 
         let total_chunks = chunks.len() as u16;
-        let assembly_id = {
-            let mut rng = rand::thread_rng();
-            let mut id = [0u8; 32];
-            rand::Rng::fill(&mut rng, &mut id);
-            id
-        };
+        // Use request_id as assembly_id so the client can match
+        // response shards to its pending request map.
+        let assembly_id = exit_payload.request_id;
 
         let mut shards = Vec::with_capacity(chunks.len() * tunnelcraft_erasure::TOTAL_SHARDS);
 
@@ -585,6 +586,7 @@ impl ExitHandler {
                         shard_id,
                         payload_size: payload.len() as u32,
                         epoch: 0,
+                        pool_pubkey: [0u8; 32],
                     }];
 
                     // Single-hop onion to gateway with tunnel_id

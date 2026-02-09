@@ -23,6 +23,9 @@ rand = "0.8"
 futures = "0.3"
 serde_json = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libp2p = { workspace = true }
+hex = "0.4"
 
 [[test]]
 name = "shard_flow"
@@ -43,3 +46,7 @@ path = "ten_relay_settlement.rs"
 [[test]]
 name = "proof_pipeline"
 path = "proof_pipeline.rs"
+
+[[test]]
+name = "ten_node_network"
+path = "ten_node_network.rs"

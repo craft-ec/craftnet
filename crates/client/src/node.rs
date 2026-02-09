@@ -243,7 +243,7 @@ impl Default for NodeConfig {
             node_type: NodeType::Relay,
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
             bootstrap_peers: Vec::new(),
-            hop_mode: HopMode::Standard,
+            hop_mode: HopMode::Triple,
             request_timeout: Duration::from_secs(30),
             allow_last_hop: true,
             enable_exit: false,
@@ -2972,123 +2972,120 @@ impl TunnelCraftNode {
     /// - `first_hop_targets`: PeerId of the first relay for each path
     /// - `lease_set`: gateway info for response routing
     fn build_request_paths(&self, exit_hop: &PathHop) -> Result<(Vec<crate::path::OnionPath>, Vec<PeerId>, tunnelcraft_core::lease_set::LeaseSet)> {
-        use crate::path::{PathSelector, random_id};
+        use crate::path::{PathSelector, OnionPath, random_id};
         use tunnelcraft_core::lease_set::{LeaseSet, Lease};
 
-        let hop_count = self.config.hop_mode.min_relays() as usize;
+        let extra_hops = self.config.hop_mode.extra_hops() as usize;
         let our_peer_id = self.local_peer_id
             .ok_or(ClientError::NotConnected)?;
         let our_bytes = our_peer_id.to_bytes();
 
-        if hop_count == 0 {
-            // Direct mode: no relay hops on forward path.
-            // Response path still goes through a gateway relay (exit → gateway → client).
-
-            // Select a gateway relay using topology: pick a relay that lists us
-            // in its connected_peers (from their topology gossip).
-            let gateway = self.select_gateway_relay(&our_bytes);
-
-            let (gw_peer_id, gw_enc_pubkey) = if let Some((pid, enc_pk)) = gateway {
-                (pid, enc_pk)
-            } else {
-                // No relays available — use ourselves as gateway (localhost fallback)
-                (our_peer_id, self.encryption_keypair.public_key_bytes())
-            };
-
-            // Derive deterministic tunnel_id from the connection
-            let tunnel_id = derive_tunnel_id(&our_peer_id, &gw_peer_id);
-
-            debug!(
-                "Selected gateway {} (connected={}) tunnel_id={}",
-                gw_peer_id,
-                self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&gw_peer_id)),
-                hex::encode(&tunnel_id[..8]),
-            );
-
-            let lease_set = LeaseSet {
-                session_id: random_id(),
-                leases: vec![Lease {
-                    gateway_peer_id: gw_peer_id.to_bytes(),
-                    gateway_encryption_pubkey: gw_enc_pubkey,
-                    tunnel_id,
-                    expires_at: u64::MAX,
-                }],
-            };
-            return Ok((vec![], vec![], lease_set));
-        }
-
-        // Select diverse paths through topology
-        let paths = PathSelector::select_diverse_paths(
-            &self.topology,
-            hop_count,
-            exit_hop,
-            tunnelcraft_erasure::TOTAL_SHARDS,
-        )?;
-
-        // Extract first-hop PeerIds
-        let first_hops: Vec<PeerId> = paths.iter()
-            .filter_map(|p| {
-                if p.hops.is_empty() { return None; }
-                PeerId::from_bytes(&p.hops[0].peer_id).ok()
-            })
-            .collect();
-
-        // Build LeaseSet: pick a directly-connected relay as gateway.
-        // The client is NEVER its own gateway — responses always route through
-        // a relay: exit → gateway → client.
-        let gateway = self.select_gateway_relay(&our_bytes);
-
-        let (gw_peer_id, gw_enc_pubkey) = if let Some((pid, enc_pk)) = gateway {
-            (pid, enc_pk)
-        } else {
-            (our_peer_id, self.encryption_keypair.public_key_bytes())
-        };
+        // Always select a gateway relay. The gateway is the first onion hop
+        // on every path. There is no direct client → exit connection.
+        //
+        // Path: client → gateway → [extra_hops relays] → exit
+        let (gw_peer_id, gw_hop) = self.select_gateway_relay(&our_bytes)
+            .ok_or(ClientError::RequestFailed(
+                "No gateway relay available (not connected to any relay)".to_string(),
+            ))?;
 
         let tunnel_id = derive_tunnel_id(&our_peer_id, &gw_peer_id);
+
+        debug!(
+            "Gateway {} (connected={}, extra_hops={}) tunnel_id={}",
+            gw_peer_id,
+            self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&gw_peer_id)),
+            extra_hops,
+            hex::encode(&tunnel_id[..8]),
+        );
 
         let lease_set = LeaseSet {
             session_id: random_id(),
             leases: vec![Lease {
                 gateway_peer_id: gw_peer_id.to_bytes(),
-                gateway_encryption_pubkey: gw_enc_pubkey,
+                gateway_encryption_pubkey: gw_hop.encryption_pubkey,
                 tunnel_id,
                 expires_at: u64::MAX,
             }],
         };
+
+        // Build paths: gateway is always the first onion hop
+        let gw_bytes = gw_peer_id.to_bytes();
+
+        if extra_hops == 0 {
+            // Direct mode: path = [gateway] → exit (1 onion hop)
+            let path = OnionPath {
+                hops: vec![gw_hop],
+                exit: exit_hop.clone(),
+            };
+            return Ok((vec![path], vec![gw_peer_id], lease_set));
+        }
+
+        // Multi-hop: select additional relay hops after gateway
+        // entry_peer = gateway, so first extra relay must be connected to gateway
+        let extra_paths = PathSelector::select_diverse_paths(
+            &self.topology,
+            extra_hops,
+            exit_hop,
+            tunnelcraft_erasure::TOTAL_SHARDS,
+            Some(&gw_bytes),
+        )?;
+
+        // Prepend gateway to each path
+        let paths: Vec<OnionPath> = extra_paths.into_iter().map(|p| {
+            let mut hops = vec![gw_hop.clone()];
+            hops.extend(p.hops);
+            OnionPath { hops, exit: p.exit }
+        }).collect();
+
+        // first_hops is always the gateway for all paths
+        let first_hops = vec![gw_peer_id; paths.len()];
 
         Ok((paths, first_hops, lease_set))
     }
 
     /// Select a gateway relay using topology + swarm connectivity.
     ///
-    /// Priority:
-    /// 1. Topology-aware: relay that lists us in `connected_peers` (from gossip) and is online
-    /// 2. Swarm-connected: relay we're directly connected to (fallback before gossip arrives)
-    /// 3. None: no suitable gateway found
-    fn select_gateway_relay(&self, our_bytes: &[u8]) -> Option<(PeerId, [u8; 32])> {
-        // Try topology-aware selection: relay whose gossip says it's connected to us
+    /// Tunnel registration happens on `ConnectionEstablished`, so the gateway
+    /// MUST be a peer we're directly connected to via swarm. Topology gossip
+    /// provides additional validation (relay confirms it sees us), but swarm
+    /// connectivity is the hard requirement.
+    ///
+    /// Returns `(PeerId, PathHop)` with full info needed for onion layer.
+    fn select_gateway_relay(&self, our_bytes: &[u8]) -> Option<(PeerId, PathHop)> {
+        // Best: relay that gossips it's connected to us AND we're connected via swarm
         let topology_match = self.topology.relays_with_encryption()
             .into_iter()
             .find(|r| r.connected_peers.contains(our_bytes))
             .and_then(|r| {
-                // Map back to relay_nodes to get PeerId + confirm it's a known relay
                 self.relay_nodes.values()
-                    .find(|s| s.info.pubkey == r.signing_pubkey && s.online)
-                    .map(|s| (s.peer_id, r.encryption_pubkey))
+                    .find(|s| {
+                        s.info.pubkey == r.signing_pubkey
+                            && s.online
+                            && self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&s.peer_id))
+                    })
+                    .map(|s| (s.peer_id, PathHop {
+                        peer_id: s.peer_id.to_bytes(),
+                        signing_pubkey: r.signing_pubkey,
+                        encryption_pubkey: r.encryption_pubkey,
+                    }))
             });
 
         if topology_match.is_some() {
             return topology_match;
         }
 
-        // Fallback: pick a relay we're directly connected to via swarm
-        // (before topology gossip has arrived)
+        // Fallback: any relay we're directly connected to via swarm
         self.relay_nodes.values()
             .find(|s| s.online && self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&s.peer_id)))
             .or_else(|| self.relay_nodes.values()
                 .find(|s| self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&s.peer_id)))
             )
-            .map(|gw| (gw.peer_id, gw.info.encryption_pubkey.unwrap_or([0u8; 32])))
+            .map(|gw| (gw.peer_id, PathHop {
+                peer_id: gw.peer_id.to_bytes(),
+                signing_pubkey: gw.info.pubkey,
+                encryption_pubkey: gw.info.encryption_pubkey.unwrap_or([0u8; 32]),
+            }))
     }
 
     /// Send shards to per-path first-hop targets.

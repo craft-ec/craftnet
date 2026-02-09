@@ -96,8 +96,9 @@ impl RequestBuilder {
         paths: &[OnionPath],
         lease_set: &LeaseSet,
         epoch: u64,
+        pool_pubkey: PublicKey,
     ) -> Result<(Id, Vec<Shard>)> {
-        self.build_onion_with_enc_key(keypair, exit, paths, lease_set, epoch, [0u8; 32])
+        self.build_onion_with_enc_key(keypair, exit, paths, lease_set, epoch, [0u8; 32], pool_pubkey)
     }
 
     /// Build onion-routed request shards with an explicit X25519 encryption pubkey
@@ -110,6 +111,7 @@ impl RequestBuilder {
         lease_set: &LeaseSet,
         epoch: u64,
         response_enc_pubkey: [u8; 32],
+        pool_pubkey: PublicKey,
     ) -> Result<(Id, Vec<Shard>)> {
         let request_id = random_id();
         let assembly_id = random_id();
@@ -172,6 +174,7 @@ impl RequestBuilder {
                         shard_id,
                         payload_size: payload.len() as u32,
                         epoch,
+                        pool_pubkey,
                     }
                 }).collect();
 
@@ -284,6 +287,7 @@ mod tests {
             &[], // direct mode
             &lease_set,
             42,
+            [0u8; 32],
         ).unwrap();
 
         assert_eq!(shards.len(), TOTAL_SHARDS);

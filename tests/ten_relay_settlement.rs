@@ -821,7 +821,7 @@ async fn test_direct_mode_exit_roundtrip() {
         .header("User-Agent", "TunnelCraft-DirectMode-Test");
 
     let (request_id, shards) = builder
-        .build_onion(&user_keypair, &exit_hop, &[], &lease_set, 0)
+        .build_onion(&user_keypair, &exit_hop, &[], &lease_set, 0, [0u8; 32])
         .expect("build_onion should succeed in direct mode");
 
     assert_ne!(request_id, [0u8; 32]);
@@ -849,7 +849,7 @@ async fn test_direct_mode_exit_roundtrip() {
     for shard in shards {
         match exit_handler.process_shard(shard).await {
             Ok(result) => {
-                last_result = result.or(last_result);
+                last_result = result.map(|(shards, _gateway)| shards).or(last_result);
             }
             Err(e) => {
                 // HTTP request failure is acceptable in test environments

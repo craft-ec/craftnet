@@ -105,39 +105,39 @@ impl Default for NetworkSettings {
     }
 }
 
-/// Hop mode for connections
+/// Hop mode for connections (number of relay hops including gateway)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HopMode {
-    /// Direct connection (0 hops) - no privacy
-    Direct,
-    /// Light mode (1 hop) - basic privacy
-    Light,
-    /// Standard mode (2 hops) - recommended
+    /// 1 hop (gateway only) - fastest
+    Single,
+    /// 2 hops - basic privacy
+    Double,
+    /// 3 hops - good privacy (recommended)
     #[default]
-    Standard,
-    /// Paranoid mode (3+ hops) - maximum privacy
-    Paranoid,
+    Triple,
+    /// 4 hops - maximum privacy
+    Quad,
 }
 
 impl HopMode {
     /// Get the number of hops for this mode
     pub fn hops(&self) -> u8 {
         match self {
-            Self::Direct => 0,
-            Self::Light => 1,
-            Self::Standard => 2,
-            Self::Paranoid => 3,
+            Self::Single => 1,
+            Self::Double => 2,
+            Self::Triple => 3,
+            Self::Quad => 4,
         }
     }
 
     /// Create a hop mode from a hop count
     pub fn from_hops(hops: u8) -> Self {
         match hops {
-            0 => Self::Direct,
-            1 => Self::Light,
-            2 => Self::Standard,
-            _ => Self::Paranoid,
+            0 | 1 => Self::Single,
+            2 => Self::Double,
+            3 => Self::Triple,
+            _ => Self::Quad,
         }
     }
 }
@@ -252,22 +252,22 @@ mod tests {
     fn test_default_settings() {
         let settings = Settings::default();
         assert_eq!(settings.network.default_hops, 2);
-        assert_eq!(settings.network.hop_mode, HopMode::Standard);
+        assert_eq!(settings.network.hop_mode, HopMode::Triple);
         assert!(settings.network.bootstrap_peers.is_empty());
     }
 
     #[test]
     fn test_hop_mode_conversion() {
-        assert_eq!(HopMode::Direct.hops(), 0);
-        assert_eq!(HopMode::Light.hops(), 1);
-        assert_eq!(HopMode::Standard.hops(), 2);
-        assert_eq!(HopMode::Paranoid.hops(), 3);
+        assert_eq!(HopMode::Single.hops(), 1);
+        assert_eq!(HopMode::Double.hops(), 2);
+        assert_eq!(HopMode::Triple.hops(), 3);
+        assert_eq!(HopMode::Quad.hops(), 4);
 
-        assert_eq!(HopMode::from_hops(0), HopMode::Direct);
-        assert_eq!(HopMode::from_hops(1), HopMode::Light);
-        assert_eq!(HopMode::from_hops(2), HopMode::Standard);
-        assert_eq!(HopMode::from_hops(3), HopMode::Paranoid);
-        assert_eq!(HopMode::from_hops(10), HopMode::Paranoid);
+        assert_eq!(HopMode::from_hops(0), HopMode::Single);
+        assert_eq!(HopMode::from_hops(1), HopMode::Single);
+        assert_eq!(HopMode::from_hops(2), HopMode::Double);
+        assert_eq!(HopMode::from_hops(3), HopMode::Triple);
+        assert_eq!(HopMode::from_hops(10), HopMode::Quad);
     }
 
     #[test]

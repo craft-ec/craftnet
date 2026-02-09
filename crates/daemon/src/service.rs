@@ -285,10 +285,10 @@ impl DaemonService {
 
         // Apply loaded settings to initial state
         let hop_mode = match settings.network.hop_mode {
-            tunnelcraft_settings::HopMode::Direct => HopMode::Direct,
-            tunnelcraft_settings::HopMode::Light => HopMode::Light,
-            tunnelcraft_settings::HopMode::Standard => HopMode::Standard,
-            tunnelcraft_settings::HopMode::Paranoid => HopMode::Paranoid,
+            tunnelcraft_settings::HopMode::Single => HopMode::Single,
+            tunnelcraft_settings::HopMode::Double => HopMode::Double,
+            tunnelcraft_settings::HopMode::Triple => HopMode::Triple,
+            tunnelcraft_settings::HopMode::Quad => HopMode::Quad,
         };
         let node_mode = match settings.node.mode {
             tunnelcraft_settings::NodeMode::Disabled => NodeMode::Client,
@@ -374,10 +374,10 @@ impl DaemonService {
         let state = *self.state.read().await;
         let mode = format!("{:?}", *self.node_mode.read().await).to_lowercase();
         let privacy = match *self.privacy_level.read().await {
-            HopMode::Direct => "direct",
-            HopMode::Light => "light",
-            HopMode::Standard => "standard",
-            HopMode::Paranoid => "paranoid",
+            HopMode::Single => "single",
+            HopMode::Double => "double",
+            HopMode::Triple => "triple",
+            HopMode::Quad => "quad",
         }.to_string();
 
         // Try to get fresh status from node
@@ -441,10 +441,10 @@ impl DaemonService {
         // Apply hops param to privacy level if provided
         if let Some(hops) = params.hops {
             let hop_mode = match hops {
-                0 => HopMode::Direct,
-                1 => HopMode::Light,
-                2 => HopMode::Standard,
-                _ => HopMode::Paranoid,
+                0 => HopMode::Single,
+                1 => HopMode::Double,
+                2 => HopMode::Triple,
+                _ => HopMode::Quad,
             };
             *self.privacy_level.write().await = hop_mode;
         }
@@ -647,12 +647,12 @@ impl DaemonService {
     /// Set privacy level for the next connection
     pub async fn set_privacy_level(&self, level: &str) -> Result<()> {
         let hop_mode = match level {
-            "direct" => HopMode::Direct,
-            "light" => HopMode::Light,
-            "standard" => HopMode::Standard,
-            "paranoid" => HopMode::Paranoid,
+            "single" => HopMode::Single,
+            "double" => HopMode::Double,
+            "triple" => HopMode::Triple,
+            "quad" => HopMode::Quad,
             _ => return Err(crate::DaemonError::InvalidRequest(
-                format!("Unknown privacy level: {}. Use direct, light, standard, or paranoid", level)
+                format!("Unknown privacy level: {}. Use single, double, triple, or quad", level)
             )),
         };
 
@@ -662,10 +662,10 @@ impl DaemonService {
         {
             let mut settings = self.settings.write().await;
             settings.network.hop_mode = match hop_mode {
-                HopMode::Direct => tunnelcraft_settings::HopMode::Direct,
-                HopMode::Light => tunnelcraft_settings::HopMode::Light,
-                HopMode::Standard => tunnelcraft_settings::HopMode::Standard,
-                HopMode::Paranoid => tunnelcraft_settings::HopMode::Paranoid,
+                HopMode::Single => tunnelcraft_settings::HopMode::Single,
+                HopMode::Double => tunnelcraft_settings::HopMode::Double,
+                HopMode::Triple => tunnelcraft_settings::HopMode::Triple,
+                HopMode::Quad => tunnelcraft_settings::HopMode::Quad,
             };
             if let Err(e) = settings.save() {
                 debug!("Failed to save settings: {}", e);
@@ -1461,7 +1461,7 @@ mod tests {
             shards_relayed: 42,
             requests_exited: 7,
             mode: "both".to_string(),
-            privacy_level: "standard".to_string(),
+            privacy_level: "triple".to_string(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -1570,7 +1570,7 @@ mod tests {
         let service = mock_service();
 
         // Valid levels
-        for level in ["direct", "light", "standard", "paranoid"] {
+        for level in ["single", "double", "triple", "quad"] {
             let result = service.handle(
                 "set_privacy_level",
                 Some(serde_json::json!({"level": level})),
@@ -1674,7 +1674,7 @@ mod tests {
             shards_relayed: 100,
             requests_exited: 10,
             mode: "both".to_string(),
-            privacy_level: "standard".to_string(),
+            privacy_level: "triple".to_string(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -1684,7 +1684,7 @@ mod tests {
         assert!(json.contains("\"pending_requests\":42"));
         assert!(json.contains("\"peer_count\":5"));
         assert!(json.contains("\"mode\":\"both\""));
-        assert!(json.contains("\"privacy_level\":\"standard\""));
+        assert!(json.contains("\"privacy_level\":\"triple\""));
     }
 
     #[test]
@@ -1762,14 +1762,14 @@ mod tests {
     async fn test_set_privacy_level_values() {
         let service = mock_service();
 
-        service.set_privacy_level("light").await.unwrap();
-        assert_eq!(*service.privacy_level.read().await, HopMode::Light);
+        service.set_privacy_level("double").await.unwrap();
+        assert_eq!(*service.privacy_level.read().await, HopMode::Double);
 
-        service.set_privacy_level("standard").await.unwrap();
-        assert_eq!(*service.privacy_level.read().await, HopMode::Standard);
+        service.set_privacy_level("triple").await.unwrap();
+        assert_eq!(*service.privacy_level.read().await, HopMode::Triple);
 
-        service.set_privacy_level("paranoid").await.unwrap();
-        assert_eq!(*service.privacy_level.read().await, HopMode::Paranoid);
+        service.set_privacy_level("quad").await.unwrap();
+        assert_eq!(*service.privacy_level.read().await, HopMode::Quad);
     }
 
     #[tokio::test]
