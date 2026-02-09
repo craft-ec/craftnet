@@ -1,40 +1,30 @@
-//! Relay shard handler
+//! Onion relay shard handler
 //!
-//! Handles incoming shards, performs destination verification, and forwards.
+//! Handles incoming shards by peeling one onion layer to learn the next hop.
+//! No plaintext routing metadata is visible — the relay only sees:
+//! - Settlement data (blind_token, shard_id, payload_size, epoch) from its onion layer
+//! - The next hop's PeerId and ephemeral key
 //!
-//! ## Security Critical
-//!
-//! The `handle_response` method MUST verify that the response destination matches
-//! the cached user_pubkey from the original request. This prevents exit nodes
-//! from redirecting responses to colluding parties.
+//! Gateway mode: when the peeled layer contains a tunnel_id, the relay
+//! looks up the registered client PeerId and forwards directly.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tunnelcraft_core::{Id, PublicKey, Shard, ShardType, TunnelCraftError};
-use tunnelcraft_crypto::SigningKeypair;
+use tunnelcraft_core::{Id, PublicKey, Shard, ForwardReceipt, TunnelCraftError};
+use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair, peel_onion_layer, sign_forward_receipt};
 use tunnelcraft_settlement::SettlementClient;
-
-use crate::cache::RequestCache;
 
 #[derive(Error, Debug)]
 pub enum RelayError {
-    /// Response destination does not match cached request origin
-    ///
-    /// SECURITY CRITICAL: This error indicates a potential attack where an exit node
-    /// is trying to redirect a response to a different destination than the original user.
-    #[error("Destination mismatch: response destination does not match request origin")]
-    DestinationMismatch {
-        expected: PublicKey,
-        actual: PublicKey,
-    },
+    /// Failed to peel onion layer (corrupted header or wrong key)
+    #[error("Onion peel failed: {0}")]
+    OnionPeelFailed(String),
 
-    /// Request not found in cache (may have expired)
-    #[error("Request not found in cache: {0:?}")]
-    RequestNotFound(Id),
-
-    /// Shard has no remaining hops
-    #[error("No hops remaining")]
-    NoHopsRemaining,
+    /// Tunnel ID not found in registrations (gateway mode)
+    #[error("Tunnel not found: {0}")]
+    TunnelNotFound(String),
 
     /// Internal relay error
     #[error("Internal error: {0}")]
@@ -52,7 +42,7 @@ pub type Result<T> = std::result::Result<T, RelayError>;
 /// Relay configuration
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
-    /// Whether this relay can act as the last hop (submits to settlement)
+    /// Whether this relay can act as the last hop
     pub can_be_last_hop: bool,
 }
 
@@ -64,35 +54,50 @@ impl Default for RelayConfig {
     }
 }
 
-/// Relay handler for processing shards
+/// Registration of a tunnel_id → client PeerId mapping (gateway mode)
+struct TunnelRegistration {
+    /// Client PeerId bytes (to forward shards to)
+    client_peer_id: Vec<u8>,
+    /// When this registration expires
+    expires_at: u64,
+    /// When this was created
+    #[allow(dead_code)]
+    created_at: Instant,
+}
+
+/// Relay handler for processing onion-routed shards
 pub struct RelayHandler {
-    /// This relay's signing keypair
+    /// This relay's signing keypair (for ForwardReceipts)
     keypair: SigningKeypair,
-    /// Cache of request_id → user_pubkey for destination verification
-    cache: RequestCache,
+    /// This relay's encryption keypair (for onion layer decryption)
+    encryption_keypair: EncryptionKeypair,
+    /// Tunnel registrations: tunnel_id → client PeerId (gateway mode)
+    tunnel_registrations: HashMap<Id, TunnelRegistration>,
     /// Relay configuration
     #[allow(dead_code)]
     config: RelayConfig,
-    /// Settlement client (optional - for mock/live settlement)
+    /// Settlement client (optional)
     settlement_client: Option<Arc<SettlementClient>>,
 }
 
 impl RelayHandler {
-    /// Create a new relay handler with a signing keypair
-    pub fn new(keypair: SigningKeypair) -> Self {
+    /// Create a new relay handler with signing and encryption keypairs
+    pub fn new(keypair: SigningKeypair, encryption_keypair: EncryptionKeypair) -> Self {
         Self {
             keypair,
-            cache: RequestCache::new(),
+            encryption_keypair,
+            tunnel_registrations: HashMap::new(),
             config: RelayConfig::default(),
             settlement_client: None,
         }
     }
 
     /// Create a relay handler with custom config
-    pub fn with_config(keypair: SigningKeypair, config: RelayConfig) -> Self {
+    pub fn with_config(keypair: SigningKeypair, encryption_keypair: EncryptionKeypair, config: RelayConfig) -> Self {
         Self {
             keypair,
-            cache: RequestCache::new(),
+            encryption_keypair,
+            tunnel_registrations: HashMap::new(),
             config,
             settlement_client: None,
         }
@@ -101,12 +106,14 @@ impl RelayHandler {
     /// Create a relay handler with settlement client
     pub fn with_settlement(
         keypair: SigningKeypair,
+        encryption_keypair: EncryptionKeypair,
         config: RelayConfig,
         settlement_client: Arc<SettlementClient>,
     ) -> Self {
         Self {
             keypair,
-            cache: RequestCache::new(),
+            encryption_keypair,
+            tunnel_registrations: HashMap::new(),
             config,
             settlement_client: Some(settlement_client),
         }
@@ -117,530 +124,326 @@ impl RelayHandler {
         self.settlement_client = Some(client);
     }
 
-    /// Get this relay's public key
+    /// Get this relay's signing public key
     pub fn pubkey(&self) -> PublicKey {
         self.keypair.public_key_bytes()
     }
 
-    /// Handle an incoming shard
-    ///
-    /// Returns the processed shard ready to forward, or None if this is the final hop.
-    pub fn handle_shard(&mut self, shard: Shard) -> Result<Option<Shard>> {
-        match shard.shard_type {
-            ShardType::Request => self.handle_request(shard),
-            ShardType::Response => self.handle_response(shard),
-        }
+    /// Get this relay's encryption public key
+    pub fn encryption_pubkey(&self) -> [u8; 32] {
+        self.encryption_keypair.public_key_bytes()
     }
 
-    /// Handle an incoming shard (async version for settlement)
+    /// Handle an incoming shard by peeling one onion layer.
     ///
-    /// Returns the processed shard ready to forward, or None if this is the final hop.
-    /// Also handles settlement submission for last-hop responses.
-    /// Network-level TCP ACK proves delivery - no explicit user acknowledgment needed.
-    pub async fn handle_shard_async(&mut self, shard: Shard) -> Result<Option<Shard>> {
-        match shard.shard_type {
-            ShardType::Request => self.handle_request(shard),
-            ShardType::Response => self.handle_response_async(shard).await,
-        }
-    }
-
-    /// Handle an incoming request shard
+    /// Returns `(modified_shard, next_peer_id_bytes, forward_receipt)`.
+    /// The caller (node.rs) forwards the shard to the returned next_peer.
     ///
-    /// 1. Cache the request_id → user_pubkey mapping
-    /// 2. Stamp sender_pubkey
-    /// 3. Decrement hops and forward (or deliver to exit if last hop)
-    fn handle_request(&mut self, mut shard: Shard) -> Result<Option<Shard>> {
-        // Cache the mapping for later response verification
-        self.cache.insert(shard.request_id, shard.user_pubkey);
-
-        // Stamp our identity as the sender
-        shard.sender_pubkey = self.keypair.public_key_bytes();
-
-        // Decrement hops
-        let is_last_hop = shard.decrement_hops();
-
-        if is_last_hop {
-            // This shard should go to the exit node (destination)
-            // Return it for delivery to exit
-            Ok(Some(shard))
-        } else {
-            // Forward to next relay
-            Ok(Some(shard))
-        }
-    }
-
-    /// Handle an incoming response shard
-    ///
-    /// Response shards take independent random paths back to the client,
-    /// so this relay may or may not have seen the original request.
-    /// If we have a cached entry, verify destination matches (security check).
-    /// If not, still forward — random routing means we won't always be on the request path.
-    fn handle_response(&mut self, mut shard: Shard) -> Result<Option<Shard>> {
-        // If we saw the original request, verify destination matches
-        if let Some(expected_user) = self.cache.get(&shard.request_id) {
-            if shard.destination != expected_user {
-                // ATTACK DETECTED: Exit node is trying to redirect response
-                // to a different destination than the original requester.
-                return Err(RelayError::DestinationMismatch {
-                    expected: expected_user,
-                    actual: shard.destination,
-                });
-            }
-        }
-        // If not in cache, still forward (response takes independent random path)
-
-        // Stamp our identity as the sender
-        shard.sender_pubkey = self.keypair.public_key_bytes();
-
-        // Decrement hops
-        shard.decrement_hops();
-
-        Ok(Some(shard))
-    }
-
-    /// Handle an incoming response shard (async version with settlement)
-    ///
-    /// Response shards take independent random paths. If we have a cached
-    /// entry from the original request, verify destination. Otherwise forward.
-    ///
-    /// Network-level TCP ACK proves delivery - no explicit user acknowledgment needed.
-    async fn handle_response_async(
-        &mut self,
+    /// `sender_pubkey` comes from the libp2p connection (authenticated via Noise).
+    pub fn handle_shard(
+        &self,
         mut shard: Shard,
-    ) -> Result<Option<Shard>> {
-        // If we saw the original request, verify destination matches
-        if let Some(expected_user) = self.cache.get(&shard.request_id) {
-            if shard.destination != expected_user {
-                return Err(RelayError::DestinationMismatch {
-                    expected: expected_user,
-                    actual: shard.destination,
-                });
-            }
+        sender_pubkey: PublicKey,
+    ) -> Result<(Shard, Vec<u8>, ForwardReceipt)> {
+        // Peel one onion layer
+        let layer = peel_onion_layer(
+            &self.encryption_keypair.secret_key_bytes(),
+            &shard.ephemeral_pubkey,
+            &shard.header,
+        ).map_err(|e| RelayError::OnionPeelFailed(e.to_string()))?;
+
+        // Create ForwardReceipt from the settlement data in this layer
+        // request_id is [0u8; 32] for onion shards (not used for dedup — use shard_id)
+        let receipt = sign_forward_receipt(
+            &self.keypair,
+            &[0u8; 32], // request_id not available in onion mode
+            &layer.settlement.shard_id,
+            &sender_pubkey,
+            &layer.settlement.blind_token,
+            layer.settlement.payload_size,
+            layer.settlement.epoch,
+        );
+
+        // Determine next peer
+        let next_peer = if let Some(tunnel_id) = &layer.tunnel_id {
+            // Gateway mode: look up client PeerId from tunnel registration
+            self.lookup_tunnel(tunnel_id)?
+        } else {
+            layer.next_peer_id.clone()
+        };
+
+        // Update shard for next hop
+        shard.header = layer.remaining_header;
+        shard.ephemeral_pubkey = layer.next_ephemeral_pubkey;
+
+        Ok((shard, next_peer, receipt))
+    }
+
+    /// Register a tunnel_id → client PeerId mapping (called via TunnelSetup message).
+    /// Any connected relay can act as a gateway.
+    pub fn register_tunnel(&mut self, tunnel_id: Id, client_peer_id: Vec<u8>, expires_at: u64) {
+        self.tunnel_registrations.insert(tunnel_id, TunnelRegistration {
+            client_peer_id,
+            expires_at,
+            created_at: Instant::now(),
+        });
+    }
+
+    /// Remove a tunnel registration
+    pub fn unregister_tunnel(&mut self, tunnel_id: &Id) {
+        self.tunnel_registrations.remove(tunnel_id);
+    }
+
+    /// Look up a client PeerId by tunnel_id (gateway mode)
+    fn lookup_tunnel(&self, tunnel_id: &Id) -> Result<Vec<u8>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let reg = self.tunnel_registrations.get(tunnel_id)
+            .ok_or_else(|| RelayError::TunnelNotFound(hex::encode(&tunnel_id[..8])))?;
+
+        if reg.expires_at < now {
+            return Err(RelayError::TunnelNotFound(
+                format!("{} (expired)", hex::encode(&tunnel_id[..8]))
+            ));
         }
 
-        // Stamp our identity as the sender
-        shard.sender_pubkey = self.keypair.public_key_bytes();
-
-        // Decrement hops
-        shard.decrement_hops();
-
-        // Settlement is now handled via ForwardReceipt + per-user pool model.
-        // No per-shard settlement needed here.
-        Ok(Some(shard))
+        Ok(reg.client_peer_id.clone())
     }
 
-    /// Get cache statistics
-    pub fn cache_size(&self) -> usize {
-        self.cache.len()
+    /// Get the number of active tunnel registrations
+    pub fn tunnel_count(&self) -> usize {
+        self.tunnel_registrations.len()
     }
 
-    /// Clear expired cache entries
-    pub fn evict_expired(&mut self) {
-        self.cache.evict_expired();
+    /// Clear expired tunnel registrations
+    pub fn evict_expired_tunnels(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.tunnel_registrations.retain(|_, reg| reg.expires_at >= now);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnelcraft_crypto::SigningKeypair;
+    use tunnelcraft_crypto::{EncryptionKeypair, build_onion_header};
+    use tunnelcraft_core::OnionSettlement;
 
-    fn create_test_shard(shard_type: ShardType, hops: u8) -> Shard {
-        let user_keypair = SigningKeypair::generate();
-        let exit_keypair = SigningKeypair::generate();
-        let user_pubkey = user_keypair.public_key_bytes();
+    fn make_handler() -> RelayHandler {
+        let keypair = SigningKeypair::generate();
+        let enc_keypair = EncryptionKeypair::generate();
+        RelayHandler::new(keypair, enc_keypair)
+    }
 
-        match shard_type {
-            ShardType::Request => Shard::new_request(
-                [1u8; 32],                       // shard_id
-                [2u8; 32],                       // request_id
-                user_pubkey,                     // user_pubkey
-                exit_keypair.public_key_bytes(), // destination (exit)
-                hops,
-                vec![1, 2, 3, 4],           // payload
-                0,                          // shard_index
-                5,                          // total_shards
-                hops,                       // total_hops
-                0,                          // chunk_index
-                1,                          // total_chunks
-            ),
-            ShardType::Response => Shard::new_response(
-                [1u8; 32],                       // shard_id
-                [2u8; 32],                       // request_id
-                user_keypair.public_key_bytes(), // user_pubkey (also destination)
-                [0u8; 32],                       // user_proof
-                exit_keypair.public_key_bytes(), // exit_pubkey
-                hops,
-                vec![5, 6, 7, 8], // payload
-                0,                // shard_index
-                5,                // total_shards
-                hops,             // total_hops
-                0,                // chunk_index
-                1,                // total_chunks
-            ),
+    fn make_settlement(idx: u8) -> OnionSettlement {
+        OnionSettlement {
+            blind_token: [idx; 32],
+            shard_id: [idx + 100; 32],
+            payload_size: 1024,
+            epoch: 42,
         }
     }
 
     #[test]
-    fn test_handle_request_caches_user() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_handle_shard_1_hop() {
+        let relay1 = EncryptionKeypair::generate();
+        let relay1_signing = SigningKeypair::generate();
+        let exit = EncryptionKeypair::generate();
 
-        let shard = create_test_shard(ShardType::Request, 2);
-        let request_id = shard.request_id;
-        let user_pubkey = shard.user_pubkey;
+        let handler = RelayHandler::new(relay1_signing, relay1.clone());
 
-        let result = handler.handle_shard(shard).unwrap();
-        assert!(result.is_some());
+        let settlement = vec![make_settlement(1)];
+        let (header, ephemeral) = build_onion_header(
+            &[(b"relay1_pid".as_slice(), &relay1.public_key_bytes())],
+            (b"exit_pid".as_slice(), &exit.public_key_bytes()),
+            &settlement,
+            None,
+        ).unwrap();
 
-        // Verify the mapping was cached
-        assert_eq!(handler.cache.get(&request_id), Some(user_pubkey));
-    }
-
-    #[test]
-    fn test_handle_request_stamps_sender_pubkey() {
-        let keypair = SigningKeypair::generate();
-        let relay_pubkey = keypair.public_key_bytes();
-        let mut handler = RelayHandler::new(keypair);
-
-        let shard = create_test_shard(ShardType::Request, 2);
-
-        let result = handler.handle_shard(shard).unwrap().unwrap();
-
-        // sender_pubkey should be set to this relay's pubkey
-        assert_eq!(result.sender_pubkey, relay_pubkey);
-    }
-
-    #[test]
-    fn test_handle_response_valid_destination() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
-
-        // First, handle a request to cache the mapping
-        let request_shard = create_test_shard(ShardType::Request, 2);
-        let request_id = request_shard.request_id;
-        let user_pubkey = request_shard.user_pubkey;
-        handler.handle_shard(request_shard).unwrap();
-
-        // Now create a response with matching destination
-        let exit_keypair = SigningKeypair::generate();
-        let response_shard = Shard::new_response(
-            [10u8; 32],  // different shard_id
-            request_id,  // same request_id
-            user_pubkey, // must match cached user
-            [0u8; 32],   // user_proof
-            exit_keypair.public_key_bytes(), // exit_pubkey
-            2,
-            vec![5, 6, 7, 8],
-            0,
-            5,
-            2,           // total_hops
-            0,           // chunk_index
-            1,           // total_chunks
+        let shard = Shard::new(
+            ephemeral, header, vec![1, 2, 3],
+            vec![0; 92],
         );
 
-        // Should succeed - destination matches cached user
-        let result = handler.handle_shard(response_shard);
-        assert!(result.is_ok());
+        let sender = [9u8; 32];
+        let (modified, next_peer, receipt) = handler.handle_shard(shard, sender).unwrap();
+
+        assert_eq!(next_peer, b"exit_pid");
+        assert!(modified.header.is_empty()); // terminal layer
+        assert_eq!(receipt.sender_pubkey, sender);
+        assert_eq!(receipt.blind_token, [1u8; 32]);
     }
 
     #[test]
-    fn test_handle_response_destination_mismatch() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_handle_shard_2_hops() {
+        let relay1 = EncryptionKeypair::generate();
+        let relay1_signing = SigningKeypair::generate();
+        let relay2 = EncryptionKeypair::generate();
+        let relay2_signing = SigningKeypair::generate();
+        let exit = EncryptionKeypair::generate();
 
-        // Handle a request to cache the mapping
-        let request_shard = create_test_shard(ShardType::Request, 2);
-        let request_id = request_shard.request_id;
-        handler.handle_shard(request_shard).unwrap();
+        let handler1 = RelayHandler::new(relay1_signing, relay1.clone());
+        let handler2 = RelayHandler::new(relay2_signing, relay2.clone());
 
-        // Create a response with WRONG destination (attack simulation)
-        let attacker_keypair = SigningKeypair::generate();
-        let exit_keypair = SigningKeypair::generate();
-        let malicious_response = Shard::new_response(
-            [10u8; 32],
-            request_id,
-            attacker_keypair.public_key_bytes(), // WRONG user - attacker
-            [0u8; 32],                           // user_proof
-            exit_keypair.public_key_bytes(),      // exit_pubkey
-            2,
-            vec![5, 6, 7, 8],
-            0,
-            5,
-            2,
-            0,                                   // chunk_index
-            1,                                   // total_chunks
+        let settlement = vec![make_settlement(1), make_settlement(2)];
+        let (header, ephemeral) = build_onion_header(
+            &[
+                (b"r1".as_slice(), &relay1.public_key_bytes()),
+                (b"r2".as_slice(), &relay2.public_key_bytes()),
+            ],
+            (b"exit".as_slice(), &exit.public_key_bytes()),
+            &settlement,
+            None,
+        ).unwrap();
+
+        let shard = Shard::new(
+            ephemeral, header, vec![1, 2, 3],
+            vec![0; 92],
         );
 
-        // Should fail with DestinationMismatch
-        let result = handler.handle_shard(malicious_response);
-        assert!(matches!(result, Err(RelayError::DestinationMismatch { .. })));
+        // Relay 1 peels
+        let sender1 = [10u8; 32];
+        let (shard2, next1, receipt1) = handler1.handle_shard(shard, sender1).unwrap();
+        assert_eq!(next1, b"r2");
+        assert!(!shard2.header.is_empty());
+        assert_eq!(receipt1.blind_token, [1u8; 32]); // settlement[0]
+
+        // Relay 2 peels
+        let sender2 = [11u8; 32];
+        let (shard3, next2, receipt2) = handler2.handle_shard(shard2, sender2).unwrap();
+        assert_eq!(next2, b"exit");
+        assert!(shard3.header.is_empty());
+        assert_eq!(receipt2.blind_token, [2u8; 32]); // settlement[1]
     }
 
     #[test]
-    fn test_handle_response_without_cached_request() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_wrong_key_fails() {
+        let relay1 = EncryptionKeypair::generate();
+        let wrong_key = EncryptionKeypair::generate();
+        let wrong_signing = SigningKeypair::generate();
+        let exit = EncryptionKeypair::generate();
 
-        // Response without cached request should still be forwarded
-        // (response shards take independent random paths)
-        let response_shard = create_test_shard(ShardType::Response, 2);
+        let handler = RelayHandler::new(wrong_signing, wrong_key);
 
-        let result = handler.handle_shard(response_shard);
-        assert!(result.is_ok());
-        let shard = result.unwrap().unwrap();
-        assert_eq!(shard.hops_remaining, 1); // decremented
-    }
+        let settlement = vec![make_settlement(1)];
+        let (header, ephemeral) = build_onion_header(
+            &[(b"r1".as_slice(), &relay1.public_key_bytes())],
+            (b"exit".as_slice(), &exit.public_key_bytes()),
+            &settlement,
+            None,
+        ).unwrap();
 
-    #[test]
-    fn test_hops_decrement() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
-
-        let shard = create_test_shard(ShardType::Request, 3);
-        let result = handler.handle_shard(shard).unwrap().unwrap();
-
-        // Hops should be decremented
-        assert_eq!(result.hops_remaining, 2);
-    }
-
-    // ==================== NEGATIVE TESTS ====================
-
-    #[test]
-    fn test_handle_response_with_unknown_request_id() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
-
-        // Cache a request with one ID
-        let request_shard = create_test_shard(ShardType::Request, 2);
-        handler.handle_shard(request_shard).unwrap();
-
-        // Response with DIFFERENT request_id (not in cache) — still forwarded
-        // because response shards take random paths through any relay
-        let exit_keypair = SigningKeypair::generate();
-        let response = Shard::new_response(
-            [10u8; 32],
-            [99u8; 32],  // Different request_id - not in cache
-            [1u8; 32],   // Some destination
-            [0u8; 32],   // user_proof
-            exit_keypair.public_key_bytes(),
-            2,
-            vec![5, 6, 7, 8],
-            0,
-            5,
-            2,
-            0,           // chunk_index
-            1,           // total_chunks
+        let shard = Shard::new(
+            ephemeral, header, vec![1, 2, 3],
+            vec![0; 92],
         );
 
-        let result = handler.handle_shard(response);
-        assert!(result.is_ok()); // forwarded without cache verification
+        let result = handler.handle_shard(shard, [0u8; 32]);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), RelayError::OnionPeelFailed(_)));
     }
 
     #[test]
-    fn test_handle_response_after_cache_clear() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_tunnel_registration_and_gateway() {
+        let relay = EncryptionKeypair::generate();
+        let relay_signing = SigningKeypair::generate();
+        let exit = EncryptionKeypair::generate();
 
-        // Handle a request
-        let request_shard = create_test_shard(ShardType::Request, 2);
-        let request_id = request_shard.request_id;
-        let user_pubkey = request_shard.user_pubkey;
-        handler.handle_shard(request_shard).unwrap();
+        let mut handler = RelayHandler::new(relay_signing, relay.clone());
 
-        // Clear the cache (simulating expiration)
-        handler.cache.clear();
+        let tunnel_id = [42u8; 32];
+        let client_peer = b"client_peer_id".to_vec();
+        let far_future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + 600;
 
-        // Response should still be forwarded (cache miss = no verification, but still forward)
-        let exit_keypair = SigningKeypair::generate();
-        let response_shard = Shard::new_response(
-            [10u8; 32],
-            request_id,
-            user_pubkey,
-            [0u8; 32],  // user_proof
-            exit_keypair.public_key_bytes(),
-            2,
-            vec![5, 6, 7, 8],
-            0,
-            5,
-            2,
-            0,          // chunk_index
-            1,          // total_chunks
+        handler.register_tunnel(tunnel_id, client_peer.clone(), far_future);
+        assert_eq!(handler.tunnel_count(), 1);
+
+        // Build onion with tunnel_id
+        let settlement = vec![make_settlement(1)];
+        let (header, ephemeral) = build_onion_header(
+            &[(b"relay".as_slice(), &relay.public_key_bytes())],
+            (b"gateway".as_slice(), &exit.public_key_bytes()),
+            &settlement,
+            Some(&tunnel_id),
+        ).unwrap();
+
+        let shard = Shard::new(
+            ephemeral, header, vec![1, 2, 3],
+            vec![0; 92],
         );
 
-        let result = handler.handle_shard(response_shard);
-        assert!(result.is_ok());
+        let (_, next_peer, _) = handler.handle_shard(shard, [0u8; 32]).unwrap();
+        // Gateway mode: should return the client peer ID
+        assert_eq!(next_peer, client_peer);
     }
 
     #[test]
-    fn test_last_hop_response_forwarded() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_tunnel_not_found() {
+        let handler = make_handler();
 
-        // Handle a request first
-        let request_shard = create_test_shard(ShardType::Request, 2);
-        let request_id = request_shard.request_id;
-        let user_pubkey = request_shard.user_pubkey;
-        handler.handle_shard(request_shard).unwrap();
-
-        // Create response with hops=1 so after decrement it's the last hop
-        let exit_keypair = SigningKeypair::generate();
-        let response_shard = Shard::new_response(
-            [10u8; 32],
-            request_id,
-            user_pubkey,
-            [0u8; 32],  // user_proof
-            exit_keypair.public_key_bytes(),
-            1,  // Will be 0 after decrement = last hop
-            vec![5, 6, 7, 8],
-            0,
-            5,
-            2,
-            0,          // chunk_index
-            1,          // total_chunks
-        );
-
-        let result = handler.handle_shard(response_shard);
-        assert!(result.is_ok());
-        let shard = result.unwrap().unwrap();
-        assert_eq!(shard.hops_remaining, 0); // decremented to 0
+        let unknown_tunnel = [99u8; 32];
+        let result = handler.lookup_tunnel(&unknown_tunnel);
+        assert!(matches!(result, Err(RelayError::TunnelNotFound(_))));
     }
 
     #[test]
-    fn test_multiple_responses_for_same_request() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_tunnel_expired() {
+        let mut handler = make_handler();
 
-        // Handle a request
-        let request_shard = create_test_shard(ShardType::Request, 2);
-        let request_id = request_shard.request_id;
-        let user_pubkey = request_shard.user_pubkey;
-        handler.handle_shard(request_shard).unwrap();
+        let tunnel_id = [42u8; 32];
+        handler.register_tunnel(tunnel_id, b"client".to_vec(), 0); // Already expired
 
-        // Handle first response successfully
-        let exit_keypair = SigningKeypair::generate();
-        let exit_pubkey = exit_keypair.public_key_bytes();
-        let response1 = Shard::new_response(
-            [10u8; 32],
-            request_id,
-            user_pubkey,
-            [0u8; 32],  // user_proof
-            exit_pubkey,
-            2,
-            vec![5, 6, 7, 8],
-            0,  // shard_index 0
-            5,
-            2,
-            0,          // chunk_index
-            1,          // total_chunks
-        );
-
-        let result1 = handler.handle_shard(response1);
-        assert!(result1.is_ok());
-
-        // Second response for same request should also work (multiple shards)
-        let response2 = Shard::new_response(
-            [11u8; 32],  // different shard_id
-            request_id,
-            user_pubkey,
-            [0u8; 32],  // user_proof
-            exit_pubkey,
-            2,
-            vec![9, 10, 11, 12],
-            1,  // shard_index 1
-            5,
-            2,
-            0,          // chunk_index
-            1,          // total_chunks
-        );
-
-        let result2 = handler.handle_shard(response2);
-        assert!(result2.is_ok());
+        let result = handler.lookup_tunnel(&tunnel_id);
+        assert!(matches!(result, Err(RelayError::TunnelNotFound(_))));
     }
 
     #[test]
-    fn test_response_shard_hops_decrement() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_evict_expired_tunnels() {
+        let mut handler = make_handler();
 
-        // Response shard without cached request — still forwarded
-        let exit_keypair = SigningKeypair::generate();
-        let response = Shard::new_response(
-            [10u8; 32],
-            [42u8; 32],
-            [1u8; 32],
-            [0u8; 32],  // user_proof
-            exit_keypair.public_key_bytes(),
-            3,
-            vec![5, 6, 7, 8],
-            0,
-            5,
-            3,
-            0,          // chunk_index
-            1,          // total_chunks
-        );
+        let far_future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + 600;
 
-        let result = handler.handle_shard(response);
-        assert!(result.is_ok());
-        let shard = result.unwrap().unwrap();
-        assert_eq!(shard.hops_remaining, 2); // decremented from 3 to 2
+        handler.register_tunnel([1u8; 32], b"a".to_vec(), 0);           // expired
+        handler.register_tunnel([2u8; 32], b"b".to_vec(), far_future);  // valid
+
+        assert_eq!(handler.tunnel_count(), 2);
+        handler.evict_expired_tunnels();
+        assert_eq!(handler.tunnel_count(), 1);
     }
 
     #[test]
-    fn test_destination_mismatch_preserves_error_details() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_unregister_tunnel() {
+        let mut handler = make_handler();
 
-        // Handle a request
-        let request_shard = create_test_shard(ShardType::Request, 2);
-        let request_id = request_shard.request_id;
-        let original_user = request_shard.user_pubkey;
-        handler.handle_shard(request_shard).unwrap();
+        let tunnel_id = [42u8; 32];
+        handler.register_tunnel(tunnel_id, b"client".to_vec(), u64::MAX);
+        assert_eq!(handler.tunnel_count(), 1);
 
-        // Create response with wrong destination
-        let attacker_pubkey = [0xFFu8; 32];
-        let exit_keypair = SigningKeypair::generate();
-        let malicious_response = Shard::new_response(
-            [10u8; 32],
-            request_id,
-            attacker_pubkey,  // Wrong destination
-            [0u8; 32],        // user_proof
-            exit_keypair.public_key_bytes(),
-            2,
-            vec![5, 6, 7, 8],
-            0,
-            5,
-            2,
-            0,                // chunk_index
-            1,                // total_chunks
-        );
-
-        let result = handler.handle_shard(malicious_response);
-
-        // Verify error contains the correct pubkeys
-        match result {
-            Err(RelayError::DestinationMismatch { expected, actual }) => {
-                assert_eq!(expected, original_user);
-                assert_eq!(actual, attacker_pubkey);
-            }
-            _ => panic!("Expected DestinationMismatch error"),
-        }
+        handler.unregister_tunnel(&tunnel_id);
+        assert_eq!(handler.tunnel_count(), 0);
     }
 
     #[test]
-    fn test_cache_size_after_operations() {
-        let keypair = SigningKeypair::generate();
-        let mut handler = RelayHandler::new(keypair);
+    fn test_pubkey_and_encryption_pubkey() {
+        let signing = SigningKeypair::generate();
+        let encryption = EncryptionKeypair::generate();
+        let signing_pub = signing.public_key_bytes();
+        let enc_pub = encryption.public_key_bytes();
 
-        assert_eq!(handler.cache_size(), 0);
-
-        // Add multiple requests
-        for i in 0..5 {
-            let mut shard = create_test_shard(ShardType::Request, 2);
-            shard.request_id = [i as u8; 32];  // Unique request_id
-            handler.handle_shard(shard).unwrap();
-        }
-
-        assert_eq!(handler.cache_size(), 5);
+        let handler = RelayHandler::new(signing, encryption);
+        assert_eq!(handler.pubkey(), signing_pub);
+        assert_eq!(handler.encryption_pubkey(), enc_pub);
     }
 }

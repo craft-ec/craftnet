@@ -2,7 +2,7 @@
 //!
 //! Command-line interface for the TunnelCraft VPN client and node operator.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -413,10 +413,10 @@ fn run_dev(action: DevAction) {
 // IPC Commands (using shared ipc-client crate)
 // ============================================================================
 
-async fn connect(socket: &PathBuf, hops: u8, exit_region: Option<String>) -> Result<()> {
+async fn connect(socket: &Path, hops: u8, exit_region: Option<String>) -> Result<()> {
     info!("Connecting to TunnelCraft network with {} hops...", hops);
 
-    let client = IpcClient::new(socket.clone());
+    let client = IpcClient::new(socket.to_path_buf());
 
     // Set exit region preference before connecting
     if let Some(ref region) = exit_region {
@@ -439,18 +439,18 @@ async fn connect(socket: &PathBuf, hops: u8, exit_region: Option<String>) -> Res
     Ok(())
 }
 
-async fn disconnect(socket: &PathBuf) -> Result<()> {
+async fn disconnect(socket: &Path) -> Result<()> {
     info!("Disconnecting from TunnelCraft network...");
 
-    let client = IpcClient::new(socket.clone());
+    let client = IpcClient::new(socket.to_path_buf());
     client.disconnect().await?;
 
     println!("Disconnected from TunnelCraft network");
     Ok(())
 }
 
-async fn status(socket: &PathBuf) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn status(socket: &Path) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
 
     // Use raw send_request to get the full status including new fields
     let result = client.send_request("status", None).await?;
@@ -490,8 +490,8 @@ async fn status(socket: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn stats(socket: &PathBuf) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn stats(socket: &Path) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
     let result = client.get_node_stats().await?;
 
     println!("TunnelCraft Node Statistics");
@@ -521,8 +521,8 @@ fn format_bytes(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
-async fn mode_cmd(socket: &PathBuf, mode: Option<String>) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn mode_cmd(socket: &Path, mode: Option<String>) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
 
     match mode {
         Some(new_mode) => {
@@ -542,8 +542,8 @@ async fn mode_cmd(socket: &PathBuf, mode: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn exits(socket: &PathBuf) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn exits(socket: &Path) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
     let result = client.get_available_exits().await?;
 
     if result.exits.is_empty() {
@@ -577,8 +577,8 @@ async fn exits(socket: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn privacy_cmd(socket: &PathBuf, level: Option<String>) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn privacy_cmd(socket: &Path, level: Option<String>) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
 
     match level {
         Some(new_level) => {
@@ -605,8 +605,8 @@ async fn privacy_cmd(socket: &PathBuf, level: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn discovery_cmd(socket: &PathBuf, state: Option<String>) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn discovery_cmd(socket: &Path, state: Option<String>) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
 
     match state {
         Some(s) => {
@@ -630,8 +630,8 @@ async fn discovery_cmd(socket: &PathBuf, state: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn credits(socket: &PathBuf, action: Option<CreditsAction>) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn credits(socket: &Path, action: Option<CreditsAction>) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
 
     match action {
         Some(CreditsAction::Buy { amount }) => {
@@ -655,7 +655,7 @@ async fn credits(socket: &PathBuf, action: Option<CreditsAction>) -> Result<()> 
 }
 
 async fn request(
-    socket: &PathBuf,
+    socket: &Path,
     method: &str,
     url: &str,
     body: Option<String>,
@@ -663,7 +663,7 @@ async fn request(
 ) -> Result<()> {
     info!("Making {} request to {}", method, url);
 
-    let client = IpcClient::new(socket.clone());
+    let client = IpcClient::new(socket.to_path_buf());
 
     // Build headers map
     let headers_map: std::collections::HashMap<String, String> = headers
@@ -701,8 +701,8 @@ async fn request(
 // New Feature Commands
 // ============================================================================
 
-async fn history(socket: &PathBuf) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn history(socket: &Path) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
     let result = client.get_connection_history().await?;
 
     println!("Connection History");
@@ -733,8 +733,8 @@ async fn history(socket: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn earnings_history(socket: &PathBuf) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn earnings_history(socket: &Path) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
     let result = client.get_earnings_history().await?;
 
     println!("Earnings History");
@@ -762,10 +762,10 @@ async fn earnings_history(socket: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn speedtest(socket: &PathBuf) -> Result<()> {
+async fn speedtest(socket: &Path) -> Result<()> {
     println!("Running speed test...");
 
-    let client = IpcClient::new(socket.clone());
+    let client = IpcClient::new(socket.to_path_buf());
     let result = client.run_speed_test().await?;
 
     println!("Speed Test Results");
@@ -778,8 +778,8 @@ async fn speedtest(socket: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn bandwidth_cmd(socket: &PathBuf, limit: Option<u64>) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn bandwidth_cmd(socket: &Path, limit: Option<u64>) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
 
     match limit {
         Some(0) => {
@@ -800,8 +800,8 @@ async fn bandwidth_cmd(socket: &PathBuf, limit: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-async fn key_cmd(socket: &PathBuf, action: KeyAction) -> Result<()> {
-    let client = IpcClient::new(socket.clone());
+async fn key_cmd(socket: &Path, action: KeyAction) -> Result<()> {
+    let client = IpcClient::new(socket.to_path_buf());
 
     match action {
         KeyAction::Export { path, password } => {
@@ -1022,7 +1022,7 @@ async fn run_node(mode: NodeSubcommand) -> Result<()> {
     }
 }
 
-fn show_node_info(keyfile: &PathBuf) -> Result<()> {
+fn show_node_info(keyfile: &Path) -> Result<()> {
     let keypair = load_or_generate_libp2p_keypair(keyfile)
         .map_err(|e| anyhow::anyhow!("Failed to load keypair: {}", e))?;
     let peer_id = PeerId::from(keypair.public());
@@ -1039,7 +1039,7 @@ async fn run_node_with_config(
     node_type: NodeType,
     listen: &str,
     bootstrap: &[String],
-    keyfile: &PathBuf,
+    keyfile: &Path,
     allow_last_hop: bool,
     timeout_secs: u64,
     enable_aggregator: bool,
@@ -1065,7 +1065,7 @@ async fn run_node_with_config(
     let data_dir = expand_path(keyfile)
         .parent()
         .map(|p| p.join("data"))
-        .map(|p| { let _ = std::fs::create_dir_all(&p); p });
+        .inspect(|p| { let _ = std::fs::create_dir_all(p); });
 
     // Create node config using TunnelCraftNode
     let config = NodeConfig {

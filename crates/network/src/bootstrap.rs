@@ -18,6 +18,7 @@ use libp2p::{Multiaddr, PeerId};
 /// 1. Run `tunnelcraft-node` on a VPS with public IP
 /// 2. Note the peer ID from startup logs
 /// 3. Add the multiaddr below
+///
 /// Devnet bootstrap nodes for the TunnelCraft network.
 ///
 /// These can be overridden via settings (`network.bootstrap_peers`).

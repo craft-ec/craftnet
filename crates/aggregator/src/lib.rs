@@ -361,6 +361,7 @@ mod tests {
         make_proof_epoch(relay, pool, pool_type, 0, batch, cumulative, prev_root, new_root)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_proof_epoch(relay: u8, pool: u8, pool_type: PoolType, epoch: u64, batch: u64, cumulative: u64, prev_root: [u8; 32], new_root: [u8; 32]) -> ProofMessage {
         let keypair = tunnelcraft_crypto::SigningKeypair::from_secret_bytes(&[relay; 32]);
         let mut msg = ProofMessage {

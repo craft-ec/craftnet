@@ -11,10 +11,10 @@ use libp2p::StreamProtocol;
 use tunnelcraft_core::{ForwardReceipt, Shard, SHARD_MAGIC, SHARD_VERSION};
 
 /// Protocol identifier for shard messages
-pub const SHARD_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/tunnelcraft/shard/1.0.0");
+pub const SHARD_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/tunnelcraft/shard/2.0.0");
 
-/// Maximum shard message size (8KB — header + 6KB payload per shard)
-pub const MAX_SHARD_SIZE: usize = 8 * 1024;
+/// Maximum shard message size (10KB — onion header + payload per shard)
+pub const MAX_SHARD_SIZE: usize = 10 * 1024;
 
 /// Shard protocol handler (marker type for request-response behaviour)
 #[derive(Debug, Clone, Default)]
@@ -38,7 +38,7 @@ pub enum ShardResponse {
     /// Shard was accepted and forwarded/processed.
     /// Contains an optional ForwardReceipt — a cryptographic proof that
     /// the receiver got the shard. The sender uses this for settlement.
-    Accepted(Option<ForwardReceipt>),
+    Accepted(Option<Box<ForwardReceipt>>),
     /// Shard was rejected with reason
     Rejected(String),
 }
@@ -139,7 +139,7 @@ impl Codec for ShardCodec {
 
         match response_type[0] {
             0 => {
-                // Accepted without receipt (legacy / client endpoints)
+                // Accepted without receipt
                 Ok(ShardResponse::Accepted(None))
             }
             1 => {
@@ -184,7 +184,7 @@ impl Codec for ShardCodec {
                     io::Error::new(io::ErrorKind::InvalidData, format!("Invalid receipt: {}", e))
                 })?;
 
-                Ok(ShardResponse::Accepted(Some(receipt)))
+                Ok(ShardResponse::Accepted(Some(Box::new(receipt))))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -290,7 +290,7 @@ mod tests {
     fn test_protocol_id() {
         assert_eq!(
             SHARD_PROTOCOL_ID.as_ref(),
-            "/tunnelcraft/shard/1.0.0"
+            "/tunnelcraft/shard/2.0.0"
         );
     }
 
@@ -301,12 +301,12 @@ mod tests {
 
     #[test]
     fn test_shard_protocol_default() {
-        let _protocol = ShardProtocol::default();
+        let _protocol = ShardProtocol;
     }
 
     #[test]
     fn test_max_shard_size() {
-        assert_eq!(MAX_SHARD_SIZE, 8 * 1024);
+        assert_eq!(MAX_SHARD_SIZE, 10 * 1024);
     }
 
     #[test]
@@ -323,10 +323,9 @@ mod tests {
 
     #[test]
     fn test_shard_request_clone() {
-        let user_pubkey = [4u8; 32];
-        let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], user_pubkey, [5u8; 32],
-            3, vec![0u8; 100], 0, 5, 3, 0, 1,
+        let shard = Shard::new(
+            [1u8; 32], vec![2, 3], vec![4, 5, 6],
+            vec![0; 92],
         );
         let request = ShardRequest { shard };
         let _cloned = request.clone();
@@ -350,10 +349,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_codec_request_roundtrip() {
-        let user_pubkey = [4u8; 32];
-        let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], user_pubkey, [5u8; 32],
-            3, vec![0xAB, 0xCD, 0xEF], 0, 5, 3, 0, 1,
+        let shard = Shard::new(
+            [1u8; 32], vec![2, 3], vec![0xAB, 0xCD, 0xEF],
+            vec![0; 92],
         );
         let request = ShardRequest { shard };
 
@@ -374,7 +372,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(decoded.shard.shard_id, [1u8; 32]);
+        assert_eq!(decoded.shard.ephemeral_pubkey, [1u8; 32]);
         assert_eq!(decoded.shard.payload, vec![0xAB, 0xCD, 0xEF]);
     }
 
@@ -385,7 +383,6 @@ mod tests {
         let mut codec = ShardCodec::new();
         let mut buffer = Vec::new();
 
-        // Write response
         {
             let mut cursor = futures::io::Cursor::new(&mut buffer);
             codec.write_response(&SHARD_PROTOCOL_ID, &mut cursor, response)
@@ -393,7 +390,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Read response back
         let mut cursor = futures::io::Cursor::new(&buffer);
         let decoded = codec.read_response(&SHARD_PROTOCOL_ID, &mut cursor)
             .await
@@ -412,7 +408,6 @@ mod tests {
         let mut codec = ShardCodec::new();
         let mut buffer = Vec::new();
 
-        // Write response
         {
             let mut cursor = futures::io::Cursor::new(&mut buffer);
             codec.write_response(&SHARD_PROTOCOL_ID, &mut cursor, response)
@@ -420,7 +415,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Read response back
         let mut cursor = futures::io::Cursor::new(&buffer);
         let decoded = codec.read_response(&SHARD_PROTOCOL_ID, &mut cursor)
             .await
@@ -435,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn test_codec_invalid_magic() {
         let mut codec = ShardCodec::new();
-        let buffer = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x10];
+        let buffer = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x00, 0x00, 0x00, 0x10];
 
         let mut cursor = futures::io::Cursor::new(&buffer);
         let result = codec.read_request(&SHARD_PROTOCOL_ID, &mut cursor).await;
@@ -447,9 +441,8 @@ mod tests {
     #[tokio::test]
     async fn test_codec_invalid_version() {
         let mut codec = ShardCodec::new();
-        // Valid magic, but wrong version (99)
         let mut buffer = SHARD_MAGIC.to_vec();
-        buffer.push(99);
+        buffer.push(99); // wrong version
 
         let mut cursor = futures::io::Cursor::new(&buffer);
         let result = codec.read_request(&SHARD_PROTOCOL_ID, &mut cursor).await;
@@ -461,7 +454,6 @@ mod tests {
     #[tokio::test]
     async fn test_codec_shard_too_large() {
         let mut codec = ShardCodec::with_max_size(100);
-        // Valid header claiming 1000 bytes
         let mut buffer = SHARD_MAGIC.to_vec();
         buffer.push(SHARD_VERSION);
         buffer.extend_from_slice(&1000u32.to_be_bytes());
@@ -476,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn test_codec_unknown_response_type() {
         let mut codec = ShardCodec::new();
-        let buffer = vec![99]; // Unknown response type
+        let buffer = vec![99];
 
         let mut cursor = futures::io::Cursor::new(&buffer);
         let result = codec.read_response(&SHARD_PROTOCOL_ID, &mut cursor).await;

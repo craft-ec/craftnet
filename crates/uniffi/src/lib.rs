@@ -149,7 +149,7 @@ impl Default for UnifiedNodeConfig {
 }
 
 /// Statistics for the unified node
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, Default, uniffi::Record)]
 pub struct UnifiedNodeStats {
     // Client stats (when routing personal traffic)
     pub bytes_sent: u64,
@@ -164,20 +164,7 @@ pub struct UnifiedNodeStats {
     pub uptime_secs: u64,
 }
 
-impl Default for UnifiedNodeStats {
-    fn default() -> Self {
-        Self {
-            bytes_sent: 0,
-            bytes_received: 0,
-            shards_relayed: 0,
-            requests_exited: 0,
-            credits_earned: 0,
-            credits_spent: 0,
-            connected_peers: 0,
-            uptime_secs: 0,
-        }
-    }
-}
+// Default is derived
 
 /// Response from an HTTP request through the tunnel
 #[derive(Debug, Clone, uniffi::Record)]
@@ -301,8 +288,7 @@ impl TunnelCraftUnifiedNode {
 
         info!("Creating TunnelCraftUnifiedNode with mode: {:?}", config.mode);
 
-        let mut state = UnifiedNodeState::default();
-        state.mode = config.mode;
+        let state = UnifiedNodeState { mode: config.mode, ..Default::default() };
 
         Ok(Arc::new(Self {
             config: RwLock::new(config),
@@ -325,9 +311,11 @@ impl TunnelCraftUnifiedNode {
         let config = self.config.read().clone();
 
         // Build node config
-        let mut node_config = tunnelcraft_client::NodeConfig::default();
-        node_config.mode = config.mode.into();
-        node_config.hop_mode = config.privacy_level.into();
+        let node_config = tunnelcraft_client::NodeConfig {
+            mode: config.mode.into(),
+            hop_mode: config.privacy_level.into(),
+            ..Default::default()
+        };
 
         // Drop state lock before async operation
         drop(state);
@@ -533,14 +521,17 @@ impl TunnelCraftUnifiedNode {
         drop(state);
 
         let result = get_runtime().block_on(async {
-            let mut state = self.state.lock();
-            if let Some(ref mut node) = state.node {
-                node.fetch(&method, &url, body, None)
-                    .await
-                    .map_err(|e| TunnelCraftError::InternalError { msg: e.to_string() })
-            } else {
-                Err(TunnelCraftError::NotConnected)
-            }
+            // Take the node temporarily to avoid holding the lock across await
+            let mut node = {
+                let mut state = self.state.lock();
+                state.node.take().ok_or(TunnelCraftError::NotConnected)?
+            };
+            let res = node.fetch(&method, &url, body, None)
+                .await
+                .map_err(|e| TunnelCraftError::InternalError { msg: e.to_string() });
+            // Put the node back
+            self.state.lock().node = Some(node);
+            res
         });
 
         result.map(|r| TunnelResponse {

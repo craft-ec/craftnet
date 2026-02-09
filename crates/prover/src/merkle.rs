@@ -32,7 +32,7 @@ pub struct MerkleTree {
 pub fn merkle_leaf(relay_pubkey: &[u8; 32], relay_bytes: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(relay_pubkey);
-    hasher.update(&relay_bytes.to_le_bytes());
+    hasher.update(relay_bytes.to_le_bytes());
     let result = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
@@ -119,7 +119,7 @@ impl MerkleTree {
 
         for layer in &self.layers[..self.layers.len() - 1] {
             // Sibling is the other child of the same parent
-            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
             siblings.push(layer[sibling_idx]);
             idx /= 2;
         }
@@ -136,7 +136,7 @@ impl MerkleTree {
         let mut idx = proof.leaf_index;
 
         for sibling in &proof.siblings {
-            current = if idx % 2 == 0 {
+            current = if idx.is_multiple_of(2) {
                 hash_pair(&current, sibling)
             } else {
                 hash_pair(sibling, &current)

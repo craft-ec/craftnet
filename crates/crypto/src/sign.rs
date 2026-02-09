@@ -30,8 +30,8 @@ pub fn verify_signature(pubkey: &[u8; 32], data: &[u8], signature: &[u8; 64]) ->
 /// Uses shard_id (unique hash) so request and response shards produce distinct receipts.
 ///
 /// `sender_pubkey` binds this receipt to the forwarding relay (anti-Sybil).
-/// `user_proof` binds this receipt to the originating user's pool, preventing
-/// colluding relays from creating fake receipts against other users' pools.
+/// `blind_token` is a per-hop unique token derived from user_proof, preventing
+/// colluding relays from correlating settlement data across the same path.
 /// `payload_size` is the actual payload bytes — settlement weights by bandwidth.
 /// `epoch` prevents cross-epoch receipt replay.
 pub fn sign_forward_receipt(
@@ -39,7 +39,7 @@ pub fn sign_forward_receipt(
     request_id: &[u8; 32],
     shard_id: &[u8; 32],
     sender_pubkey: &[u8; 32],
-    user_proof: &[u8; 32],
+    blind_token: &[u8; 32],
     payload_size: u32,
     epoch: u64,
 ) -> ForwardReceipt {
@@ -53,7 +53,7 @@ pub fn sign_forward_receipt(
         shard_id,
         sender_pubkey,
         &receiver_pubkey,
-        user_proof,
+        blind_token,
         payload_size,
         epoch,
         timestamp,
@@ -64,7 +64,7 @@ pub fn sign_forward_receipt(
         shard_id: *shard_id,
         sender_pubkey: *sender_pubkey,
         receiver_pubkey,
-        user_proof: *user_proof,
+        blind_token: *blind_token,
         payload_size,
         epoch,
         timestamp,
@@ -79,7 +79,7 @@ pub fn verify_forward_receipt(receipt: &ForwardReceipt) -> bool {
         &receipt.shard_id,
         &receipt.sender_pubkey,
         &receipt.receiver_pubkey,
-        &receipt.user_proof,
+        &receipt.blind_token,
         receipt.payload_size,
         receipt.epoch,
         receipt.timestamp,

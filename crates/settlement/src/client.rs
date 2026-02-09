@@ -385,10 +385,10 @@ impl SettlementClient {
     /// Hash a receipt for dedup: SHA256(request_id || shard_id || receiver_pubkey)
     pub fn receipt_dedup_hash(receipt: &ForwardReceipt) -> Id {
         let mut hasher = Sha256::new();
-        hasher.update(&receipt.request_id);
-        hasher.update(&receipt.shard_id);
-        hasher.update(&receipt.sender_pubkey);
-        hasher.update(&receipt.receiver_pubkey);
+        hasher.update(receipt.request_id);
+        hasher.update(receipt.shard_id);
+        hasher.update(receipt.sender_pubkey);
+        hasher.update(receipt.receiver_pubkey);
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
@@ -1026,7 +1026,7 @@ mod tests {
             shard_id: [10u8; 32],
             sender_pubkey: [0xFFu8; 32],
             receiver_pubkey: [2u8; 32],
-            user_proof: [5u8; 32],
+            blind_token: [5u8; 32],
             payload_size: 1024,
             epoch: 0,
             timestamp: 1000,
@@ -1053,7 +1053,7 @@ mod tests {
             shard_id: [10u8; 32],
             sender_pubkey: [0xFFu8; 32],
             receiver_pubkey: [2u8; 32],
-            user_proof: [5u8; 32],
+            blind_token: [5u8; 32],
             payload_size: 1024,
             epoch: 0,
             timestamp: 1000,

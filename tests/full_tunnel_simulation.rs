@@ -1,17 +1,22 @@
-//! Full Tunnel Simulation Tests
+//! Full Tunnel Simulation Tests (Onion Routing)
 //!
-//! End-to-end integration tests that simulate realistic TunnelCraft operation:
-//! - Real HTTP requests through the tunnel
-//! - Actual exit node fetching from HTTP server
-//! - Variable payload sizes with multiple chunking rounds
-//! - Full relay chain with sender_pubkey stamping
+//! End-to-end integration tests that simulate direct-mode TunnelCraft operation:
+//! - Client builds onion-encrypted shards via RequestBuilder::build_onion()
+//! - Exit node decrypts, reassembles, and fetches from real HTTP server
+//! - Exit creates encrypted response shards
+//! - Client decrypts response
 //!
-//! Test topology:
+//! Test topology (direct mode -- no relay chain):
 //! ```text
-//! Client → Relay1 → Relay2 → Exit → HTTP Server
-//!   ↑                          ↓
-//!   └──────────────────────────┘
+//! Client --> Exit --> HTTP Server
+//!   ^                    |
+//!   +--------------------+
 //! ```
+//!
+//! Direct mode is used because building proper multi-hop onion headers
+//! for integration tests requires a live relay network. These tests verify
+//! the core encrypt -> shard -> reassemble -> decrypt -> fetch -> respond
+//! pipeline end-to-end.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,12 +29,12 @@ use axum::{
     extract::Path,
 };
 
-use tunnelcraft_client::RequestBuilder;
-use tunnelcraft_core::{HopMode, Shard};
-use tunnelcraft_crypto::SigningKeypair;
+use tunnelcraft_client::{RequestBuilder, PathHop};
+use tunnelcraft_core::{Shard, lease_set::LeaseSet};
+use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair, decrypt_from_sender, decrypt_routing_tag};
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
+use tunnelcraft_erasure::chunker::reassemble;
 use tunnelcraft_exit::{ExitConfig, ExitHandler, HttpRequest, HttpResponse};
-use tunnelcraft_relay::RelayHandler;
 
 // =============================================================================
 // TEST HTTP SERVER
@@ -90,69 +95,84 @@ async fn start_test_server() -> (SocketAddr, oneshot::Sender<()>) {
 // TEST HELPERS
 // =============================================================================
 
-/// Simulate request flow through relay chain
-fn process_through_relays(
-    mut shards: Vec<Shard>,
-    relays: &mut [RelayHandler],
-) -> Vec<Shard> {
-    for relay in relays.iter_mut() {
-        shards = shards
-            .into_iter()
-            .filter_map(|shard| {
-                relay.handle_shard(shard).ok().flatten()
-            })
-            .collect();
+/// Create an ExitConfig that allows localhost connections (for test server).
+/// The default ExitConfig blocks localhost and 127.0.0.1.
+fn test_exit_config() -> ExitConfig {
+    ExitConfig {
+        blocked_domains: vec![],
+        ..Default::default()
     }
-    shards
 }
 
-/// Simulate response flow back through relay chain (reverse order)
-fn process_response_through_relays(
-    mut shards: Vec<Shard>,
-    relays: &mut [RelayHandler],
-) -> Vec<Shard> {
-    // Response goes in reverse order
-    for relay in relays.iter_mut().rev() {
-        shards = shards
-            .into_iter()
-            .filter_map(|shard| {
-                relay.handle_shard(shard).ok().flatten()
-            })
-            .collect();
-    }
-    shards
-}
-
-/// Reconstruct data from shards using erasure coding
+/// Decrypt and reconstruct response data from exit-produced response shards.
 ///
-/// Uses max possible length (shard_size * DATA_SHARDS) since our serialized data
-/// formats (HttpRequest, HttpResponse) are self-describing and can handle trailing bytes.
-fn reconstruct_from_shards(shards: &[Shard]) -> Result<Vec<u8>, String> {
-    let erasure = ErasureCoder::new().map_err(|e| e.to_string())?;
+/// The exit encrypts response data via `encrypt_for_recipient(response_enc_pubkey, exit_secret)`,
+/// where `response_enc_pubkey` is the client's X25519 encryption pubkey.
+/// To decrypt, the client uses `decrypt_from_sender(exit_enc_pubkey, client_enc_secret)`.
+fn decrypt_response_shards(
+    shards: &[Shard],
+    exit_enc_pubkey: &[u8; 32],
+    client_enc_secret: &[u8; 32],
+) -> Vec<u8> {
+    let erasure = ErasureCoder::new().unwrap();
 
-    // Need at least DATA_SHARDS
-    if shards.len() < DATA_SHARDS {
-        return Err(format!(
-            "Not enough shards: have {}, need {}",
-            shards.len(),
-            DATA_SHARDS
-        ));
+    // Decrypt routing tags to get shard/chunk metadata (no longer plaintext on Shard)
+    let tags: Vec<_> = shards.iter().map(|shard| {
+        assert!(!shard.routing_tag.is_empty(), "routing tag must not be empty");
+        decrypt_routing_tag(client_enc_secret, &shard.routing_tag)
+            .expect("failed to decrypt routing tag")
+    }).collect();
+
+    // Group shards by chunk_index using decrypted routing tags
+    let total_chunks = tags[0].total_chunks;
+    let mut chunks_by_index: HashMap<u16, Vec<(usize, &Shard)>> = HashMap::new();
+    for (i, shard) in shards.iter().enumerate() {
+        chunks_by_index.entry(tags[i].chunk_index).or_default().push((i, shard));
     }
 
-    // Prepare shard data for reconstruction
-    let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
-    let mut shard_size = 0;
-    for shard in shards {
-        let idx = shard.shard_index as usize;
-        if idx < TOTAL_SHARDS {
-            shard_size = shard.payload.len();
-            shard_data[idx] = Some(shard.payload.clone());
+    let mut reconstructed_chunks: std::collections::BTreeMap<u16, Vec<u8>> = std::collections::BTreeMap::new();
+
+    for chunk_idx in 0..total_chunks {
+        let chunk_shards = chunks_by_index.get(&chunk_idx).expect("missing chunk");
+
+        let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
+        let mut shard_size = 0;
+
+        for &(tag_idx, shard) in chunk_shards {
+            let idx = tags[tag_idx].shard_index as usize;
+            if idx < TOTAL_SHARDS {
+                shard_size = shard.payload.len();
+                shard_data[idx] = Some(shard.payload.clone());
+            }
         }
+
+        let max_len = shard_size * DATA_SHARDS;
+        let chunk_data = erasure.decode(&mut shard_data, max_len).expect("erasure decode failed");
+        reconstructed_chunks.insert(chunk_idx, chunk_data);
     }
 
-    // Use max possible length - the serialization formats handle their own length
-    let max_len = shard_size * DATA_SHARDS;
-    erasure.decode(&mut shard_data, max_len).map_err(|e| e.to_string())
+    let total_possible: usize = reconstructed_chunks.values().map(|c| c.len()).sum();
+    let framed = reassemble(&reconstructed_chunks, total_chunks, total_possible)
+        .expect("reassemble failed");
+
+    // Strip length-prefixed framing (4-byte LE u32 original length)
+    assert!(framed.len() >= 4, "Framed response data too short for length prefix");
+    let original_len = u32::from_le_bytes(framed[..4].try_into().unwrap()) as usize;
+    assert!(
+        framed.len() >= 4 + original_len,
+        "Framed data shorter than declared: {} < {}",
+        framed.len() - 4,
+        original_len
+    );
+    let encrypted_response = &framed[4..4 + original_len];
+
+    // Decrypt: exit used encrypt_for_recipient(response_enc_pubkey, exit_enc_secret),
+    // so client decrypts with decrypt_from_sender(exit_enc_pubkey, client_enc_secret).
+    decrypt_from_sender(
+        exit_enc_pubkey,
+        client_enc_secret,
+        encrypted_response,
+    ).expect("response decryption failed")
 }
 
 // =============================================================================
@@ -165,136 +185,92 @@ async fn test_full_tunnel_small_request() {
     let (server_addr, _shutdown) = start_test_server().await;
     let url = format!("http://{}/small", server_addr);
 
-    // Create participants
-    let user_keypair = SigningKeypair::generate();
-    let exit_keypair = SigningKeypair::generate();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
+    // Create client keypairs
+    let client_signing = SigningKeypair::generate();
+    let client_enc = EncryptionKeypair::generate();
+    let client_enc_pubkey = client_enc.public_key_bytes();
+    let client_enc_secret = client_enc.secret_key_bytes();
 
-    // Create relay chain (2 relays)
-    let mut relays: Vec<RelayHandler> = (0..2)
-        .map(|_| RelayHandler::new(SigningKeypair::generate()))
-        .collect();
+    // Create exit keypairs
+    let exit_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+    let exit_enc_pubkey = exit_enc.public_key_bytes();
 
-    // Create exit handler (not used directly in test - we simulate exit behavior manually)
-    let _exit_handler = ExitHandler::new(
-        ExitConfig::default(),
-        exit_pubkey,
-        [0u8; 32],
+    // Build exit PathHop (must capture pubkey before moving exit_enc)
+    let exit_hop = PathHop {
+        peer_id: b"exit_peer".to_vec(),
+        signing_pubkey: exit_signing.public_key_bytes(),
+        encryption_pubkey: exit_enc_pubkey,
+    };
+
+    // Create exit handler with known encryption keypair
+    let mut exit_handler = ExitHandler::with_keypairs(
+        test_exit_config(),
+        exit_signing,
+        exit_enc,
     ).unwrap();
+
+    // Build lease set (empty for direct mode -- no gateway routing)
+    let lease_set = LeaseSet {
+        session_id: [0u8; 32],
+        leases: vec![],
+    };
 
     // === REQUEST PHASE ===
 
-    // Build request shards
-    let request_shards = RequestBuilder::new("GET", &url)
+    // Build onion-encrypted request shards with client encryption pubkey for response
+    let (_request_id, shards) = RequestBuilder::new("GET", &url)
         .header("User-Agent", "TunnelCraft-Test/1.0")
-        .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey)
-        .expect("Failed to build request");
+        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, 0, client_enc_pubkey)
+        .expect("Failed to build onion request");
 
-    assert_eq!(request_shards.len(), TOTAL_SHARDS);
-    println!("Created {} request shards", request_shards.len());
+    assert_eq!(shards.len(), TOTAL_SHARDS);
+    println!("Created {} request shards", shards.len());
 
-    // Process through relay chain
-    let relayed_shards = process_through_relays(request_shards.clone(), &mut relays);
-    println!(
-        "After relays: {} shards",
-        relayed_shards.len(),
-    );
-
-    // Each shard should have a relay's sender_pubkey stamped
-    for shard in &relayed_shards {
-        assert_ne!(shard.sender_pubkey, [0u8; 32], "sender_pubkey should be stamped by relay");
+    // All shards should have empty headers in direct mode
+    for shard in &shards {
+        assert!(shard.header.is_empty(), "Direct mode shards should have empty headers");
     }
 
-    // Reconstruct at exit
-    let request_data = reconstruct_from_shards(&relayed_shards)
-        .expect("Failed to reconstruct request");
+    // === EXIT PROCESSES SHARDS ===
 
-    let http_request = HttpRequest::from_bytes(&request_data)
-        .expect("Failed to parse HTTP request");
+    // Feed shards to exit handler; it should accumulate them and
+    // process when enough are collected.
+    let mut response_shards = None;
+    for shard in shards {
+        let result = exit_handler.process_shard(shard).await
+            .expect("Exit failed to process shard");
+        if let Some(resp) = result {
+            response_shards = Some(resp);
+        }
+    }
 
-    println!("Exit received: {} {}", http_request.method, http_request.url);
-    assert_eq!(http_request.method, "GET");
-    assert!(http_request.url.contains("/small"));
+    let response_shards = response_shards.expect("Exit should have produced response shards");
+    assert!(!response_shards.is_empty(), "Response shards should not be empty");
+    println!("Exit produced {} response shards", response_shards.len());
 
-    // === EXIT FETCHES FROM SERVER ===
+    // === CLIENT DECRYPTS RESPONSE ===
 
-    let client = reqwest::Client::new();
-    let response = client
-        .request(
-            reqwest::Method::from_bytes(http_request.method.as_bytes()).unwrap(),
-            &http_request.url,
-        )
-        .send()
-        .await
-        .expect("Exit failed to fetch");
-
-    let status = response.status().as_u16();
-    let body = response.bytes().await.expect("Failed to read body");
-
-    println!("Exit fetched: status={}, body_len={}", status, body.len());
-    assert_eq!(status, 200);
-    assert_eq!(&body[..], b"Hello, TunnelCraft!");
-
-    // === RESPONSE PHASE ===
-
-    // Create response shards
-    let mut headers = HashMap::new();
-    headers.insert("Content-Type".to_string(), "text/plain".to_string());
-    let http_response = HttpResponse {
-        status,
-        headers,
-        body: body.to_vec(),
-    };
-
-    let response_data = http_response.to_bytes();
-    let erasure = ErasureCoder::new().unwrap();
-    let encoded = erasure.encode(&response_data).unwrap();
-
-    let request_id = request_shards[0].request_id;
-
-    let response_shards: Vec<Shard> = encoded
-        .into_iter()
-        .enumerate()
-        .map(|(i, payload)| {
-            Shard::new_response(
-                [i as u8; 32], // shard_id
-                request_id,
-                user_pubkey,  // destination
-                [0u8; 32],    // user_proof
-                exit_pubkey,
-                3,            // hops
-                payload,
-                i as u8,
-                TOTAL_SHARDS as u8,
-                3,            // total_hops
-                0,            // chunk_index
-                1,            // total_chunks
-            )
-        })
-        .collect();
-
-    println!("Created {} response shards", response_shards.len());
-
-    // Process response back through relays (reverse order)
-    let returned_shards = process_response_through_relays(response_shards, &mut relays);
-    println!(
-        "After return: {} shards",
-        returned_shards.len(),
+    let response_data = decrypt_response_shards(
+        &response_shards,
+        &exit_enc_pubkey,
+        &client_enc_secret,
     );
 
-    // Client reconstructs response
-    let final_data = reconstruct_from_shards(&returned_shards)
-        .expect("Failed to reconstruct response");
+    let http_response = HttpResponse::from_bytes(&response_data)
+        .expect("Failed to parse HTTP response");
 
-    let final_response = HttpResponse::from_bytes(&final_data)
-        .expect("Failed to parse response");
+    assert_eq!(http_response.status, 200);
+    assert_eq!(
+        String::from_utf8_lossy(&http_response.body),
+        "Hello, TunnelCraft!"
+    );
 
-    assert_eq!(final_response.status, 200);
-    assert_eq!(String::from_utf8_lossy(&final_response.body), "Hello, TunnelCraft!");
-
-    println!("SUCCESS: Full tunnel round-trip completed!");
+    println!(
+        "SUCCESS: Full tunnel round-trip completed! Response: {} bytes, status {}",
+        http_response.body.len(),
+        http_response.status
+    );
 }
 
 #[tokio::test]
@@ -303,96 +279,80 @@ async fn test_full_tunnel_large_response() {
     let (server_addr, _shutdown) = start_test_server().await;
     let url = format!("http://{}/large", server_addr);
 
-    // Create participants
-    let user_keypair = SigningKeypair::generate();
-    let exit_keypair = SigningKeypair::generate();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
+    // Create client keypairs
+    let client_signing = SigningKeypair::generate();
+    let client_enc = EncryptionKeypair::generate();
+    let client_enc_pubkey = client_enc.public_key_bytes();
+    let client_enc_secret = client_enc.secret_key_bytes();
 
-    // Create relay chain
-    let mut relays: Vec<RelayHandler> = (0..2)
-        .map(|_| RelayHandler::new(SigningKeypair::generate()))
-        .collect();
+    // Create exit keypairs
+    let exit_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+    let exit_enc_pubkey = exit_enc.public_key_bytes();
 
-    // Build and relay request
-    let request_shards = RequestBuilder::new("GET", &url)
-        .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey)
-        .expect("Failed to build request");
-
-    let relayed_shards = process_through_relays(request_shards.clone(), &mut relays);
-    let request_data = reconstruct_from_shards(&relayed_shards).unwrap();
-    let http_request = HttpRequest::from_bytes(&request_data).unwrap();
-
-    // Exit fetches large response
-    let client = reqwest::Client::new();
-    let response = client.get(&http_request.url).send().await.unwrap();
-    let status = response.status().as_u16();
-    let body = response.bytes().await.unwrap();
-
-    println!(
-        "Large response: status={}, body_len={} bytes ({:.1} KB)",
-        status,
-        body.len(),
-        body.len() as f64 / 1024.0
-    );
-
-    // Create response shards (will be larger due to 100KB payload)
-    let http_response = HttpResponse {
-        status,
-        headers: HashMap::new(),
-        body: body.to_vec(),
+    let exit_hop = PathHop {
+        peer_id: b"exit_peer".to_vec(),
+        signing_pubkey: exit_signing.public_key_bytes(),
+        encryption_pubkey: exit_enc_pubkey,
     };
 
-    let response_data = http_response.to_bytes();
-    println!("Response data size: {} bytes", response_data.len());
+    let mut exit_handler = ExitHandler::with_keypairs(
+        test_exit_config(),
+        exit_signing,
+        exit_enc,
+    ).unwrap();
 
-    let erasure = ErasureCoder::new().unwrap();
-    let encoded = erasure.encode(&response_data).unwrap();
+    let lease_set = LeaseSet {
+        session_id: [0u8; 32],
+        leases: vec![],
+    };
+
+    // Build onion request shards
+    let (_request_id, shards) = RequestBuilder::new("GET", &url)
+        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, 0, client_enc_pubkey)
+        .expect("Failed to build onion request");
 
     println!(
-        "Erasure encoded into {} shards, each ~{} bytes",
-        encoded.len(),
-        encoded.first().map(|s| s.len()).unwrap_or(0)
+        "Created {} request shards for large response test",
+        shards.len()
     );
 
-    let request_id = request_shards[0].request_id;
+    // Feed all shards to exit
+    let mut response_shards = None;
+    for shard in shards {
+        let result = exit_handler.process_shard(shard).await
+            .expect("Exit failed to process shard");
+        if let Some(resp) = result {
+            response_shards = Some(resp);
+        }
+    }
 
-    let response_shards: Vec<Shard> = encoded
-        .into_iter()
-        .enumerate()
-        .map(|(i, payload)| {
-            Shard::new_response(
-                [i as u8; 32],
-                request_id,
-                user_pubkey,
-                [0u8; 32],    // user_proof
-                exit_pubkey,
-                3,
-                payload,
-                i as u8,
-                TOTAL_SHARDS as u8,
-                3,            // total_hops
-                0,            // chunk_index
-                1,            // total_chunks
-            )
-        })
-        .collect();
+    let response_shards = response_shards.expect("Exit should have produced response shards");
+    println!(
+        "Exit produced {} response shards for large response",
+        response_shards.len()
+    );
 
-    // Return through relays
-    let returned_shards = process_response_through_relays(response_shards, &mut relays);
+    // Decrypt and verify
+    let response_data = decrypt_response_shards(
+        &response_shards,
+        &exit_enc_pubkey,
+        &client_enc_secret,
+    );
 
-    // Reconstruct
-    let final_data = reconstruct_from_shards(&returned_shards).unwrap();
-    let final_response = HttpResponse::from_bytes(&final_data).unwrap();
+    let http_response = HttpResponse::from_bytes(&response_data)
+        .expect("Failed to parse HTTP response");
 
-    assert_eq!(final_response.status, 200);
-    assert_eq!(final_response.body.len(), 100 * 1024);
-    assert!(final_response.body.iter().all(|&b| b == b'Y'));
+    assert_eq!(http_response.status, 200);
+    assert_eq!(http_response.body.len(), 100 * 1024);
+    assert!(
+        http_response.body.iter().all(|&b| b == b'Y'),
+        "Large response body should be all 'Y' characters"
+    );
 
     println!(
-        "SUCCESS: Large response ({} KB) transmitted through tunnel!",
-        final_response.body.len() / 1024
+        "SUCCESS: Large response ({} KB) transmitted through onion tunnel!",
+        http_response.body.len() / 1024
     );
 }
 
@@ -401,115 +361,155 @@ async fn test_full_tunnel_json_api() {
     let (server_addr, _shutdown) = start_test_server().await;
     let url = format!("http://{}/json", server_addr);
 
-    let user_keypair = SigningKeypair::generate();
-    let exit_keypair = SigningKeypair::generate();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
+    // Create client keypairs
+    let client_signing = SigningKeypair::generate();
+    let client_enc = EncryptionKeypair::generate();
+    let client_enc_pubkey = client_enc.public_key_bytes();
+    let client_enc_secret = client_enc.secret_key_bytes();
 
-    let mut relays: Vec<RelayHandler> = (0..2)
-        .map(|_| RelayHandler::new(SigningKeypair::generate()))
-        .collect();
+    // Create exit keypairs
+    let exit_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+    let exit_enc_pubkey = exit_enc.public_key_bytes();
 
-    // Request
-    let request_shards = RequestBuilder::new("GET", &url)
+    let exit_hop = PathHop {
+        peer_id: b"exit_peer".to_vec(),
+        signing_pubkey: exit_signing.public_key_bytes(),
+        encryption_pubkey: exit_enc_pubkey,
+    };
+
+    let mut exit_handler = ExitHandler::with_keypairs(
+        test_exit_config(),
+        exit_signing,
+        exit_enc,
+    ).unwrap();
+
+    let lease_set = LeaseSet {
+        session_id: [0u8; 32],
+        leases: vec![],
+    };
+
+    // Build request with Accept header
+    let (_request_id, shards) = RequestBuilder::new("GET", &url)
         .header("Accept", "application/json")
-        .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey)
+        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, 0, client_enc_pubkey)
         .unwrap();
 
-    let relayed = process_through_relays(request_shards.clone(), &mut relays);
-    let request_data = reconstruct_from_shards(&relayed).unwrap();
-    let http_request = HttpRequest::from_bytes(&request_data).unwrap();
+    // Feed to exit
+    let mut response_shards = None;
+    for shard in shards {
+        let result = exit_handler.process_shard(shard).await.unwrap();
+        if let Some(resp) = result {
+            response_shards = Some(resp);
+        }
+    }
 
-    // Exit fetch
-    let client = reqwest::Client::new();
-    let response = client.get(&http_request.url).send().await.unwrap();
-    let body = response.bytes().await.unwrap();
+    let response_shards = response_shards.expect("Exit should have produced response shards");
 
-    // Parse JSON to verify
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // Decrypt response
+    let response_data = decrypt_response_shards(
+        &response_shards,
+        &exit_enc_pubkey,
+        &client_enc_secret,
+    );
+
+    let http_response = HttpResponse::from_bytes(&response_data)
+        .expect("Failed to parse HTTP response");
+
+    assert_eq!(http_response.status, 200);
+
+    // Parse JSON to verify content
+    let json: serde_json::Value = serde_json::from_slice(&http_response.body).unwrap();
     assert_eq!(json["status"], "ok");
-    assert!(json["data"]["items"].as_array().unwrap().len() == 100);
+    assert_eq!(
+        json["data"]["items"].as_array().unwrap().len(),
+        100
+    );
 
-    println!("SUCCESS: JSON API response received through tunnel!");
-    println!("JSON preview: {}", serde_json::to_string_pretty(&json["data"]["message"]).unwrap());
+    println!("SUCCESS: JSON API response received through onion tunnel!");
+    println!(
+        "JSON preview: {}",
+        serde_json::to_string_pretty(&json["data"]["message"]).unwrap()
+    );
 }
 
 #[tokio::test]
 async fn test_full_tunnel_variable_sizes() {
     let (server_addr, _shutdown) = start_test_server().await;
 
-    let user_keypair = SigningKeypair::generate();
-    let exit_keypair = SigningKeypair::generate();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
-
-    // Test various sizes
+    // Test various payload sizes
     let sizes = [1024, 5 * 1024, 50 * 1024, 200 * 1024];
 
     for size in sizes {
         let url = format!("http://{}/echo/{}", server_addr, size);
 
-        let mut relays: Vec<RelayHandler> = (0..2)
-            .map(|_| RelayHandler::new(SigningKeypair::generate()))
-            .collect();
+        // Create fresh keypairs for each size test
+        let client_signing = SigningKeypair::generate();
+        let client_enc = EncryptionKeypair::generate();
+        let client_enc_pubkey = client_enc.public_key_bytes();
+        let client_enc_secret = client_enc.secret_key_bytes();
 
-        let request_shards = RequestBuilder::new("GET", &url)
-            .hop_mode(HopMode::Standard)
-            .build(user_pubkey, exit_pubkey)
-            .unwrap();
+        let exit_signing = SigningKeypair::generate();
+        let exit_enc = EncryptionKeypair::generate();
+        let exit_enc_pubkey = exit_enc.public_key_bytes();
 
-        let relayed = process_through_relays(request_shards.clone(), &mut relays);
-        let request_data = reconstruct_from_shards(&relayed).unwrap();
-        let http_request = HttpRequest::from_bytes(&request_data).unwrap();
-
-        let client = reqwest::Client::new();
-        let response = client.get(&http_request.url).send().await.unwrap();
-        let body = response.bytes().await.unwrap();
-
-        let http_response = HttpResponse {
-            status: 200,
-            headers: HashMap::new(),
-            body: body.to_vec(),
+        let exit_hop = PathHop {
+            peer_id: b"exit_peer".to_vec(),
+            signing_pubkey: exit_signing.public_key_bytes(),
+            encryption_pubkey: exit_enc_pubkey,
         };
 
-        let erasure = ErasureCoder::new().unwrap();
-        let encoded = erasure.encode(&http_response.to_bytes()).unwrap();
+        let mut exit_handler = ExitHandler::with_keypairs(
+            test_exit_config(),
+            exit_signing,
+            exit_enc,
+        ).unwrap();
 
-        let request_id = request_shards[0].request_id;
+        let lease_set = LeaseSet {
+            session_id: [0u8; 32],
+            leases: vec![],
+        };
 
-        let response_shards: Vec<Shard> = encoded
-            .into_iter()
-            .enumerate()
-            .map(|(i, payload)| {
-                Shard::new_response(
-                    [i as u8; 32],
-                    request_id,
-                    user_pubkey,
-                    [0u8; 32],    // user_proof
-                    exit_pubkey,
-                    3,
-                    payload,
-                    i as u8,
-                    TOTAL_SHARDS as u8,
-                    3,            // total_hops
-                    0,            // chunk_index
-                    1,            // total_chunks
-                )
-            })
-            .collect();
+        let (_request_id, shards) = RequestBuilder::new("GET", &url)
+            .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, 0, client_enc_pubkey)
+            .unwrap();
 
-        let returned = process_response_through_relays(response_shards, &mut relays);
-        let final_data = reconstruct_from_shards(&returned).unwrap();
-        let final_response = HttpResponse::from_bytes(&final_data).unwrap();
+        let num_request_shards = shards.len();
 
-        assert_eq!(final_response.body.len(), size);
+        // Feed to exit
+        let mut response_shards = None;
+        for shard in shards {
+            let result = exit_handler.process_shard(shard).await.unwrap();
+            if let Some(resp) = result {
+                response_shards = Some(resp);
+            }
+        }
+
+        let response_shards = response_shards.expect("Exit should have produced response shards");
+
+        // Decrypt and verify
+        let response_data = decrypt_response_shards(
+            &response_shards,
+            &exit_enc_pubkey,
+            &client_enc_secret,
+        );
+
+        let http_response = HttpResponse::from_bytes(&response_data)
+            .expect("Failed to parse HTTP response");
+
+        assert_eq!(http_response.status, 200);
+        assert_eq!(http_response.body.len(), size);
+        assert!(
+            http_response.body.iter().all(|&b| b == b'D'),
+            "Response body should be all 'D' characters"
+        );
+
         println!(
-            "✓ Size {} bytes ({:.1} KB): {} shards, each ~{} bytes",
+            "  Size {} bytes ({:.1} KB): {} request shards, {} response shards",
             size,
             size as f64 / 1024.0,
-            TOTAL_SHARDS,
-            final_response.body.len() / DATA_SHARDS
+            num_request_shards,
+            response_shards.len()
         );
     }
 
@@ -517,49 +517,67 @@ async fn test_full_tunnel_variable_sizes() {
 }
 
 #[tokio::test]
-async fn test_tunnel_with_paranoid_hops() {
-    let (server_addr, _shutdown) = start_test_server().await;
-    let url = format!("http://{}/small", server_addr);
+async fn test_http_request_serialization() {
+    // Test HttpRequest serialization round-trip with various configurations
 
-    let user_keypair = SigningKeypair::generate();
-    let exit_keypair = SigningKeypair::generate();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
+    // Simple GET request
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        url: "https://example.com/api/data".to_string(),
+        headers: HashMap::new(),
+        body: None,
+    };
+    let bytes = request.to_bytes();
+    let parsed = HttpRequest::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.method, "GET");
+    assert_eq!(parsed.url, "https://example.com/api/data");
+    assert!(parsed.body.is_none());
 
-    // More relays for paranoid mode
-    let mut relays: Vec<RelayHandler> = (0..4)
-        .map(|_| RelayHandler::new(SigningKeypair::generate()))
-        .collect();
+    // POST request with headers and body
+    let mut headers = HashMap::new();
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+    headers.insert("Authorization".to_string(), "Bearer token123".to_string());
 
-    let request_shards = RequestBuilder::new("GET", &url)
-        .hop_mode(HopMode::Paranoid) // Maximum hops
-        .build(user_pubkey, exit_pubkey)
-        .unwrap();
+    let body = b"{\"key\": \"value\", \"number\": 42}".to_vec();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        url: "https://api.example.com/submit".to_string(),
+        headers,
+        body: Some(body.clone()),
+    };
+    let bytes = request.to_bytes();
+    let parsed = HttpRequest::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.method, "POST");
+    assert_eq!(parsed.url, "https://api.example.com/submit");
+    assert_eq!(parsed.headers.len(), 2);
+    assert_eq!(parsed.body.unwrap(), body);
 
-    println!("Paranoid mode: initial hops = {}", request_shards[0].hops_remaining);
-
-    let relayed = process_through_relays(request_shards.clone(), &mut relays);
-
-    println!(
-        "After {} relays: sender_pubkey stamped",
-        relays.len(),
+    // HttpResponse serialization round-trip
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("Content-Type".to_string(), "text/html".to_string());
+    let response = HttpResponse::new(200, resp_headers, b"<html>OK</html>".to_vec());
+    let bytes = response.to_bytes();
+    let parsed = HttpResponse::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.status, 200);
+    assert_eq!(
+        parsed.headers.get("Content-Type").unwrap(),
+        "text/html"
     );
+    assert_eq!(parsed.body, b"<html>OK</html>");
 
-    // Verify sender_pubkey is stamped by the last relay
-    for shard in &relayed {
-        assert_ne!(
-            shard.sender_pubkey, [0u8; 32],
-            "Paranoid mode should have sender_pubkey stamped by last relay"
-        );
-    }
+    // Empty body response
+    let response = HttpResponse::new(204, HashMap::new(), Vec::new());
+    let bytes = response.to_bytes();
+    let parsed = HttpResponse::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.status, 204);
+    assert!(parsed.body.is_empty());
 
-    let request_data = reconstruct_from_shards(&relayed).unwrap();
-    let http_request = HttpRequest::from_bytes(&request_data).unwrap();
+    // Large body round-trip
+    let large_body = vec![0xAB; 50 * 1024];
+    let response = HttpResponse::new(200, HashMap::new(), large_body.clone());
+    let bytes = response.to_bytes();
+    let parsed = HttpResponse::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.body, large_body);
 
-    let client = reqwest::Client::new();
-    let response = client.get(&http_request.url).send().await.unwrap();
-    let body = response.text().await.unwrap();
-
-    assert_eq!(body, "Hello, TunnelCraft!");
-    println!("SUCCESS: Paranoid mode with 4 relay hops completed!");
+    println!("SUCCESS: All HTTP serialization round-trip tests passed!");
 }

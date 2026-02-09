@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, info, warn, error};
 
-use tunnelcraft_client::{NodeConfig, NodeMode, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse};
+use tunnelcraft_client::{NodeConfig, NodeMode, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse, Socks5Server};
 use tunnelcraft_core::{ExitRegion, HopMode};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig, Subscribe};
 use tunnelcraft_core::SubscriptionTier;
@@ -150,6 +150,19 @@ enum NodeCommand {
     RunSpeedTest(oneshot::Sender<SpeedTestResultData>),
     SetBandwidthLimit(Option<u64>, oneshot::Sender<std::result::Result<(), String>>),
     SetCredits(u64),
+    StartProxy {
+        port: u16,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    StopProxy(oneshot::Sender<std::result::Result<(), String>>),
+    GetProxyStatus(oneshot::Sender<Option<ProxyStatusInfo>>),
+}
+
+/// Proxy status information
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyStatusInfo {
+    pub listening: bool,
+    pub port: u16,
 }
 
 /// Node status info (simpler version for channel communication)
@@ -457,7 +470,7 @@ impl DaemonService {
 
             reply_rx.await
                 .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
-                .map_err(|e| crate::DaemonError::SdkError(e))?;
+                .map_err(crate::DaemonError::SdkError)?;
 
             self.set_state(DaemonState::Connected).await;
 
@@ -487,7 +500,7 @@ impl DaemonService {
 
             reply_rx.await
                 .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
-                .map_err(|e| crate::DaemonError::SdkError(e))?;
+                .map_err(crate::DaemonError::SdkError)?;
         }
 
         self.set_state(DaemonState::Ready).await;
@@ -594,7 +607,7 @@ impl DaemonService {
 
             reply_rx.await
                 .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
-                .map_err(|e| crate::DaemonError::SdkError(e))?;
+                .map_err(crate::DaemonError::SdkError)?;
         }
 
         *self.node_mode.write().await = mode;
@@ -681,7 +694,7 @@ impl DaemonService {
 
             reply_rx.await
                 .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
-                .map_err(|e| crate::DaemonError::SdkError(e))
+                .map_err(crate::DaemonError::SdkError)
         } else {
             Err(crate::DaemonError::SdkError("Node not initialized".to_string()))
         }
@@ -704,7 +717,7 @@ impl DaemonService {
 
             reply_rx.await
                 .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
-                .map_err(|e| crate::DaemonError::SdkError(e))?;
+                .map_err(crate::DaemonError::SdkError)?;
         }
 
         info!("Exit node preference set to region: {}", region);
@@ -725,7 +738,7 @@ impl DaemonService {
 
             reply_rx.await
                 .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
-                .map_err(|e| crate::DaemonError::SdkError(e))?;
+                .map_err(crate::DaemonError::SdkError)?;
         }
 
         info!("Local discovery set to: {}", enabled);
@@ -809,6 +822,57 @@ impl DaemonService {
         Ok(())
     }
 
+    /// Start the SOCKS5 proxy server
+    pub async fn start_proxy(&self, port: u16) -> Result<()> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(NodeCommand::StartProxy { port, reply: reply_tx })
+                .await
+                .map_err(|_| crate::DaemonError::SdkError("Node not running".to_string()))?;
+            drop(cmd_tx);
+            reply_rx.await
+                .map_err(|_| crate::DaemonError::SdkError("Node task died".to_string()))?
+                .map_err(crate::DaemonError::SdkError)?;
+        } else {
+            return Err(crate::DaemonError::NotRunning);
+        }
+        Ok(())
+    }
+
+    /// Stop the SOCKS5 proxy server
+    pub async fn stop_proxy(&self) -> Result<()> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(NodeCommand::StopProxy(reply_tx))
+                .await
+                .map_err(|_| crate::DaemonError::SdkError("Node not running".to_string()))?;
+            drop(cmd_tx);
+            reply_rx.await
+                .map_err(|_| crate::DaemonError::SdkError("Node task died".to_string()))?
+                .map_err(crate::DaemonError::SdkError)?;
+        } else {
+            return Err(crate::DaemonError::NotRunning);
+        }
+        Ok(())
+    }
+
+    /// Get proxy status
+    pub async fn proxy_status(&self) -> Option<ProxyStatusInfo> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx.send(NodeCommand::GetProxyStatus(reply_tx)).await.is_ok() {
+                drop(cmd_tx);
+                if let Ok(status) = reply_rx.await {
+                    return status;
+                }
+            }
+        }
+        None
+    }
+
     /// Export private key (encrypted with password)
     pub async fn export_key(&self, path: &str, password: &str) -> Result<(String, String)> {
         use sha2::{Sha256, Digest};
@@ -890,6 +954,9 @@ async fn run_node_task(
 ) -> std::result::Result<(), String> {
     let mut node = TunnelCraftNode::new(config)
         .map_err(|e| e.to_string())?;
+
+    // SOCKS5 proxy state (created on StartProxy, dropped on StopProxy)
+    let mut socks5_server: Option<Socks5Server> = None;
 
     info!("TunnelCraftNode initialized in background task");
 
@@ -1022,6 +1089,44 @@ async fn run_node_task(
                         node.set_credits(credits);
                         status.write().await.credits = credits;
                         debug!("Node credits set to {}", credits);
+                    }
+                    Some(NodeCommand::StartProxy { port, reply }) => {
+                        // Stop existing proxy if running
+                        if let Some(mut existing) = socks5_server.take() {
+                            existing.stop();
+                        }
+
+                        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+                        let (burst_tx, burst_rx) = tokio::sync::mpsc::channel(256);
+                        node.set_tunnel_burst_rx(burst_rx);
+
+                        let mut server = Socks5Server::new(addr, burst_tx);
+                        match server.start().await {
+                            Ok(()) => {
+                                info!("SOCKS5 proxy started on port {}", server.listen_addr().port());
+                                socks5_server = Some(server);
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("Failed to start proxy: {}", e)));
+                            }
+                        }
+                    }
+                    Some(NodeCommand::StopProxy(reply)) => {
+                        if let Some(mut server) = socks5_server.take() {
+                            server.stop();
+                            info!("SOCKS5 proxy stopped");
+                            let _ = reply.send(Ok(()));
+                        } else {
+                            let _ = reply.send(Err("Proxy not running".to_string()));
+                        }
+                    }
+                    Some(NodeCommand::GetProxyStatus(reply)) => {
+                        let status_info = socks5_server.as_ref().map(|s| ProxyStatusInfo {
+                            listening: true,
+                            port: s.listen_addr().port(),
+                        });
+                        let _ = reply.send(status_info);
                     }
                     None => {
                         info!("Command channel closed, shutting down node task");
@@ -1292,6 +1397,39 @@ impl IpcHandler for DaemonService {
                         .map_err(|e| format!("Import key error: {}", e))?;
 
                     Ok(serde_json::json!({"public_key": public_key}))
+                }
+
+                "start_proxy" => {
+                    #[derive(Deserialize)]
+                    struct ProxyParams {
+                        port: Option<u16>,
+                    }
+
+                    let params: ProxyParams = params
+                        .map(|p| serde_json::from_value(p).unwrap_or(ProxyParams { port: None }))
+                        .unwrap_or(ProxyParams { port: None });
+
+                    let port = params.port.unwrap_or(1080);
+                    self.start_proxy(port).await
+                        .map_err(|e| format!("Start proxy error: {}", e))?;
+
+                    Ok(serde_json::json!({"success": true, "port": port}))
+                }
+
+                "stop_proxy" => {
+                    self.stop_proxy().await
+                        .map_err(|e| format!("Stop proxy error: {}", e))?;
+
+                    Ok(serde_json::json!({"success": true}))
+                }
+
+                "proxy_status" => {
+                    let status = self.proxy_status().await;
+                    match status {
+                        Some(s) => serde_json::to_value(s)
+                            .map_err(|e| format!("Serialize error: {}", e)),
+                        None => Ok(serde_json::json!({"listening": false})),
+                    }
                 }
 
                 _ => {

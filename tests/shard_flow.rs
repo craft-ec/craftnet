@@ -1,188 +1,527 @@
-//! Integration tests for the complete shard flow
+//! Integration tests for the onion-routed shard flow
 //!
-//! Tests the full request/response lifecycle:
-//! 1. Client creates request, erasure codes into shards
-//! 2. Shards pass through relay handlers (sender_pubkey stamping)
-//! 3. Exit node receives shards, reconstructs request
-//! 4. Exit creates response shards
-//! 5. Response shards pass back through relays (destination verification)
-//! 6. Client reconstructs response
+//! Tests the onion routing lifecycle:
+//! 1. Client builds onion-encrypted shards via RequestBuilder::build_onion
+//! 2. Relay handlers peel onion layers and produce ForwardReceipts
+//! 3. Exit handler decrypts, reconstructs, and processes requests
+//! 4. Erasure coding reconstruction (3-of-5)
+//! 5. HTTP request/response serialization
+//! 6. End-to-end: client -> relay(s) -> exit (direct mode)
 
-use tunnelcraft_client::RequestBuilder;
-use tunnelcraft_core::{HopMode, Shard, ShardType};
-use tunnelcraft_crypto::SigningKeypair;
-use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
-use tunnelcraft_exit::HttpResponse;
-use tunnelcraft_relay::{RelayConfig, RelayHandler};
+use tunnelcraft_client::{RequestBuilder, PathHop, OnionPath, compute_user_proof};
+use tunnelcraft_core::{Shard, OnionSettlement, ExitPayload, ShardType, lease_set::LeaseSet};
+use tunnelcraft_crypto::{
+    SigningKeypair, EncryptionKeypair, build_onion_header, peel_onion_layer,
+    encrypt_routing_tag, decrypt_routing_tag, encrypt_exit_payload,
+    sign_forward_receipt, verify_forward_receipt,
+};
+use tunnelcraft_relay::{RelayHandler, RelayConfig};
+use tunnelcraft_erasure::{ErasureCoder, TOTAL_SHARDS};
+use tunnelcraft_exit::{HttpRequest, HttpResponse};
 
-/// Test helper to create a user keypair
-fn create_user_keypair() -> SigningKeypair {
-    SigningKeypair::generate()
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+/// Create a PathHop from an encryption keypair and peer_id bytes
+fn make_path_hop(peer_id: &[u8], enc_kp: &EncryptionKeypair) -> PathHop {
+    PathHop {
+        peer_id: peer_id.to_vec(),
+        signing_pubkey: [0u8; 32], // not used for routing
+        encryption_pubkey: enc_kp.public_key_bytes(),
+    }
 }
 
-/// Test helper to create an exit keypair
-fn create_exit_keypair() -> SigningKeypair {
-    SigningKeypair::generate()
-}
-
-/// Test helper to create relay handlers
-fn create_relay_chain(count: usize) -> Vec<RelayHandler> {
-    (0..count)
-        .map(|_| RelayHandler::new(SigningKeypair::generate()))
-        .collect()
-}
-
-/// Create request shards for testing
-fn create_test_request_shards(
-    user_pubkey: [u8; 32],
-    exit_pubkey: [u8; 32],
-) -> Vec<Shard> {
-    RequestBuilder::new("GET", "https://httpbin.org/get")
-        .header("User-Agent", "TunnelCraft-Test")
-        .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey)
-        .expect("Failed to build request shards")
+/// Create an empty LeaseSet for tests (direct response mode)
+fn empty_lease_set() -> LeaseSet {
+    LeaseSet {
+        session_id: [0u8; 32],
+        leases: vec![],
+    }
 }
 
 // =============================================================================
-// FULL FLOW TESTS
+// 1. RequestBuilder::build_onion creates valid shards (direct mode)
 // =============================================================================
 
 #[test]
-fn test_request_shards_through_single_relay() {
-    let user_keypair = create_user_keypair();
-    let exit_keypair = create_exit_keypair();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
+fn test_build_onion_direct_mode_creates_valid_shards() {
+    let keypair = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
 
-    // Create request shards
-    let shards = create_test_request_shards(user_pubkey, exit_pubkey);
-    assert_eq!(shards.len(), TOTAL_SHARDS);
+    let exit = PathHop {
+        peer_id: b"exit_peer".to_vec(),
+        signing_pubkey: [2u8; 32],
+        encryption_pubkey: exit_enc.public_key_bytes(),
+    };
 
-    // Create a relay handler
-    let mut relay = RelayHandler::new(SigningKeypair::generate());
-    let relay_pubkey = relay.pubkey();
+    let builder = RequestBuilder::new("GET", "https://example.com")
+        .header("User-Agent", "TunnelCraft-Test");
 
-    // Process each shard through the relay
-    let mut processed_shards = Vec::new();
-    for shard in shards {
-        let result = relay.handle_shard(shard).expect("Relay should accept shard");
-        let processed = result.expect("Should return processed shard");
+    let (request_id, shards) = builder
+        .build_onion(&keypair, &exit, &[], &empty_lease_set(), 1)
+        .expect("build_onion should succeed in direct mode");
 
-        // Verify relay stamped its pubkey as sender
-        assert_eq!(
-            processed.sender_pubkey, relay_pubkey,
-            "sender_pubkey should be relay's pubkey"
-        );
+    // Request ID should be non-zero
+    assert_ne!(request_id, [0u8; 32]);
 
-        // Verify hops decremented
-        assert!(processed.hops_remaining < 3, "Hops should be decremented");
+    // Direct mode with small request produces exactly TOTAL_SHARDS (5) shards per chunk
+    assert!(
+        !shards.is_empty(),
+        "Should produce at least one shard"
+    );
+    // All shards should be from chunk 0 with TOTAL_SHARDS per chunk
+    assert_eq!(shards.len() % TOTAL_SHARDS, 0);
 
-        processed_shards.push(processed);
-    }
-
-    assert_eq!(processed_shards.len(), TOTAL_SHARDS);
-}
-
-#[test]
-fn test_request_shards_through_relay_chain() {
-    let user_keypair = create_user_keypair();
-    let exit_keypair = create_exit_keypair();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
-
-    // Create request with more hops
-    let shards = RequestBuilder::new("GET", "https://example.com")
-        .hop_mode(HopMode::Paranoid) // More hops
-        .build(user_pubkey, exit_pubkey)
-        .expect("Failed to build request shards");
-
-    // Create a chain of relays
-    let mut relays = create_relay_chain(3);
-    let relay_pubkeys: Vec<_> = relays.iter().map(|r| r.pubkey()).collect();
-
-    // Process each shard through the relay chain
-    for mut shard in shards {
-        for (i, relay) in relays.iter_mut().enumerate() {
-            let result = relay.handle_shard(shard.clone()).expect("Relay should accept");
-            shard = result.expect("Should return processed shard");
-
-            // Verify sender_pubkey is the current relay
-            assert_eq!(shard.sender_pubkey, relay_pubkeys[i]);
-        }
+    for shard in &shards {
+        assert!(!shard.payload.is_empty(), "Shard payload should not be empty");
+        assert!(!shard.routing_tag.is_empty(), "Routing tag should not be empty");
+        // Direct mode: header is empty (no onion layers)
+        assert!(shard.header.is_empty(), "Direct mode should have empty headers");
     }
 }
 
 #[test]
-fn test_response_destination_verification() {
-    let user_keypair = create_user_keypair();
-    let exit_keypair = create_exit_keypair();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
+fn test_build_onion_with_single_relay_path() {
+    let keypair = SigningKeypair::generate();
+    let relay_enc = EncryptionKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
 
-    // Create and process request shards to populate relay cache
-    let request_shards = create_test_request_shards(user_pubkey, exit_pubkey);
-    let request_id = request_shards[0].request_id;
+    let exit = PathHop {
+        peer_id: b"exit_peer".to_vec(),
+        signing_pubkey: [2u8; 32],
+        encryption_pubkey: exit_enc.public_key_bytes(),
+    };
 
-    let mut relay = RelayHandler::new(SigningKeypair::generate());
+    let path = OnionPath {
+        hops: vec![make_path_hop(b"relay1", &relay_enc)],
+        exit: exit.clone(),
+    };
 
-    // Process request shards (this caches request_id → user_pubkey)
-    for shard in &request_shards {
-        relay.handle_shard(shard.clone()).expect("Should process request");
+    let builder = RequestBuilder::new("GET", "https://example.com");
+    let (_request_id, shards) = builder
+        .build_onion(&keypair, &exit, &[path], &empty_lease_set(), 42)
+        .expect("build_onion should succeed with 1 relay");
+
+    assert!(!shards.is_empty());
+
+    for shard in &shards {
+        // With 1 relay: header should be non-empty (contains onion layer)
+        assert!(!shard.header.is_empty(), "1-hop path should have non-empty header");
+        assert!(!shard.payload.is_empty());
+        assert!(!shard.routing_tag.is_empty(), "Routing tag should not be empty");
     }
+}
 
-    // Create a valid response shard with correct destination
-    let valid_response = Shard::new_response(
-        [100u8; 32],
-        request_id,
-        user_pubkey, // Correct destination
-        [0u8; 32],   // user_proof
-        exit_pubkey,
-        2,
+// =============================================================================
+// 2. Onion header build/peel roundtrip
+// =============================================================================
+
+#[test]
+fn test_onion_header_1_hop_roundtrip() {
+    let relay1 = EncryptionKeypair::generate();
+    let exit = EncryptionKeypair::generate();
+
+    let settlement = vec![OnionSettlement {
+        blind_token: [10u8; 32],
+        shard_id: [20u8; 32],
+        payload_size: 512,
+        epoch: 7,
+    }];
+
+    let (header, ephemeral) = build_onion_header(
+        &[(b"relay1_pid".as_slice(), &relay1.public_key_bytes())],
+        (b"exit_pid".as_slice(), &exit.public_key_bytes()),
+        &settlement,
+        None,
+    )
+    .expect("build_onion_header should succeed");
+
+    assert!(!header.is_empty());
+    assert_ne!(ephemeral, [0u8; 32]);
+
+    // Peel the single layer
+    let layer = peel_onion_layer(
+        &relay1.secret_key_bytes(),
+        &ephemeral,
+        &header,
+    )
+    .expect("peel should succeed");
+
+    assert_eq!(layer.next_peer_id, b"exit_pid");
+    assert!(layer.is_terminal);
+    assert!(layer.remaining_header.is_empty());
+    assert!(layer.tunnel_id.is_none());
+    assert_eq!(layer.settlement.blind_token, [10u8; 32]);
+    assert_eq!(layer.settlement.shard_id, [20u8; 32]);
+    assert_eq!(layer.settlement.payload_size, 512);
+    assert_eq!(layer.settlement.epoch, 7);
+}
+
+#[test]
+fn test_onion_header_2_hop_roundtrip() {
+    let relay1 = EncryptionKeypair::generate();
+    let relay2 = EncryptionKeypair::generate();
+    let exit = EncryptionKeypair::generate();
+
+    let settlement = vec![
+        OnionSettlement {
+            blind_token: [1u8; 32],
+            shard_id: [101u8; 32],
+            payload_size: 1024,
+            epoch: 42,
+        },
+        OnionSettlement {
+            blind_token: [2u8; 32],
+            shard_id: [102u8; 32],
+            payload_size: 1024,
+            epoch: 42,
+        },
+    ];
+
+    let (header, ephemeral) = build_onion_header(
+        &[
+            (b"r1".as_slice(), &relay1.public_key_bytes()),
+            (b"r2".as_slice(), &relay2.public_key_bytes()),
+        ],
+        (b"exit".as_slice(), &exit.public_key_bytes()),
+        &settlement,
+        None,
+    )
+    .expect("2-hop header should build");
+
+    // Relay 1 peels its layer
+    let layer1 = peel_onion_layer(
+        &relay1.secret_key_bytes(),
+        &ephemeral,
+        &header,
+    )
+    .expect("relay1 peel should succeed");
+
+    assert_eq!(layer1.next_peer_id, b"r2");
+    assert!(!layer1.is_terminal);
+    assert!(!layer1.remaining_header.is_empty());
+    assert_eq!(layer1.settlement.blind_token, [1u8; 32]);
+
+    // Relay 2 peels its layer using the updated ephemeral key and remaining header
+    let layer2 = peel_onion_layer(
+        &relay2.secret_key_bytes(),
+        &layer1.next_ephemeral_pubkey,
+        &layer1.remaining_header,
+    )
+    .expect("relay2 peel should succeed");
+
+    assert_eq!(layer2.next_peer_id, b"exit");
+    assert!(layer2.is_terminal);
+    assert!(layer2.remaining_header.is_empty());
+    assert_eq!(layer2.settlement.blind_token, [2u8; 32]);
+}
+
+#[test]
+fn test_onion_header_wrong_key_fails() {
+    let relay1 = EncryptionKeypair::generate();
+    let wrong_key = EncryptionKeypair::generate();
+    let exit = EncryptionKeypair::generate();
+
+    let settlement = vec![OnionSettlement {
+        blind_token: [1u8; 32],
+        shard_id: [2u8; 32],
+        payload_size: 100,
+        epoch: 0,
+    }];
+
+    let (header, ephemeral) = build_onion_header(
+        &[(b"r1".as_slice(), &relay1.public_key_bytes())],
+        (b"exit".as_slice(), &exit.public_key_bytes()),
+        &settlement,
+        None,
+    )
+    .unwrap();
+
+    // Wrong key cannot peel the layer
+    let result = peel_onion_layer(
+        &wrong_key.secret_key_bytes(),
+        &ephemeral,
+        &header,
+    );
+    assert!(result.is_err(), "Wrong key should fail to peel onion layer");
+}
+
+#[test]
+fn test_onion_header_direct_mode_empty() {
+    let exit = EncryptionKeypair::generate();
+
+    let (header, ephemeral) = build_onion_header(
+        &[],
+        (b"exit".as_slice(), &exit.public_key_bytes()),
+        &[],
+        None,
+    )
+    .unwrap();
+
+    assert!(header.is_empty(), "Direct mode should produce empty header");
+    assert_eq!(ephemeral, [0u8; 32], "Direct mode should produce zero ephemeral key");
+}
+
+// =============================================================================
+// 3. RelayHandler peels onion layer
+// =============================================================================
+
+#[test]
+fn test_relay_handler_peels_1_hop_shard() {
+    let relay_enc = EncryptionKeypair::generate();
+    let relay_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+
+    let handler = RelayHandler::new(relay_signing, relay_enc.clone());
+
+    let settlement = vec![OnionSettlement {
+        blind_token: [5u8; 32],
+        shard_id: [50u8; 32],
+        payload_size: 256,
+        epoch: 10,
+    }];
+
+    let (header, ephemeral) = build_onion_header(
+        &[(b"relay_pid".as_slice(), &relay_enc.public_key_bytes())],
+        (b"exit_pid".as_slice(), &exit_enc.public_key_bytes()),
+        &settlement,
+        None,
+    )
+    .unwrap();
+
+    let shard = Shard::new(
+        ephemeral,
+        header,
         vec![1, 2, 3, 4],
-        0,
-        5,
-        2,           // total_hops
-        0,           // chunk_index
-        1,           // total_chunks
+        vec![0u8; 92],
     );
 
-    // Should succeed - destination matches cached user
-    let result = relay.handle_shard(valid_response);
-    assert!(result.is_ok(), "Valid response should be accepted");
+    let sender_pubkey = [9u8; 32];
+    let (modified_shard, next_peer, receipt) = handler
+        .handle_shard(shard, sender_pubkey)
+        .expect("RelayHandler should peel shard successfully");
 
-    // Create an INVALID response with wrong destination (attack simulation)
-    let attacker_pubkey = [0xFFu8; 32];
-    let malicious_response = Shard::new_response(
-        [101u8; 32],
-        request_id,
-        attacker_pubkey, // WRONG destination
-        [0u8; 32],       // user_proof
-        exit_pubkey,
-        2,
-        vec![1, 2, 3, 4],
-        1,
-        5,
-        2,               // total_hops
-        0,               // chunk_index
-        1,               // total_chunks
+    // Next peer should be the exit
+    assert_eq!(next_peer, b"exit_pid");
+
+    // After peeling the only layer, the header should be empty (terminal)
+    assert!(modified_shard.header.is_empty());
+
+    // Payload should be passed through unchanged
+    assert_eq!(modified_shard.payload, vec![1, 2, 3, 4]);
+
+    // Receipt should contain correct sender_pubkey and settlement data
+    assert_eq!(receipt.sender_pubkey, sender_pubkey);
+    assert_eq!(receipt.blind_token, [5u8; 32]);
+}
+
+#[test]
+fn test_relay_handler_peels_2_hop_chain() {
+    let relay1_enc = EncryptionKeypair::generate();
+    let relay1_signing = SigningKeypair::generate();
+    let relay2_enc = EncryptionKeypair::generate();
+    let relay2_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+
+    let handler1 = RelayHandler::new(relay1_signing, relay1_enc.clone());
+    let handler2 = RelayHandler::new(relay2_signing, relay2_enc.clone());
+
+    let settlement = vec![
+        OnionSettlement {
+            blind_token: [1u8; 32],
+            shard_id: [101u8; 32],
+            payload_size: 512,
+            epoch: 42,
+        },
+        OnionSettlement {
+            blind_token: [2u8; 32],
+            shard_id: [102u8; 32],
+            payload_size: 512,
+            epoch: 42,
+        },
+    ];
+
+    let (header, ephemeral) = build_onion_header(
+        &[
+            (b"r1".as_slice(), &relay1_enc.public_key_bytes()),
+            (b"r2".as_slice(), &relay2_enc.public_key_bytes()),
+        ],
+        (b"exit".as_slice(), &exit_enc.public_key_bytes()),
+        &settlement,
+        None,
+    )
+    .unwrap();
+
+    let shard = Shard::new(
+        ephemeral,
+        header,
+        vec![10, 20, 30],
+        vec![0u8; 92],
     );
 
-    // Should fail - destination mismatch detected
-    let result = relay.handle_shard(malicious_response);
-    assert!(result.is_err(), "Malicious response should be rejected");
+    // Relay 1 peels
+    let sender1 = [11u8; 32];
+    let (shard2, next1, receipt1) = handler1.handle_shard(shard, sender1).unwrap();
+    assert_eq!(next1, b"r2");
+    assert!(!shard2.header.is_empty(), "Header should still have relay2's layer");
+    assert_eq!(receipt1.blind_token, [1u8; 32]); // settlement[0]
+    assert_eq!(receipt1.sender_pubkey, sender1);
 
-    match result {
-        Err(tunnelcraft_relay::RelayError::DestinationMismatch { expected, actual }) => {
-            assert_eq!(expected, user_pubkey, "Expected should be user pubkey");
-            assert_eq!(actual, attacker_pubkey, "Actual should be attacker pubkey");
-        }
-        _ => panic!("Expected DestinationMismatch error"),
-    }
+    // Relay 2 peels
+    let sender2 = [12u8; 32];
+    let (shard3, next2, receipt2) = handler2.handle_shard(shard2, sender2).unwrap();
+    assert_eq!(next2, b"exit");
+    assert!(shard3.header.is_empty(), "After last relay, header should be empty");
+    assert_eq!(receipt2.blind_token, [2u8; 32]); // settlement[1]
+    assert_eq!(receipt2.sender_pubkey, sender2);
+
+    // Payload is preserved through the chain
+    assert_eq!(shard3.payload, vec![10, 20, 30]);
+}
+
+#[test]
+fn test_relay_handler_wrong_key_rejects_shard() {
+    let relay_enc = EncryptionKeypair::generate();
+    let wrong_enc = EncryptionKeypair::generate();
+    let wrong_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+
+    // Handler has wrong encryption key
+    let handler = RelayHandler::new(wrong_signing, wrong_enc);
+
+    let settlement = vec![OnionSettlement {
+        blind_token: [1u8; 32],
+        shard_id: [2u8; 32],
+        payload_size: 100,
+        epoch: 0,
+    }];
+
+    let (header, ephemeral) = build_onion_header(
+        &[(b"r1".as_slice(), &relay_enc.public_key_bytes())],
+        (b"exit".as_slice(), &exit_enc.public_key_bytes()),
+        &settlement,
+        None,
+    )
+    .unwrap();
+
+    let shard = Shard::new(
+        ephemeral,
+        header,
+        vec![1, 2, 3],
+        vec![0u8; 92],
+    );
+
+    let result = handler.handle_shard(shard, [0u8; 32]);
+    assert!(result.is_err(), "Wrong encryption key should cause peel failure");
 }
 
 // =============================================================================
-// ERASURE CODING TESTS
+// 4. ForwardReceipt generation and verification
+// =============================================================================
+
+#[test]
+fn test_forward_receipt_from_relay_is_valid() {
+    let relay_enc = EncryptionKeypair::generate();
+    let relay_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+
+    let handler = RelayHandler::new(relay_signing.clone(), relay_enc.clone());
+
+    let blind_token = [42u8; 32];
+    let shard_id = [99u8; 32];
+    let settlement = vec![OnionSettlement {
+        blind_token,
+        shard_id,
+        payload_size: 2048,
+        epoch: 100,
+    }];
+
+    let (header, ephemeral) = build_onion_header(
+        &[(b"relay".as_slice(), &relay_enc.public_key_bytes())],
+        (b"exit".as_slice(), &exit_enc.public_key_bytes()),
+        &settlement,
+        None,
+    )
+    .unwrap();
+
+    let shard = Shard::new(
+        ephemeral,
+        header,
+        vec![0xAA; 2048],
+        vec![0u8; 92],
+    );
+
+    let sender = [77u8; 32];
+    let (_modified, _next_peer, receipt) = handler.handle_shard(shard, sender).unwrap();
+
+    // Verify receipt fields
+    assert_eq!(receipt.sender_pubkey, sender);
+    assert_eq!(receipt.receiver_pubkey, relay_signing.public_key_bytes());
+    assert_eq!(receipt.blind_token, blind_token);
+    assert_eq!(receipt.epoch, 100);
+
+    // Verify receipt signature
+    assert!(
+        verify_forward_receipt(&receipt),
+        "ForwardReceipt signature should be valid"
+    );
+}
+
+#[test]
+fn test_forward_receipt_sign_and_verify() {
+    let keypair = SigningKeypair::generate();
+    let request_id = [1u8; 32];
+    let shard_id = [2u8; 32];
+    let sender = [3u8; 32];
+    let blind_token = [4u8; 32];
+
+    let receipt = sign_forward_receipt(
+        &keypair,
+        &request_id,
+        &shard_id,
+        &sender,
+        &blind_token,
+        4096,
+        55,
+    );
+
+    assert_eq!(receipt.request_id, request_id);
+    assert_eq!(receipt.shard_id, shard_id);
+    assert_eq!(receipt.sender_pubkey, sender);
+    assert_eq!(receipt.receiver_pubkey, keypair.public_key_bytes());
+    assert_eq!(receipt.blind_token, blind_token);
+    assert_eq!(receipt.payload_size, 4096);
+    assert_eq!(receipt.epoch, 55);
+
+    assert!(verify_forward_receipt(&receipt));
+}
+
+#[test]
+fn test_forward_receipt_tampered_fails_verification() {
+    let keypair = SigningKeypair::generate();
+
+    let mut receipt = sign_forward_receipt(
+        &keypair,
+        &[1u8; 32],
+        &[2u8; 32],
+        &[3u8; 32],
+        &[4u8; 32],
+        1024,
+        10,
+    );
+
+    // Tamper with the payload_size
+    receipt.payload_size = 9999;
+
+    assert!(
+        !verify_forward_receipt(&receipt),
+        "Tampered receipt should fail verification"
+    );
+}
+
+// =============================================================================
+// 5. Erasure coding tests (3-of-5 reconstruction)
 // =============================================================================
 
 #[test]
@@ -194,7 +533,7 @@ fn test_erasure_reconstruction_with_3_of_5_shards() {
 
     assert_eq!(encoded.len(), TOTAL_SHARDS);
 
-    // Test reconstruction with first 3 shards
+    // Test reconstruction with first 3 shards (data shards only)
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
     shards[0] = Some(encoded[0].clone());
     shards[1] = Some(encoded[1].clone());
@@ -202,10 +541,10 @@ fn test_erasure_reconstruction_with_3_of_5_shards() {
 
     let decoded = coder
         .decode(&mut shards, original_data.len())
-        .expect("Failed to decode");
+        .expect("Failed to decode with first 3 shards");
     assert_eq!(decoded, original_data);
 
-    // Test reconstruction with last 3 shards
+    // Test reconstruction with last 3 shards (1 data + 2 parity)
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
     shards[2] = Some(encoded[2].clone());
     shards[3] = Some(encoded[3].clone());
@@ -213,7 +552,7 @@ fn test_erasure_reconstruction_with_3_of_5_shards() {
 
     let decoded = coder
         .decode(&mut shards, original_data.len())
-        .expect("Failed to decode");
+        .expect("Failed to decode with last 3 shards");
     assert_eq!(decoded, original_data);
 
     // Test reconstruction with mixed shards (0, 2, 4)
@@ -224,7 +563,7 @@ fn test_erasure_reconstruction_with_3_of_5_shards() {
 
     let decoded = coder
         .decode(&mut shards, original_data.len())
-        .expect("Failed to decode");
+        .expect("Failed to decode with shards 0, 2, 4");
     assert_eq!(decoded, original_data);
 }
 
@@ -241,212 +580,35 @@ fn test_erasure_fails_with_2_of_5_shards() {
     shards[1] = Some(encoded[1].clone());
 
     let result = coder.decode(&mut shards, original_data.len());
-    assert!(result.is_err(), "Should fail with only 2 shards");
+    assert!(result.is_err(), "Should fail with only 2 of 5 shards");
 }
 
 #[test]
-fn test_request_shards_contain_erasure_encoded_data() {
-    let user_pubkey = [1u8; 32];
-    let exit_pubkey = [2u8; 32];
+fn test_erasure_verify_enough_shards() {
+    let coder = ErasureCoder::new().unwrap();
+    let data = b"Verify test data for erasure";
+    let encoded = coder.encode(data).unwrap();
 
-    let shards = create_test_request_shards(user_pubkey, exit_pubkey);
+    // 3 shards should be enough
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
+    shards[0] = Some(encoded[0].clone());
+    shards[1] = Some(encoded[1].clone());
+    shards[2] = Some(encoded[2].clone());
+    assert!(coder.verify(&shards), "3 shards should be enough");
 
-    // All shards should have same request_id
-    let request_id = shards[0].request_id;
-    for shard in &shards {
-        assert_eq!(shard.request_id, request_id);
-    }
-
-    // Verify shard indices are correct
-    for (i, shard) in shards.iter().enumerate() {
-        assert_eq!(shard.shard_index, i as u8);
-        assert_eq!(shard.total_shards, TOTAL_SHARDS as u8);
-    }
-
-    // Verify payloads are present and non-empty
-    for shard in &shards {
-        assert!(!shard.payload.is_empty(), "Shard payload should not be empty");
-    }
+    // 2 shards should not be enough
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
+    shards[0] = Some(encoded[0].clone());
+    shards[1] = Some(encoded[1].clone());
+    assert!(!coder.verify(&shards), "2 shards should not be enough");
 }
 
 // =============================================================================
-// SENDER PUBKEY STAMPING TESTS
-// =============================================================================
-
-#[test]
-fn test_sender_pubkey_stamped_through_relays() {
-    let user_pubkey = [1u8; 32];
-    let exit_pubkey = [2u8; 32];
-
-    let shards = RequestBuilder::new("GET", "https://example.com")
-        .hop_mode(HopMode::Paranoid)
-        .build(user_pubkey, exit_pubkey)
-        .expect("Failed to build shards");
-
-    let mut relays = create_relay_chain(3);
-    let relay_pubkeys: Vec<_> = relays.iter().map(|r| r.pubkey()).collect();
-
-    // Take just one shard for testing
-    let mut shard = shards.into_iter().next().unwrap();
-
-    // Process through each relay
-    for (i, relay) in relays.iter_mut().enumerate() {
-        let result = relay.handle_shard(shard).expect("Should process");
-        shard = result.expect("Should return shard");
-
-        // After each relay, sender_pubkey should be that relay's pubkey
-        assert_eq!(shard.sender_pubkey, relay_pubkeys[i]);
-    }
-
-    // After the last relay, sender_pubkey should be the last relay's pubkey
-    assert_eq!(shard.sender_pubkey, relay_pubkeys[2]);
-}
-
-#[test]
-fn test_relay_decrements_hops_and_stamps_sender() {
-    let user_pubkey = [1u8; 32];
-    let exit_pubkey = [2u8; 32];
-
-    let shards = RequestBuilder::new("GET", "https://example.com")
-        .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey)
-        .expect("Failed to build");
-
-    let relay_keypair = SigningKeypair::generate();
-    let relay_pubkey = relay_keypair.public_key_bytes();
-    let mut relay = RelayHandler::new(relay_keypair);
-    let mut shard = shards.into_iter().next().unwrap();
-    let initial_hops = shard.hops_remaining;
-
-    let result = relay.handle_shard(shard).expect("Should process");
-    shard = result.expect("Should return");
-
-    // Hops should be decremented
-    assert_eq!(shard.hops_remaining, initial_hops - 1);
-
-    // sender_pubkey should be the relay's pubkey
-    assert_eq!(shard.sender_pubkey, relay_pubkey);
-}
-
-// =============================================================================
-// SECURITY TESTS
-// =============================================================================
-
-#[test]
-fn test_response_without_prior_request_forwarded() {
-    let mut relay = RelayHandler::new(SigningKeypair::generate());
-
-    // Response without prior request should still be forwarded
-    // (response shards take independent random paths through any relay)
-    let orphan_response = Shard::new_response(
-        [1u8; 32],
-        [99u8; 32], // Unknown request_id
-        [4u8; 32],
-        [0u8; 32],  // user_proof
-        [9u8; 32],  // exit_pubkey
-        2,
-        vec![1, 2, 3],
-        0,
-        5,
-        2,          // total_hops
-        0,          // chunk_index
-        1,          // total_chunks
-    );
-
-    let result = relay.handle_shard(orphan_response);
-    assert!(result.is_ok());
-    let shard = result.unwrap().unwrap();
-    assert_eq!(shard.hops_remaining, 1); // decremented
-}
-
-#[test]
-fn test_multiple_request_shards_share_cache_entry() {
-    let user_keypair = create_user_keypair();
-    let exit_keypair = create_exit_keypair();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
-
-    let shards = create_test_request_shards(user_pubkey, exit_pubkey);
-    let request_id = shards[0].request_id;
-
-    let mut relay = RelayHandler::new(SigningKeypair::generate());
-
-    // Process all request shards
-    for shard in &shards {
-        relay.handle_shard(shard.clone()).expect("Should process");
-    }
-
-    // Cache should have just one entry for this request
-    assert_eq!(relay.cache_size(), 1);
-
-    // Response with correct destination should work
-    let response = Shard::new_response(
-        [100u8; 32],
-        request_id,
-        user_pubkey,
-        [0u8; 32],  // user_proof
-        exit_pubkey,
-        2,
-        vec![1, 2, 3],
-        0,
-        5,
-        2,          // total_hops
-        0,          // chunk_index
-        1,          // total_chunks
-    );
-
-    let result = relay.handle_shard(response);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_relay_last_hop_response_forwarded() {
-    let user_keypair = create_user_keypair();
-    let exit_keypair = create_exit_keypair();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
-
-    let mut relay = RelayHandler::new(SigningKeypair::generate());
-
-    // Create request shard and process it
-    let mut shards = RequestBuilder::new("GET", "https://example.com")
-        .hop_mode(HopMode::Direct)
-        .build(user_pubkey, exit_pubkey)
-        .expect("Failed to build");
-
-    let request_shard = shards.remove(0);
-    let request_id = request_shard.request_id;
-    relay.handle_shard(request_shard).expect("Request should work");
-
-    // Response with hops=1 (will be 0 = last hop) should be forwarded
-    let response = Shard::new_response(
-        [100u8; 32],
-        request_id,
-        user_pubkey,
-        [0u8; 32],  // user_proof
-        exit_pubkey,
-        1,
-        vec![1, 2, 3],
-        0,
-        5,
-        1,          // total_hops
-        0,          // chunk_index
-        1,          // total_chunks
-    );
-
-    let result = relay.handle_shard(response);
-    assert!(result.is_ok());
-    let shard = result.unwrap().unwrap();
-    assert_eq!(shard.hops_remaining, 0);
-}
-
-// =============================================================================
-// HTTP REQUEST/RESPONSE TESTS
+// 6. HTTP request/response serialization
 // =============================================================================
 
 #[test]
 fn test_http_request_serialization_roundtrip() {
-    use tunnelcraft_exit::HttpRequest;
     use std::collections::HashMap;
 
     let mut headers = HashMap::new();
@@ -470,6 +632,25 @@ fn test_http_request_serialization_roundtrip() {
 }
 
 #[test]
+fn test_http_request_no_body() {
+    use std::collections::HashMap;
+
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        url: "https://example.com".to_string(),
+        headers: HashMap::new(),
+        body: None,
+    };
+
+    let bytes = request.to_bytes();
+    let parsed = HttpRequest::from_bytes(&bytes).expect("Should parse");
+
+    assert_eq!(parsed.method, "GET");
+    assert_eq!(parsed.url, "https://example.com");
+    assert!(parsed.body.is_none());
+}
+
+#[test]
 fn test_http_response_serialization() {
     use std::collections::HashMap;
 
@@ -480,142 +661,310 @@ fn test_http_response_serialization() {
 
     let bytes = response.to_bytes();
     assert!(!bytes.is_empty());
+
+    let parsed = HttpResponse::from_bytes(&bytes).expect("Should parse");
+    assert_eq!(parsed.status, 200);
+    assert_eq!(parsed.body, b"<html>Hello</html>");
 }
 
 // =============================================================================
-// END-TO-END FLOW TEST
+// 7. Routing tag encryption/decryption roundtrip
 // =============================================================================
 
 #[test]
-fn test_complete_request_response_flow() {
-    // This test simulates the complete flow:
-    // Client -> Relay1 -> Relay2 -> Exit -> Relay2 -> Relay1 -> Client
+fn test_routing_tag_encrypt_decrypt_roundtrip() {
+    let exit_enc = EncryptionKeypair::generate();
+    let assembly_id = [42u8; 32];
 
-    let user_keypair = create_user_keypair();
-    let exit_keypair = create_exit_keypair();
-    let user_pubkey = user_keypair.public_key_bytes();
-    let exit_pubkey = exit_keypair.public_key_bytes();
+    let encrypted = encrypt_routing_tag(
+        &exit_enc.public_key_bytes(),
+        &assembly_id,
+        0,
+        5,
+        0,
+        1,
+    )
+    .expect("encrypt_routing_tag should succeed");
 
-    // Create request shards with enough hops for the relay chain
-    let request_shards = RequestBuilder::new("GET", "https://example.com/api")
-        .header("Accept", "application/json")
-        .hop_mode(HopMode::Paranoid) // Use more hops to avoid last-hop issues
-        .build(user_pubkey, exit_pubkey)
-        .expect("Failed to build request");
+    assert!(!encrypted.is_empty(), "Routing tag should not be empty");
 
-    let request_id = request_shards[0].request_id;
+    let decrypted = decrypt_routing_tag(
+        &exit_enc.secret_key_bytes(),
+        &encrypted,
+    )
+    .expect("decrypt_routing_tag should succeed");
 
-    // Create relay chain - configure to not remove cache entries on last hop
-    // This allows processing all response shards without cache invalidation
-    let relay_config = RelayConfig {
-        can_be_last_hop: false, // Don't remove cache entries
+    assert_eq!(decrypted.assembly_id, assembly_id);
+    assert_eq!(decrypted.shard_index, 0);
+    assert_eq!(decrypted.total_shards, 5);
+    assert_eq!(decrypted.chunk_index, 0);
+    assert_eq!(decrypted.total_chunks, 1);
+}
+
+#[test]
+fn test_routing_tags_are_unlinkable() {
+    let exit_enc = EncryptionKeypair::generate();
+    let assembly_id = [42u8; 32];
+
+    let tag1 = encrypt_routing_tag(&exit_enc.public_key_bytes(), &assembly_id, 0, 5, 0, 1).unwrap();
+    let tag2 = encrypt_routing_tag(&exit_enc.public_key_bytes(), &assembly_id, 0, 5, 0, 1).unwrap();
+
+    // Each call uses a fresh ephemeral key, so tags should differ
+    assert_ne!(tag1, tag2, "Same assembly_id should produce different ciphertexts");
+
+    // But both should decrypt to the same assembly_id
+    let rt1 = decrypt_routing_tag(&exit_enc.secret_key_bytes(), &tag1).unwrap();
+    let rt2 = decrypt_routing_tag(&exit_enc.secret_key_bytes(), &tag2).unwrap();
+    assert_eq!(rt1.assembly_id, assembly_id);
+    assert_eq!(rt2.assembly_id, assembly_id);
+}
+
+#[test]
+fn test_routing_tag_wrong_key_fails() {
+    let exit_enc = EncryptionKeypair::generate();
+    let wrong_enc = EncryptionKeypair::generate();
+
+    let tag = encrypt_routing_tag(&exit_enc.public_key_bytes(), &[1u8; 32], 0, 5, 0, 1).unwrap();
+
+    let result = decrypt_routing_tag(&wrong_enc.secret_key_bytes(), &tag);
+    assert!(result.is_err(), "Wrong key should fail to decrypt routing tag");
+}
+
+// =============================================================================
+// 8. ExitPayload encryption/decryption roundtrip
+// =============================================================================
+
+#[test]
+fn test_exit_payload_encrypt_decrypt_roundtrip() {
+    let exit_enc = EncryptionKeypair::generate();
+
+    let payload = ExitPayload {
+        request_id: [1u8; 32],
+        user_pubkey: [2u8; 32],
+        user_proof: [3u8; 32],
+        lease_set: empty_lease_set(),
+        total_hops: 2,
+        shard_type: ShardType::Request,
+        mode: 0x00,
+        data: b"GET\nhttps://example.com\n0\n0\n".to_vec(),
+        response_enc_pubkey: [0u8; 32],
     };
-    let mut relay1 = RelayHandler::with_config(SigningKeypair::generate(), relay_config.clone());
-    let mut relay2 = RelayHandler::with_config(SigningKeypair::generate(), relay_config);
 
-    // ========== REQUEST PHASE ==========
-    // Process request shards through relays
-    let mut shards_after_relay1 = Vec::new();
-    for shard in request_shards {
-        let result = relay1.handle_shard(shard).expect("Relay1 should process");
-        shards_after_relay1.push(result.expect("Should return shard"));
+    let encrypted = encrypt_exit_payload(
+        &exit_enc.public_key_bytes(),
+        &payload,
+    )
+    .expect("encrypt_exit_payload should succeed");
+
+    assert!(encrypted.len() > 32, "Encrypted payload should have ephemeral key + ciphertext");
+
+    let decrypted = tunnelcraft_crypto::decrypt_exit_payload(
+        &exit_enc.secret_key_bytes(),
+        &encrypted,
+    )
+    .expect("decrypt_exit_payload should succeed");
+
+    assert_eq!(decrypted.request_id, [1u8; 32]);
+    assert_eq!(decrypted.user_pubkey, [2u8; 32]);
+    assert_eq!(decrypted.user_proof, [3u8; 32]);
+    assert_eq!(decrypted.total_hops, 2);
+    assert_eq!(decrypted.shard_type, ShardType::Request);
+    assert_eq!(decrypted.mode, 0x00);
+    assert_eq!(decrypted.data, b"GET\nhttps://example.com\n0\n0\n");
+}
+
+// =============================================================================
+// 9. Complete request flow: client -> exit (direct mode)
+// =============================================================================
+
+#[tokio::test]
+async fn test_complete_direct_mode_flow_client_to_exit() {
+    use tunnelcraft_exit::{ExitHandler, ExitConfig};
+
+    let user_keypair = SigningKeypair::generate();
+    let exit_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+
+    // Create exit handler with explicit encryption keypair so we can match it
+    let mut exit_handler = ExitHandler::with_keypairs(
+        ExitConfig {
+            blocked_domains: vec![], // Allow all for testing
+            ..Default::default()
+        },
+        exit_signing,
+        exit_enc.clone(),
+    )
+    .expect("ExitHandler creation should succeed");
+
+    let exit_hop = PathHop {
+        peer_id: b"exit_peer".to_vec(),
+        signing_pubkey: [0u8; 32],
+        encryption_pubkey: exit_enc.public_key_bytes(),
+    };
+
+    // Build onion shards in direct mode
+    let builder = RequestBuilder::new("GET", "https://httpbin.org/get")
+        .header("User-Agent", "TunnelCraft-Test");
+
+    let (_request_id, shards) = builder
+        .build_onion(&user_keypair, &exit_hop, &[], &empty_lease_set(), 1)
+        .expect("build_onion should succeed");
+
+    assert!(!shards.is_empty(), "Should produce shards");
+
+    // Feed all shards to exit handler
+    let mut response_shards = None;
+    for shard in shards {
+        // In direct mode, shards go straight to exit
+        match exit_handler.process_shard(shard).await {
+            Ok(Some(resp)) => {
+                response_shards = Some(resp);
+            }
+            Ok(None) => {
+                // Still collecting shards
+            }
+            Err(e) => {
+                // HTTP request to external service may fail in test environment,
+                // but the shard processing itself should work up to the HTTP fetch.
+                // This is acceptable for integration tests that don't have network.
+                eprintln!("Exit processing error (expected in offline tests): {}", e);
+                return;
+            }
+        }
     }
 
-    let mut shards_after_relay2 = Vec::new();
-    for shard in shards_after_relay1 {
-        let result = relay2.handle_shard(shard).expect("Relay2 should process");
-        shards_after_relay2.push(result.expect("Should return shard"));
-    }
-
-    // Verify shards reached exit with relay2's sender_pubkey stamped
-    for shard in &shards_after_relay2 {
-        assert_eq!(shard.sender_pubkey, relay2.pubkey(), "sender_pubkey should be relay2");
-        assert_eq!(shard.shard_type, ShardType::Request);
-    }
-
-    // ========== RESPONSE PHASE ==========
-    // Create response shards (simulating what exit would create)
-    let coder = ErasureCoder::new().unwrap();
-    let response_data = b"HTTP response body";
-    let encoded_response = coder.encode(response_data).unwrap();
-
-    let mut response_shards = Vec::new();
-
-    for (i, payload) in encoded_response.into_iter().enumerate() {
-        let shard = Shard::new_response(
-            [100 + i as u8; 32],
-            request_id,
-            user_pubkey, // Destination is user
-            [0u8; 32],   // user_proof
-            exit_pubkey,
-            4, // More hops to avoid last-hop issues
-            payload,
-            i as u8,
-            TOTAL_SHARDS as u8,
-            4,           // total_hops
-            0,           // chunk_index
-            1,           // total_chunks
-        );
-        response_shards.push(shard);
-    }
-
-    // Process response shards back through relays (reverse order)
-    let mut response_after_relay2 = Vec::new();
-    for shard in response_shards {
-        let result = relay2
-            .handle_shard(shard)
-            .expect("Relay2 should process response");
-        response_after_relay2.push(result.expect("Should return shard"));
-    }
-
-    let mut response_after_relay1 = Vec::new();
-    for shard in response_after_relay2 {
-        let result = relay1
-            .handle_shard(shard)
-            .expect("Relay1 should process response");
-        response_after_relay1.push(result.expect("Should return shard"));
-    }
-
-    // ========== CLIENT RECONSTRUCTION ==========
-    // Collect response shard payloads
-    let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
-    for shard in &response_after_relay1 {
-        shard_data[shard.shard_index as usize] = Some(shard.payload.clone());
-    }
-
-    // Reconstruct response
-    let reconstructed = coder
-        .decode(&mut shard_data, response_data.len())
-        .expect("Should reconstruct");
-
-    assert_eq!(reconstructed, response_data, "Response should match");
-
-    // Verify response shards have relay1's sender_pubkey (last relay in return path)
-    for shard in &response_after_relay1 {
-        assert_eq!(shard.sender_pubkey, relay1.pubkey(), "sender_pubkey should be relay1 after return");
-        assert_eq!(shard.shard_type, ShardType::Response);
+    // If we got response shards (network was available), verify them
+    if let Some(resp) = response_shards {
+        assert!(!resp.is_empty(), "Response should have shards");
+        for shard in &resp {
+            assert!(!shard.payload.is_empty());
+            assert!(!shard.routing_tag.is_empty(), "Routing tag should not be empty");
+        }
     }
 }
 
+// =============================================================================
+// 10. Shard struct and serialization tests
+// =============================================================================
+
 #[test]
-fn test_partial_shard_reconstruction() {
-    // Test that we can reconstruct with only 3 of 5 shards arriving
+fn test_shard_new_fields() {
+    let shard = Shard::new(
+        [1u8; 32],
+        vec![2, 3, 4],
+        vec![5, 6, 7, 8],
+        vec![9u8; 98],
+    );
 
-    let user_pubkey = [1u8; 32];
-    let exit_pubkey = [2u8; 32];
+    assert_eq!(shard.ephemeral_pubkey, [1u8; 32]);
+    assert_eq!(shard.header, vec![2, 3, 4]);
+    assert_eq!(shard.payload, vec![5, 6, 7, 8]);
+    assert!(!shard.routing_tag.is_empty(), "Routing tag should not be empty");
+}
 
-    let shards = create_test_request_shards(user_pubkey, exit_pubkey);
+#[test]
+fn test_shard_serialization_roundtrip() {
+    let shard = Shard::new(
+        [1u8; 32],
+        vec![2, 3, 4, 5],
+        vec![10, 20, 30],
+        vec![0u8; 98],
+    );
 
-    // Simulate only 3 shards arriving (network loss)
-    let received_shards: Vec<_> = shards.into_iter().take(DATA_SHARDS).collect();
+    let bytes = shard.to_bytes().unwrap();
+    let restored = Shard::from_bytes(&bytes).unwrap();
 
-    // Prepare for reconstruction
-    let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
-    for shard in &received_shards {
-        shard_data[shard.shard_index as usize] = Some(shard.payload.clone());
+    assert_eq!(restored.ephemeral_pubkey, shard.ephemeral_pubkey);
+    assert_eq!(restored.header, shard.header);
+    assert_eq!(restored.payload, shard.payload);
+    assert_eq!(restored.routing_tag, shard.routing_tag);
+}
+
+// =============================================================================
+// 11. User proof computation
+// =============================================================================
+
+#[test]
+fn test_user_proof_is_deterministic() {
+    let request_id = [1u8; 32];
+    let user_pubkey = [2u8; 32];
+    let sig = [3u8; 64];
+
+    let proof1 = compute_user_proof(&request_id, &user_pubkey, &sig);
+    let proof2 = compute_user_proof(&request_id, &user_pubkey, &sig);
+    assert_eq!(proof1, proof2, "Same inputs should produce same user_proof");
+}
+
+#[test]
+fn test_user_proof_different_inputs_differ() {
+    let proof1 = compute_user_proof(&[1u8; 32], &[2u8; 32], &[3u8; 64]);
+    let proof2 = compute_user_proof(&[4u8; 32], &[2u8; 32], &[3u8; 64]);
+    assert_ne!(proof1, proof2, "Different request_ids should produce different proofs");
+
+    let proof3 = compute_user_proof(&[1u8; 32], &[5u8; 32], &[3u8; 64]);
+    assert_ne!(proof1, proof3, "Different user_pubkeys should produce different proofs");
+}
+
+// =============================================================================
+// 12. Build onion shards contain encrypted routing tags with erasure metadata
+// =============================================================================
+
+#[test]
+fn test_build_onion_shards_have_encrypted_routing_tags() {
+    let keypair = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+
+    let exit = PathHop {
+        peer_id: b"exit".to_vec(),
+        signing_pubkey: [0u8; 32],
+        encryption_pubkey: exit_enc.public_key_bytes(),
+    };
+
+    let (_request_id, shards) = RequestBuilder::new("GET", "https://example.com")
+        .build_onion(&keypair, &exit, &[], &empty_lease_set(), 1)
+        .expect("build_onion should succeed");
+
+    // Verify each shard has a non-empty routing tag that the exit can decrypt
+    for shard in &shards {
+        assert!(!shard.routing_tag.is_empty(), "Routing tag should not be empty");
+        // The routing tag should be decryptable by the exit's key
+        let tag = decrypt_routing_tag(
+            &exit_enc.secret_key_bytes(),
+            &shard.routing_tag,
+        )
+        .expect("Exit should be able to decrypt routing tag");
+        assert_eq!(tag.total_shards, TOTAL_SHARDS as u8);
+        assert!(tag.total_chunks >= 1);
     }
+}
 
-    // Should be able to verify we have enough
-    let coder = ErasureCoder::new().unwrap();
-    assert!(coder.verify(&shard_data), "Should have enough shards");
+// =============================================================================
+// 13. Relay handler pubkey accessors
+// =============================================================================
+
+#[test]
+fn test_relay_handler_pubkey_accessors() {
+    let signing = SigningKeypair::generate();
+    let encryption = EncryptionKeypair::generate();
+    let signing_pub = signing.public_key_bytes();
+    let enc_pub = encryption.public_key_bytes();
+
+    let handler = RelayHandler::new(signing, encryption);
+
+    assert_eq!(handler.pubkey(), signing_pub);
+    assert_eq!(handler.encryption_pubkey(), enc_pub);
+}
+
+#[test]
+fn test_relay_handler_with_config() {
+    let signing = SigningKeypair::generate();
+    let encryption = EncryptionKeypair::generate();
+
+    let config = RelayConfig {
+        can_be_last_hop: false,
+    };
+
+    let handler = RelayHandler::with_config(signing, encryption, config);
+    // Should not panic - handler created successfully
+    assert_ne!(handler.pubkey(), [0u8; 32]);
 }

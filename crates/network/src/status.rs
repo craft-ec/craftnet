@@ -43,12 +43,15 @@ pub struct ExitStatusMessage {
     pub uptime_secs: u64,
     /// Optional region hint (e.g., "us-west", "eu-central")
     pub region: Option<String>,
+    /// X25519 encryption pubkey (hex-encoded, for onion routing)
+    pub encryption_pubkey: Option<String>,
     /// Unix timestamp (seconds)
     pub timestamp: u64,
 }
 
 impl ExitStatusMessage {
     /// Create a heartbeat message with throughput info
+    #[allow(clippy::too_many_arguments)]
     pub fn heartbeat(
         pubkey: [u8; 32],
         peer_id: &str,
@@ -69,6 +72,7 @@ impl ExitStatusMessage {
             downlink_kbps,
             uptime_secs,
             region,
+            encryption_pubkey: None,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -88,6 +92,7 @@ impl ExitStatusMessage {
             downlink_kbps: 0,
             uptime_secs: 0,
             region: None,
+            encryption_pubkey: None,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

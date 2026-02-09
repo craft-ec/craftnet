@@ -4,17 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TunnelCraft is a decentralized, trustless P2P VPN with a Rust backend and TypeScript frontend. It uses cryptographic verification at every step to achieve anonymity without requiring trust in any single node.
+TunnelCraft is a decentralized, trustless P2P VPN with a Rust backend and TypeScript frontend. It operates at L4 (TCP tunnel via SOCKS5 proxy) for end-to-end TLS privacy, with an L7 HTTP mode for simpler use cases. The design is **private but not anonymous** — no single node sees the full picture, but routing metadata (pseudonymous pubkeys) is visible to relays.
 
-**Core Innovation**: Privacy through fragmentation + trustless verification via relay destination checks.
+**Core Innovation**: Privacy through fragmentation + trustless verification via relay destination checks + decentralized relay operators (no single trust point).
 
 ## Technology Stack
 
 ### Backend (Rust)
 - **Language**: Rust 1.75+
 - **Async Runtime**: Tokio
-- **P2P**: libp2p (Kademlia DHT, NAT traversal)
-- **Erasure Coding**: reed-solomon-erasure (5/3)
+- **P2P**: libp2p (Kademlia DHT, NAT traversal, gossipsub)
+- **Erasure Coding**: reed-solomon-erasure (5/3, chunked at 3KB)
 - **Cryptography**: dalek ecosystem (ed25519-dalek, x25519-dalek, chacha20poly1305)
 - **Settlement**: Solana + Anchor
 
@@ -24,18 +24,18 @@ TunnelCraft is a decentralized, trustless P2P VPN with a Rust backend and TypeSc
 - **IPC**: Unix socket / Named pipe to Rust daemon
 
 ### Mobile VPN Layer (Native)
-- **iOS**: Swift Network Extension → Rust FFI (uniffi)
-- **Android**: Kotlin VpnService → Rust JNI (uniffi)
+- **iOS**: Swift Network Extension → tun2socks → SOCKS5 → Rust FFI (uniffi)
+- **Android**: Kotlin VpnService → tun2socks → SOCKS5 → Rust JNI (uniffi)
 
 ## Target Platforms
 
 | Platform | UI | VPN Tunnel | Notes |
 |----------|-----|------------|-------|
-| macOS | Electron | Rust daemon | launchd service |
-| Windows | Electron | Rust daemon | Windows service |
-| Linux | Electron | Rust daemon | systemd service |
-| iOS | React Native | Swift + Rust FFI | Network Extension |
-| Android | React Native | Kotlin + Rust JNI | VpnService |
+| macOS | Electron | Rust daemon + SOCKS5 | launchd service |
+| Windows | Electron | Rust daemon + SOCKS5 | Windows service |
+| Linux | Electron | Rust daemon + SOCKS5 | systemd service |
+| iOS | React Native | TUN → tun2socks → SOCKS5 | Network Extension |
+| Android | React Native | TUN → tun2socks → SOCKS5 | VpnService |
 
 ## Build Commands
 
@@ -77,14 +77,14 @@ cd apps/mobile/android
 ```
 tunnelcraft/
 ├── crates/
-│   ├── core/           # Types: Shard, ChainEntry, errors
+│   ├── core/           # Types: Shard, ForwardReceipt, TunnelMetadata, errors
 │   ├── crypto/         # Keys, signatures, encryption
-│   ├── erasure/        # Reed-Solomon encoding (5/3)
+│   ├── erasure/        # Reed-Solomon encoding (5/3, 3KB chunks)
 │   ├── network/        # libp2p integration
 │   ├── relay/          # Relay logic + destination verification
-│   ├── exit/           # Exit node + HTTP fetch + settlement
+│   ├── exit/           # Exit node + HTTP fetch + TCP tunnel handler
 │   ├── settlement/     # Solana client
-│   ├── client/         # Client SDK
+│   ├── client/         # Client SDK + SOCKS5 proxy + tunnel builder
 │   ├── daemon/         # Background service (IPC server)
 │   └── uniffi/         # Mobile bindings (iOS/Android)
 └── apps/
@@ -102,7 +102,7 @@ tunnelcraft/
 │  Desktop                                                     │
 │  ┌──────────────┐      IPC Socket      ┌──────────────────┐ │
 │  │   Electron   │ ◄──────────────────► │   Rust Daemon    │ │
-│  │   (UI/UX)    │                      │   (VPN Core)     │ │
+│  │   (UI/UX)    │                      │ (VPN + SOCKS5)   │ │
 │  └──────────────┘                      └──────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 
@@ -114,21 +114,54 @@ tunnelcraft/
 │  └──────────────┘                      └────────┬─────────┘ │
 │                                                 │ FFI/JNI   │
 │                                        ┌────────▼─────────┐ │
-│                                        │   Rust Library   │ │
-│                                        │   (VPN Core)     │ │
+│                        TUN interface → │  tun2socks       │ │
+│                                        │  → SOCKS5 proxy  │ │
+│                                        │  → Rust Library   │ │
 │                                        └──────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Key Concepts
 
+### Two Operating Modes
+
+**TCP Tunnel Mode (L4, primary)** — SOCKS5 proxy on localhost. Browser/app connects via SOCKS5, exit opens raw TCP connection to destination, pipes bytes. TLS is end-to-end between client and destination. Exit sees only `host:port` + ciphertext. Payload prefix: `0x01`.
+
+**HTTP Mode (L7, legacy)** — Exit reconstructs full HTTP request and fetches it. Exit sees URLs, headers, bodies. For HTTPS, exit terminates TLS. Payload prefix: `0x00` (default).
+
+### Privacy Model
+
+**Private but not anonymous.** Relays see pseudonymous routing metadata (`user_pubkey`, exit pubkey) but not content (TLS end-to-end via SOCKS5). No single entity sees the full picture — relay operators are independent. This is sufficient for production (better than centralized VPNs, tradeoff vs Tor/Nym is speed).
+
+### Best-Effort Routing with Minimum Relay Count
+
+User selects privacy level via `HopMode` which sets a minimum relay count (`min_relays`). Shards carry a decrementing `hops_remaining` counter:
+- Counter > 0: relay MUST forward to another relay, decrements counter
+- Counter = 0: relay forwards toward exit via best-effort fastest path
+- Shards are never dropped due to missing relays — fallback to any connected peer
+
+| Mode | Min relays | Privacy |
+|------|-----------|---------|
+| Direct | 0 | Exit sees client IP |
+| Light | 1 | 1 relay hides IP from exit |
+| Standard | 2 | No single node sees both client and exit |
+| Paranoid | 3 | Maximum privacy |
+
 ### Trustless Verification
+
 Relays cache `request_id → user_pubkey` and verify that response destinations match. This prevents exit nodes from redirecting responses to colluding parties.
 
-### Subscription + Per-User Pool Settlement
+### Erasure Coding (Chunked)
+
+Data is split into 3KB chunks. Each chunk is Reed-Solomon encoded into 5 shards (3 data + 2 parity). Only 3 of 5 shards needed per chunk for reconstruction. Each shard carries `chunk_index` and `total_chunks` for multi-chunk reassembly.
+
+### Settlement: Subscription + Per-User Pool + ForwardReceipts
+
 - Users subscribe on-chain (tiers: Basic, Standard, Premium). Payment goes into their own pool PDA.
 - Each relay earns ForwardReceipts as proof of forwarding (signed by next hop).
-- End of cycle: relays claim proportional share of user's pool based on completed shards.
+- ForwardReceipts include `payload_size` for bandwidth-weighted settlement.
+- `user_proof = SHA256(request_id || user_pubkey || signature)` binds receipts to the user's pool.
+- End of cycle: relays claim proportional share of user's pool based on bandwidth forwarded.
 - Per-user pool prevents cross-user dilution — abuse only dilutes the abuser's own relays.
 - No bitmap, no credit indexes, no sequencer. ForwardReceipt is the only settlement primitive.
 
@@ -137,9 +170,6 @@ Relays cache `request_id → user_pubkey` and verify that response destinations 
 - Relays maintain local cache of subscribed user_pubkeys.
 - Random audit: relays spot-check subscriptions on-chain periodically.
 - Fakers are reported for abuse. Subscribed users get priority; unsubscribed get best-effort.
-
-### Erasure Coding
-Requests/responses are split into 5 shards; only 3 needed for reconstruction. Each shard takes a random path.
 
 ## Critical Implementation
 
@@ -154,11 +184,22 @@ if let Some(expected_user) = self.cache.get(&shard.request_id) {
 }
 ```
 
+The tunnel mode dispatch in `crates/exit/src/handler.rs`:
+
+```rust
+// Check payload mode prefix byte
+if !request_data.is_empty() && request_data[0] == PAYLOAD_MODE_TUNNEL {
+    // TCP tunnel: parse TunnelMetadata, pipe bytes to destination
+} else {
+    // HTTP mode: parse and fetch HTTP request
+}
+```
+
 ## Solana Contract Instructions
 
 - `subscribe` - User subscribes (tier + payment). Creates SubscriptionPDA + UserPoolPDA.
 - `submit_receipts` - Relay submits ForwardReceipts against a user's pool. Deduped by (request_id, shard_index, receiver_pubkey).
-- `claim_rewards` - End of cycle: relay claims proportional share of user pool (relay_receipts / total_receipts * pool_balance).
+- `claim_rewards` - End of cycle: relay claims proportional share of user pool weighted by bandwidth.
 - `withdraw` - Withdraw accumulated earnings from NodeAccount.
 
 ## Work Style
@@ -190,4 +231,7 @@ Desktop frontend communicates with Rust daemon via JSON-RPC over Unix socket (ma
 {"jsonrpc":"2.0","method":"disconnect","id":2}
 {"jsonrpc":"2.0","method":"status","id":3}
 {"jsonrpc":"2.0","method":"subscribe","params":{"tier":"standard"},"id":4}
+{"jsonrpc":"2.0","method":"start_proxy","params":{"port":1080},"id":5}
+{"jsonrpc":"2.0","method":"stop_proxy","id":6}
+{"jsonrpc":"2.0","method":"proxy_status","id":7}
 ```

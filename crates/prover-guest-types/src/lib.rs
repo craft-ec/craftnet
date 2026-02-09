@@ -23,7 +23,7 @@ pub struct GuestReceipt {
     /// Relay that forwarded the shard (bound to prevent Sybil re-proving)
     pub sender_pubkey: [u8; 32],
     pub receiver_pubkey: [u8; 32],
-    pub user_proof: [u8; 32],
+    pub blind_token: [u8; 32],
     /// Subscription epoch (prevents cross-epoch replay)
     pub epoch: u64,
     pub timestamp: u64,

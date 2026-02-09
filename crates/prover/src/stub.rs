@@ -18,16 +18,16 @@ impl StubProver {
         Self
     }
 
-    /// Hash a receipt into a leaf: SHA256(request_id || shard_id || sender_pubkey || receiver_pubkey || user_proof || epoch || timestamp)
+    /// Hash a receipt into a leaf: SHA256(request_id || shard_id || sender_pubkey || receiver_pubkey || blind_token || epoch || timestamp)
     fn receipt_leaf(receipt: &ForwardReceipt) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(&receipt.request_id);
-        hasher.update(&receipt.shard_id);
-        hasher.update(&receipt.sender_pubkey);
-        hasher.update(&receipt.receiver_pubkey);
-        hasher.update(&receipt.user_proof);
-        hasher.update(&receipt.epoch.to_le_bytes());
-        hasher.update(&receipt.timestamp.to_le_bytes());
+        hasher.update(receipt.request_id);
+        hasher.update(receipt.shard_id);
+        hasher.update(receipt.sender_pubkey);
+        hasher.update(receipt.receiver_pubkey);
+        hasher.update(receipt.blind_token);
+        hasher.update(receipt.epoch.to_le_bytes());
+        hasher.update(receipt.timestamp.to_le_bytes());
         let result = hasher.finalize();
         let mut out = [0u8; 32];
         out.copy_from_slice(&result);
@@ -72,7 +72,7 @@ mod tests {
             shard_id: [shard_id; 32],
             sender_pubkey: [0xFFu8; 32],
             receiver_pubkey: [receiver; 32],
-            user_proof: [0u8; 32],
+            blind_token: [0u8; 32],
             payload_size: 1024,
             epoch: 0,
             timestamp: 1700000000,

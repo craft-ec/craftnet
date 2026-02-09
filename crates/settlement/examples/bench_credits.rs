@@ -15,7 +15,7 @@ fn main() {
             let secret: [u8; 32] = hasher.finalize().into();
             
             let mut hasher = Sha256::new();
-            hasher.update(&secret);
+            hasher.update(secret);
             let hash: [u8; 32] = hasher.finalize().into();
             
             secrets.push(secret);

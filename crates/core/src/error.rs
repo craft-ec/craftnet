@@ -197,7 +197,8 @@ mod tests {
     fn test_result_type_ok() {
         let result: Result<i32> = Ok(42);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        let Ok(val) = result else { unreachable!() };
+        assert_eq!(val, 42);
     }
 
     #[test]

@@ -43,8 +43,11 @@
 
 mod credits;
 mod node;
+pub mod path;
 mod request;
 mod response;
+pub mod socks5;
+mod tunnel;
 
 // Unified node (the single networking implementation)
 pub use node::{NodeConfig, NodeMode, NodeStats, NodeStatus, NodeType, TunnelCraftNode};
@@ -52,11 +55,18 @@ pub use node::{NodeConfig, NodeMode, NodeStats, NodeStatus, NodeType, TunnelCraf
 // Credit management
 pub use credits::CreditManager;
 
+// Path selection and topology (onion routing)
+pub use path::{PathHop, OnionPath, PathSelector, TopologyGraph, TopologyRelay, random_id};
+
 // Request builder
-pub use request::RequestBuilder;
+pub use request::{RequestBuilder, compute_user_proof};
 
 // Tunnel response
 pub use response::TunnelResponse;
+
+// Tunnel mode (SOCKS5 proxy)
+pub use tunnel::build_tunnel_shards;
+pub use socks5::Socks5Server;
 
 use thiserror::Error;
 

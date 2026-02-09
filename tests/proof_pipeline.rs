@@ -25,6 +25,7 @@ fn test_keypair(seed: u8) -> SigningKeypair {
 }
 
 /// Create a signed ProofMessage
+#[allow(clippy::too_many_arguments)]
 fn signed_proof(
     keypair: &SigningKeypair,
     pool: [u8; 32],
@@ -39,6 +40,7 @@ fn signed_proof(
 }
 
 /// Create a signed ProofMessage with explicit epoch
+#[allow(clippy::too_many_arguments)]
 fn signed_proof_epoch(
     keypair: &SigningKeypair,
     pool: [u8; 32],
@@ -97,8 +99,8 @@ fn test_user_proof_included_in_receipt_signature() {
     );
 
     // And user_proof is stored
-    assert_eq!(receipt_a.user_proof, user_proof_a);
-    assert_eq!(receipt_b.user_proof, user_proof_b);
+    assert_eq!(receipt_a.blind_token, user_proof_a);
+    assert_eq!(receipt_b.blind_token, user_proof_b);
 }
 
 /// Verify that tampering with user_proof breaks verification
@@ -114,7 +116,7 @@ fn test_user_proof_tamper_breaks_verification() {
     assert!(verify_forward_receipt(&receipt));
 
     // Tamper with user_proof
-    receipt.user_proof = [0xFF; 32];
+    receipt.blind_token = [0xFF; 32];
     assert!(
         !verify_forward_receipt(&receipt),
         "Tampered user_proof should fail verification"
@@ -129,9 +131,9 @@ fn test_user_proof_computation() {
     let user_signature = [3u8; 64]; // mock signature
 
     let mut hasher = Sha256::new();
-    hasher.update(&request_id);
-    hasher.update(&user_pubkey);
-    hasher.update(&user_signature);
+    hasher.update(request_id);
+    hasher.update(user_pubkey);
+    hasher.update(user_signature);
     let result = hasher.finalize();
 
     let mut expected = [0u8; 32];
@@ -139,9 +141,9 @@ fn test_user_proof_computation() {
 
     // Compute again — should be deterministic
     let mut hasher2 = Sha256::new();
-    hasher2.update(&request_id);
-    hasher2.update(&user_pubkey);
-    hasher2.update(&user_signature);
+    hasher2.update(request_id);
+    hasher2.update(user_pubkey);
+    hasher2.update(user_signature);
     let result2 = hasher2.finalize();
 
     let mut expected2 = [0u8; 32];
@@ -161,9 +163,9 @@ fn test_different_users_different_proofs() {
 
     let proof_a = {
         let mut h = Sha256::new();
-        h.update(&request_id);
-        h.update(&user_a);
-        h.update(&sig);
+        h.update(request_id);
+        h.update(user_a);
+        h.update(sig);
         let mut p = [0u8; 32];
         p.copy_from_slice(&h.finalize());
         p
@@ -171,9 +173,9 @@ fn test_different_users_different_proofs() {
 
     let proof_b = {
         let mut h = Sha256::new();
-        h.update(&request_id);
-        h.update(&user_b);
-        h.update(&sig);
+        h.update(request_id);
+        h.update(user_b);
+        h.update(sig);
         let mut p = [0u8; 32];
         p.copy_from_slice(&h.finalize());
         p
@@ -268,7 +270,7 @@ fn test_aggregator_multi_relay_distribution() {
 
     // 5 relays, each with different receipt counts
     let counts = [100u64, 200, 300, 150, 250]; // total = 1000
-    let keypairs: Vec<SigningKeypair> = (1..=5).map(|i| test_keypair(i)).collect();
+    let keypairs: Vec<SigningKeypair> = (1..=5).map(test_keypair).collect();
     let pubkeys: Vec<[u8; 32]> = keypairs.iter().map(|kp| kp.public_key_bytes()).collect();
 
     for (i, &count) in counts.iter().enumerate() {
@@ -291,11 +293,12 @@ fn test_aggregator_multi_relay_distribution() {
 /// Distribution root is deterministic regardless of insertion order
 #[test]
 fn test_distribution_root_order_independent() {
-    let keypairs: Vec<SigningKeypair> = (1..=3).map(|i| test_keypair(i)).collect();
+    let keypairs: Vec<SigningKeypair> = (1..=3).map(test_keypair).collect();
     let pool = [10u8; 32];
 
     // Build aggregator with relays in one order
     let mut agg1 = Aggregator::new(Box::new(StubProver::new()));
+    #[allow(clippy::needless_range_loop)]
     for i in 0..3usize {
         let msg = signed_proof(&keypairs[i], pool, PoolType::Subscribed, (i as u64 + 1) * 100, (i as u64 + 1) * 100, [0u8; 32], [i as u8 + 0xAA; 32], 1000);
         agg1.handle_proof(msg).unwrap();

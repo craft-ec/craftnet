@@ -1,23 +1,24 @@
 //! TunnelCraft Exit Node
 //!
-//! Exit node logic: HTTP fetch and settlement submission.
+//! Exit node logic: HTTP fetch, TCP tunnel, and onion response creation.
 //!
 //! ## Responsibilities
 //!
-//! 1. Collect request shards from relays
-//! 2. Reconstruct HTTP request using erasure coding
-//! 3. Execute HTTP request to target
-//! 4. Fragment response into shards
-//! 5. Submit Phase 1 settlement (stores user_pubkey for verification)
-//! 6. Send response shards back through the network
+//! 1. Decrypt routing_tag to get assembly_id
+//! 2. Collect and group shards by assembly_id
+//! 3. Reconstruct via erasure coding and decrypt ExitPayload
+//! 4. Execute HTTP request or open TCP tunnel
+//! 5. Create onion-routed response shards via LeaseSet
 
 mod handler;
 mod request;
 mod response;
+mod tunnel_handler;
 
 pub use handler::{ExitHandler, ExitConfig};
 pub use request::HttpRequest;
 pub use response::HttpResponse;
+pub use tunnel_handler::TunnelHandler;
 
 use thiserror::Error;
 use tunnelcraft_erasure::ErasureError;
@@ -47,6 +48,12 @@ pub enum ExitError {
 
     #[error("Blocked destination: {0}")]
     BlockedDestination(String),
+
+    #[error("Tunnel connect failed: {0}")]
+    TunnelConnectFailed(String),
+
+    #[error("Tunnel I/O error: {0}")]
+    TunnelIoError(String),
 }
 
 pub type Result<T> = std::result::Result<T, ExitError>;

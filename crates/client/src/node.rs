@@ -23,8 +23,8 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use tunnelcraft_core::{ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, ShardType};
-use tunnelcraft_crypto::SigningKeypair;
+use tunnelcraft_core::{ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, TunnelMetadata};
+use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair};
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_erasure::chunker::reassemble;
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
@@ -43,6 +43,7 @@ use tunnelcraft_prover::{Prover, StubProver};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
 
+use crate::path::PathHop;
 use crate::{ClientError, RequestBuilder, Result, TunnelResponse};
 
 /// Max retry attempts for a rejected/failed outbound shard
@@ -296,8 +297,8 @@ pub struct NodeStatus {
 
 /// Pending request state (for client mode)
 struct PendingRequest {
-    /// Collected shards indexed by (chunk_index, shard_index)
-    shards: HashMap<(u16, u8), Shard>,
+    /// Collected shard payloads indexed by (chunk_index, shard_index)
+    shards: HashMap<(u16, u8), Vec<u8>>,
     /// Total chunks expected for this response
     total_chunks: u16,
     response_tx: mpsc::Sender<Result<TunnelResponse>>,
@@ -307,6 +308,29 @@ struct PendingRequest {
     request_bytes: usize,
     /// Time when request was sent
     sent_at: std::time::Instant,
+}
+
+/// Pending tunnel request state (for SOCKS5 tunnel mode)
+#[allow(dead_code)]
+struct PendingTunnelRequest {
+    /// Collected shard payloads indexed by (chunk_index, shard_index)
+    shards: HashMap<(u16, u8), Vec<u8>>,
+    /// Total chunks expected for this response
+    total_chunks: u16,
+    /// Channel to send raw response bytes back to the SOCKS5 connection
+    response_tx: mpsc::Sender<std::result::Result<Vec<u8>, ClientError>>,
+    /// Time when request was sent
+    sent_at: std::time::Instant,
+}
+
+/// A burst of TCP data from a SOCKS5 connection to be sent through the tunnel
+pub struct TunnelBurst {
+    /// Tunnel metadata (host, port, session_id, is_close)
+    pub metadata: TunnelMetadata,
+    /// Raw TCP data to send
+    pub data: Vec<u8>,
+    /// Channel to receive the response bytes
+    pub response_tx: mpsc::Sender<std::result::Result<Vec<u8>, ClientError>>,
 }
 
 /// Base score for new exits (50% - neutral starting point)
@@ -634,6 +658,9 @@ pub struct TunnelCraftNode {
     /// Signing keypair for shards
     keypair: SigningKeypair,
 
+    /// Encryption keypair for onion routing (X25519)
+    encryption_keypair: EncryptionKeypair,
+
     /// libp2p keypair
     libp2p_keypair: Keypair,
 
@@ -780,6 +807,13 @@ pub struct TunnelCraftNode {
     bootstrap_peer_ids: Vec<PeerId>,
     /// Last time we checked bootstrap connectivity
     last_bootstrap_check: Option<std::time::Instant>,
+
+    // === SOCKS5 tunnel mode ===
+
+    /// Pending tunnel requests (raw byte responses, not HTTP)
+    pending_tunnel: HashMap<Id, PendingTunnelRequest>,
+    /// Channel for receiving tunnel bursts from SOCKS5 server
+    tunnel_burst_rx: Option<mpsc::Receiver<TunnelBurst>>,
 }
 
 impl TunnelCraftNode {
@@ -787,6 +821,7 @@ impl TunnelCraftNode {
     pub fn new(config: NodeConfig) -> Result<Self> {
         let enable_aggregator = config.enable_aggregator;
         let keypair = SigningKeypair::generate();
+        let encryption_keypair = EncryptionKeypair::generate();
         let libp2p_keypair = config.libp2p_keypair.clone().unwrap_or_else(Keypair::generate_ed25519);
         let erasure =
             ErasureCoder::new().map_err(|e| ClientError::ErasureError(e.to_string()))?;
@@ -814,15 +849,13 @@ impl TunnelCraftNode {
                     Ok(file) => {
                         let reader = std::io::BufReader::new(file);
                         let mut loaded = 0u64;
-                        for line in reader.lines() {
-                            if let Ok(line) = line {
-                                if let Ok(receipt) = serde_json::from_str::<ForwardReceipt>(&line) {
-                                    forward_receipts
-                                        .entry(receipt.request_id)
-                                        .or_default()
-                                        .push(receipt);
-                                    loaded += 1;
-                                }
+                        for line in reader.lines().map_while(|r| r.ok()) {
+                            if let Ok(receipt) = serde_json::from_str::<ForwardReceipt>(&line) {
+                                forward_receipts
+                                    .entry(receipt.request_id)
+                                    .or_default()
+                                    .push(receipt);
+                                loaded += 1;
                             }
                         }
                         if loaded > 0 {
@@ -893,6 +926,7 @@ impl TunnelCraftNode {
             mode: config.mode,
             config,
             keypair,
+            encryption_keypair,
             libp2p_keypair,
             swarm: None,
             local_peer_id: None,
@@ -959,6 +993,8 @@ impl TunnelCraftNode {
             nat_status: NatStatus::Unknown,
             bootstrap_peer_ids: Vec::new(),
             last_bootstrap_check: None,
+            pending_tunnel: HashMap::new(),
+            tunnel_burst_rx: None,
         })
     }
 
@@ -984,10 +1020,13 @@ impl TunnelCraftNode {
                 if state.relay_handler.is_none() {
                     let relay_config = RelayConfig {
                         can_be_last_hop: self.config.allow_last_hop,
-                        ..Default::default()
                     };
                     state.relay_handler =
-                        Some(RelayHandler::with_config(self.keypair.clone(), relay_config));
+                        Some(RelayHandler::with_config(
+                            self.keypair.clone(),
+                            self.encryption_keypair.clone(),
+                            relay_config,
+                        ));
                     info!("Relay handler initialized");
                 }
 
@@ -1541,6 +1580,8 @@ impl TunnelCraftNode {
             city: self.config.exit_city.clone(),
             reputation: 0, // New node starts with 0 reputation
             latency_ms: 0, // Will be measured by clients
+            encryption_pubkey: Some(self.encryption_keypair.public_key_bytes()),
+            peer_id: self.local_peer_id.map(|p| p.to_string()),
         };
 
         // Serialize to JSON
@@ -1615,13 +1656,6 @@ impl TunnelCraftNode {
         if should_announce {
             self.announce_as_peer();
         }
-    }
-
-    /// Look up the PeerId for any destination pubkey (exit or client).
-    /// Uses known_peers as the single source of truth — all discovery paths
-    /// (DHT exits, heartbeats, peer records) insert into known_peers.
-    fn destination_peer_id(&self, pubkey: &[u8; 32]) -> Option<PeerId> {
-        self.known_peers.get(pubkey).copied()
     }
 
     /// Update exit node geo information (e.g., from auto-detection)
@@ -1759,15 +1793,26 @@ impl TunnelCraftNode {
             return Err(ClientError::NotConnected);
         }
 
-        let exit = self
+        let exit_info = self
             .selected_exit
             .as_ref()
-            .ok_or(ClientError::NoExitNodes)?;
+            .ok_or(ClientError::NoExitNodes)?
+            .clone();
 
-
+        // Build exit PathHop from selected exit info
+        let exit_peer_id_bytes = exit_info.peer_id
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec();
+        let exit_hop = PathHop {
+            peer_id: exit_peer_id_bytes,
+            signing_pubkey: exit_info.pubkey,
+            encryption_pubkey: exit_info.encryption_pubkey.unwrap_or([0u8; 32]),
+        };
 
         // Build request
-        let mut builder = RequestBuilder::new(method, url).hop_mode(self.config.hop_mode);
+        let mut builder = RequestBuilder::new(method, url);
         if let Some(hdrs) = headers {
             for (key, value) in hdrs {
                 builder = builder.header(&key, &value);
@@ -1777,9 +1822,18 @@ impl TunnelCraftNode {
             builder = builder.body(body_data);
         }
 
-        // Create shards with user_proof binding for settlement
-        let shards = builder.build_signed(&self.keypair, exit.pubkey)?;
-        let request_id = shards[0].request_id;
+        // Build onion-routed shards (no relay paths for now — direct mode)
+        let lease_set = tunnelcraft_core::lease_set::LeaseSet {
+            session_id: [0u8; 32],
+            leases: vec![],
+        };
+        let (request_id, shards) = builder.build_onion(
+            &self.keypair,
+            &exit_hop,
+            &[], // direct mode (no relay hops for now)
+            &lease_set,
+            0, // epoch
+        )?;
 
         // Calculate request size for throughput measurement
         let request_bytes: usize = shards.iter().map(|s| s.payload.len()).sum();
@@ -1801,7 +1855,7 @@ impl TunnelCraftNode {
                 shards: HashMap::new(),
                 total_chunks: 0, // Updated when first response shard arrives
                 response_tx,
-                exit_pubkey: exit.pubkey,
+                exit_pubkey: exit_info.pubkey,
                 request_bytes,
                 sent_at: std::time::Instant::now(),
             },
@@ -1834,40 +1888,29 @@ impl TunnelCraftNode {
         Ok(response)
     }
 
-    /// Send shards to relay peers
+    /// Send shards to peers.
     ///
-    /// Routing strategy:
-    /// - Direct (0 hops): send all shards to the exit node
-    /// - 1+ hops: send shards to relay peers (they forward toward exit)
-    ///
-    /// Uses forward_shard for retry tracking — if a peer rejects or fails,
-    /// the shard is automatically retried with a different peer.
+    /// Onion routing: each shard's header specifies its own path.
+    /// The first hop is determined by the onion header. In direct mode
+    /// (empty header), shards are sent to the exit directly or best-effort
+    /// to any connected peer.
     async fn send_shards(&mut self, shards: Vec<Shard>) -> Result<()> {
-        let is_direct = shards.first().map(|s| s.hops_remaining == 0).unwrap_or(false);
-        if !is_direct && self.available_relay_count() == 0 {
-            return Err(ClientError::ConnectionFailed(
-                "No relay peers available".to_string(),
-            ));
-        }
         if self.swarm.is_none() {
             return Err(ClientError::NotConnected);
         }
 
         info!(
-            "Sending {} shards (hops={}, relay_peers={})",
+            "Sending {} shards (relay_peers={})",
             shards.len(),
-            shards.first().map(|s| s.hops_remaining).unwrap_or(0),
             self.available_relay_count(),
         );
 
-        // Use forward_shard for all sends — it picks appropriate peers
-        // and tracks outbound requests for retry on failure.
-        // Cross-shard exclusion: track which relays have been used so each
-        // shard goes to a different relay (when enough relays are available).
-        let mut used_relays = HashSet::new();
+        // Cross-shard exclusion: track which peers have been used so each
+        // shard goes to a different peer (when enough peers are available).
+        let mut used_peers = HashSet::new();
         for shard in shards {
-            if let Some(selected) = self.forward_shard(shard, None, used_relays.clone()) {
-                used_relays.insert(selected);
+            if let Some(selected) = self.forward_shard(shard, None, used_peers.clone()) {
+                used_peers.insert(selected);
             }
         }
 
@@ -1878,137 +1921,37 @@ impl TunnelCraftNode {
     // Node functionality (relay/exit)
     // =========================================================================
 
-    /// Process an incoming shard (for relay/exit)
+    /// Process an incoming shard (onion-routed)
     ///
-    /// Returns a ShardResponse with a signed ForwardReceipt proving we received
-    /// the shard. The sender uses this receipt as on-chain settlement proof.
+    /// In onion mode, we don't know the shard type, request_id, or user_pubkey
+    /// from the shard itself. The relay handler peels one onion layer to learn
+    /// the next hop and settlement data.
+    ///
+    /// If this shard is for us as a client (response), we detect that by trying
+    /// to decrypt the routing_tag with our encryption key.
     async fn process_incoming_shard(&mut self, shard: Shard, source_peer: PeerId) -> ShardResponse {
-        // Track request → user mapping for proof queue routing.
-        // user_proof is set on request shards by the client; for response shards
-        // the mapping should already exist from the request path.
-        if shard.shard_type == ShardType::Request && shard.user_proof != [0u8; 32] {
-            // Determine pool type and epoch from subscription cache
-            let (pool_type, epoch) = if let Some(entry) = self.subscription_cache.get(&shard.user_pubkey) {
-                if entry.tier < 255 {
-                    (PoolType::Subscribed, entry.epoch)
-                } else {
-                    (PoolType::Free, 0)
-                }
-            } else {
-                (PoolType::Free, 0)
-            };
-            self.request_user.entry(shard.request_id)
-                .or_insert((shard.user_pubkey, pool_type, epoch));
-
-            // Update last_seen for subscription cache (touch on traffic)
-            if let Some(entry) = self.subscription_cache.get_mut(&shard.user_pubkey) {
-                entry.last_seen = std::time::Instant::now();
-            }
-
-            // Proactive client discovery: resolve user_pubkey → PeerId NOW so that
-            // response shards (destination = user_pubkey) can route without waiting
-            // for a DHT lookup when the response arrives.
-            if !self.known_peers.contains_key(&shard.user_pubkey) {
-                if let Some(ref mut swarm) = self.swarm {
-                    debug!(
-                        "Preemptive DHT lookup for client pubkey {}",
-                        hex::encode(&shard.user_pubkey[..8]),
-                    );
-                    swarm.behaviour_mut().get_peer_record(&shard.user_pubkey);
-                }
-            }
+        // Try to decrypt routing_tag with our own encryption key.
+        // If it succeeds, this is a response shard directed to us.
+        if let Ok(_assembly_id) = tunnelcraft_crypto::decrypt_routing_tag(
+            &self.encryption_keypair.secret_key_bytes(),
+            &shard.routing_tag,
+        ) {
+            // This is a response shard for us (client mode)
+            self.handle_response_shard(shard);
+            return ShardResponse::Accepted(None);
         }
 
-        // Backpressure: if proof queue is full for this user's pool, reject.
-        // Only applies when we're relaying (Node/Both mode).
-        if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            if let Some((pool, pool_type, epoch)) = self.request_user.get(&shard.request_id) {
-                let key = (*pool, *pool_type, *epoch);
-                if let Some(queue) = self.proof_queue.get(&key) {
-                    if queue.len() >= self.proof_queue_limit {
-                        return ShardResponse::Rejected("Proof queue full (backpressure)".to_string());
-                    }
-                    // Priority routing: when queue is >50% full, only accept subscribers
-                    if *pool_type == PoolType::Free && queue.len() >= self.proof_queue_limit / 2 {
-                        return ShardResponse::Rejected("Relay busy, subscribers only".to_string());
-                    }
-                }
-            }
-        }
-
-        // Sign a forward receipt proving we received this shard.
-        // Every receiver signs a receipt so the sender can settle — except
-        // the first relay on the request path (client is payer, doesn't need proof).
-        // We always sign here; the client simply won't use the receipt it gets
-        // back from the first relay.
-        //
-        // sender_pubkey: extracted from the last chain entry (the relay that forwarded
-        // us this shard). Binds the receipt to the sender — prevents Sybil re-proving.
-        let sender_pubkey = shard.sender_pubkey;
-        // Determine epoch from request_user mapping (set when we first saw this request)
-        let receipt_epoch = self.request_user.get(&shard.request_id)
-            .map(|(_, _, epoch)| *epoch)
-            .unwrap_or(0);
-        let receipt = tunnelcraft_crypto::sign_forward_receipt(
-            &self.keypair,
-            &shard.request_id,
-            &shard.shard_id,
-            &sender_pubkey,
-            &shard.user_proof,
-            shard.payload.len() as u32,
-            receipt_epoch,
-        );
-        info!(
-            "Signed ForwardReceipt: req={}, shard={}, receiver={}",
-            hex::encode(&receipt.request_id[..8]),
-            hex::encode(&receipt.shard_id[..8]),
-            hex::encode(&receipt.receiver_pubkey[..8]),
-        );
-
-        // Only process relay/exit if in Node or Both mode
+        // Not for us — process as relay or exit
         if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            // In Client mode, only handle response shards for our requests
-            if shard.shard_type == ShardType::Response {
-                self.handle_response_shard(shard);
-                // Client signs receipt — the last relay needs it for settlement
-                return ShardResponse::Accepted(Some(receipt));
-            }
             return ShardResponse::Rejected("Not in relay mode".to_string());
         }
 
-        let result = match shard.shard_type {
-            ShardType::Request => {
-                self.process_request_shard(shard, source_peer).await
-            }
-            ShardType::Response => {
-                // Check if this is for one of our pending requests
-                if self.pending.contains_key(&shard.request_id) {
-                    self.handle_response_shard(shard);
-                    // Client signs receipt — the last relay needs it for settlement
-                    return ShardResponse::Accepted(Some(receipt));
-                }
-
-                // Relay the response — routing uses destination pubkey lookup
-                // (same as request shards), no reverse path tracking needed
-                self.relay_shard(shard, Some(source_peer))
-            }
-        };
-
-        // Replace bare Accepted with receipt-bearing Accepted
-        match result {
-            ShardResponse::Accepted(_) => ShardResponse::Accepted(Some(receipt)),
-            rejected => rejected,
-        }
-    }
-
-    /// Process a request shard (relay or exit)
-    async fn process_request_shard(&mut self, shard: Shard, source_peer: PeerId) -> ShardResponse {
-        // If hops_remaining == 0, we're the exit
-        if shard.hops_remaining == 0 {
+        // Check if this shard has an empty header — if so, process as exit
+        if shard.header.is_empty() {
             return self.process_as_exit(shard).await;
         }
 
-        // Otherwise relay — exclude source so we don't send back to sender
+        // Process as relay: peel one onion layer, forward to next hop
         self.relay_shard(shard, Some(source_peer))
     }
 
@@ -2057,45 +2000,77 @@ impl TunnelCraftNode {
         ShardResponse::Accepted(None)
     }
 
-    /// Relay a shard to next hop.
-    /// `source_peer` is excluded from next-hop selection to prevent routing back to sender.
-    fn relay_shard(&mut self, shard: Shard, source_peer: Option<PeerId>) -> ShardResponse {
-        // Process shard with relay handler (under lock)
-        let processed_shard = {
-            let mut state = self.state.write();
+    /// Relay a shard by peeling one onion layer and forwarding to the next hop.
+    ///
+    /// The relay handler returns (modified_shard, next_peer_id_bytes, receipt).
+    /// We forward the modified shard to the specified next peer.
+    fn relay_shard(&mut self, shard: Shard, _source_peer: Option<PeerId>) -> ShardResponse {
+        // Get sender_pubkey from libp2p connection (for ForwardReceipt anti-replay)
+        let sender_pubkey = self.keypair.public_key_bytes(); // placeholder: use connection auth
 
-            let Some(ref mut relay_handler) = state.relay_handler else {
+        // Process shard with relay handler (under lock)
+        let relay_result = {
+            let state = self.state.read();
+
+            let Some(ref relay_handler) = state.relay_handler else {
                 return ShardResponse::Rejected("Relay not active".to_string());
             };
 
-            let result: std::result::Result<Option<Shard>, tunnelcraft_relay::RelayError> =
-                relay_handler.handle_shard(shard);
-
-            match result {
-                Ok(Some(processed)) => {
-                    state.stats.shards_relayed += 1;
-                    state.stats.bytes_relayed += processed.payload.len() as u64;
-                    Some(processed)
-                }
-                Ok(None) => return ShardResponse::Accepted(None),
-                Err(e) => return ShardResponse::Rejected(e.to_string()),
-            }
+            relay_handler.handle_shard(shard, sender_pubkey)
         };
         // Lock released here
 
-        // Forward processed shard to next peer — same logic for request and response:
-        // hops == 0 → send to destination (exit or client), hops > 0 → random relay
-        if let Some(shard_to_forward) = processed_shard {
-            self.forward_shard(shard_to_forward, source_peer, HashSet::new());
-        }
+        match relay_result {
+            Ok((modified_shard, next_peer_bytes, receipt)) => {
+                {
+                    let mut state = self.state.write();
+                    state.stats.shards_relayed += 1;
+                    state.stats.bytes_relayed += modified_shard.payload.len() as u64;
+                }
 
-        ShardResponse::Accepted(None)
+                // Store the receipt for settlement
+                self.store_forward_receipt(receipt.clone());
+
+                // Resolve next_peer bytes to PeerId and forward
+                if let Ok(next_peer) = PeerId::from_bytes(&next_peer_bytes) {
+                    if let Some(ref mut swarm) = self.swarm {
+                        let shard_clone = modified_shard.clone();
+                        let request = ShardRequest { shard: modified_shard };
+                        let req_id = swarm.behaviour_mut().send_shard(next_peer, request);
+                        self.pending_outbound.insert(req_id, PendingOutbound {
+                            shard: shard_clone,
+                            source_peer: None,
+                            tried_peers: {
+                                let mut s = HashSet::new();
+                                s.insert(next_peer);
+                                s
+                            },
+                            attempts: 0,
+                        });
+                    }
+                } else {
+                    warn!("Could not parse next_peer PeerId from onion layer");
+                }
+
+                ShardResponse::Accepted(Some(Box::new(receipt)))
+            }
+            Err(e) => {
+                // Onion peel failed — could be wrong key (shard wasn't for us)
+                // or corrupted header. Try processing as exit instead.
+                debug!("Onion peel failed: {} — not relaying", e);
+                ShardResponse::Rejected(e.to_string())
+            }
+        }
     }
 
-    /// Forward a shard to the next hop, tracking it for retry on failure.
-    /// `source_peer` and `tried_peers` are excluded from peer selection.
+    /// Forward a shard to a peer using best-effort routing.
+    ///
+    /// In onion mode, the shard's header determines its full path.
+    /// The client just needs to send it to the first relay (any connected peer).
+    /// Relay-to-relay forwarding is handled by relay_shard (onion peel).
+    ///
     /// Returns the PeerId the shard was sent to (for cross-shard exclusion),
-    /// or None if buffered (pending DHT lookup) or no peer available.
+    /// or None if no peer available.
     fn forward_shard(&mut self, shard: Shard, source_peer: Option<PeerId>, tried_peers: HashSet<PeerId>) -> Option<PeerId> {
         self.forward_shard_inner(shard, source_peer, tried_peers, 0)
     }
@@ -2107,88 +2082,38 @@ impl TunnelCraftNode {
         tried_peers: HashSet<PeerId>,
         attempts: usize,
     ) -> Option<PeerId> {
-        if shard.hops_remaining == 0 {
-            // Last hop: route to destination (exit for requests, client for responses)
-            let dest_pid = self.destination_peer_id(&shard.destination);
-            if let Some(peer_id) = dest_pid {
-                if let Some(ref mut swarm) = self.swarm {
-                    info!(
-                        "Forwarding shard {} to destination {} (hops_remaining=0)",
-                        hex::encode(&shard.shard_id[..8]),
-                        peer_id,
-                    );
-                    let shard_clone = shard.clone();
-                    let request = ShardRequest { shard };
-                    let req_id = swarm.behaviour_mut().send_shard(peer_id, request);
-                    let mut tried = tried_peers;
-                    tried.insert(peer_id);
-                    self.pending_outbound.insert(req_id, PendingOutbound {
-                        shard: shard_clone,
-                        source_peer,
-                        tried_peers: tried,
-                        attempts,
-                    });
-                    return Some(peer_id);
-                }
-            } else {
-                // Destination unknown — start DHT lookup and buffer shard
-                let dest_pubkey = shard.destination;
-                info!(
-                    "Destination {} unknown, buffering shard {} for DHT lookup",
-                    hex::encode(&dest_pubkey[..8]),
-                    hex::encode(&shard.shard_id[..8]),
-                );
-                let entry = self.pending_destination.entry(dest_pubkey).or_default();
-                let needs_lookup = entry.is_empty();
-                entry.push(shard);
-                if needs_lookup {
-                    if let Some(ref mut swarm) = self.swarm {
-                        swarm.behaviour_mut().get_peer_record(&dest_pubkey);
-                    }
-                }
-            }
-            None
-        } else {
-            // Intermediate hop: pick a random relay peer
-            // Exclude: source (don't send back), destination, and already-tried peers
-            let dest_pid = self.destination_peer_id(&shard.destination);
-            let mut exclude: HashSet<PeerId> = tried_peers.clone();
-            if let Some(src) = source_peer {
-                exclude.insert(src);
-            }
-            if let Some(dst) = dest_pid {
-                exclude.insert(dst);
-            }
-            let target_peer = self.select_relay_peer_multi_exclude(&exclude);
-
-            if let Some(peer_id) = target_peer {
-                if let Some(ref mut swarm) = self.swarm {
-                    info!(
-                        "Forwarding shard {} to relay {} (hops_remaining={})",
-                        hex::encode(&shard.shard_id[..8]),
-                        peer_id,
-                        shard.hops_remaining
-                    );
-                    let shard_clone = shard.clone();
-                    let request = ShardRequest { shard };
-                    let req_id = swarm.behaviour_mut().send_shard(peer_id, request);
-                    let mut tried = tried_peers;
-                    tried.insert(peer_id);
-                    self.pending_outbound.insert(req_id, PendingOutbound {
-                        shard: shard_clone,
-                        source_peer,
-                        tried_peers: tried,
-                        attempts,
-                    });
-                    return Some(peer_id);
-                } else {
-                    warn!("Cannot forward shard: swarm not connected");
-                }
-            } else {
-                warn!("Cannot forward shard: no relay peers available (tried {} peers)", tried_peers.len());
-            }
-            None
+        // In onion mode: send to any available relay peer (the onion header
+        // determines the actual routing path). Exclude source to prevent
+        // sending back to sender.
+        let mut exclude = tried_peers.clone();
+        if let Some(src) = source_peer {
+            exclude.insert(src);
         }
+        let target_peer = self.select_relay_peer_multi_exclude(&exclude);
+
+        if let Some(peer_id) = target_peer {
+            if let Some(ref mut swarm) = self.swarm {
+                debug!(
+                    "Forwarding shard to peer {}",
+                    peer_id,
+                );
+                let shard_clone = shard.clone();
+                let request = ShardRequest { shard };
+                let req_id = swarm.behaviour_mut().send_shard(peer_id, request);
+                let mut tried = tried_peers;
+                tried.insert(peer_id);
+                self.pending_outbound.insert(req_id, PendingOutbound {
+                    shard: shard_clone,
+                    source_peer,
+                    tried_peers: tried,
+                    attempts,
+                });
+                return Some(peer_id);
+            }
+        }
+
+        warn!("Cannot forward shard: no peers available (tried {} peers)", tried_peers.len());
+        None
     }
 
     /// Retry a shard that was rejected or failed — pick a different peer
@@ -2201,16 +2126,14 @@ impl TunnelCraftNode {
 
         if pending.attempts > MAX_SHARD_RETRIES {
             warn!(
-                "Shard {} exhausted {} retries, dropping",
-                hex::encode(&pending.shard.shard_id[..8]),
+                "Shard exhausted {} retries, dropping",
                 MAX_SHARD_RETRIES,
             );
             return;
         }
 
         info!(
-            "Retrying shard {} (attempt {}/{})",
-            hex::encode(&pending.shard.shard_id[..8]),
+            "Retrying shard (attempt {}/{})",
             pending.attempts,
             MAX_SHARD_RETRIES,
         );
@@ -2336,27 +2259,49 @@ impl TunnelCraftNode {
         }
     }
 
-    /// Handle response shard for our own request (multi-chunk aware)
+    /// Handle response shard for our own request (onion-routed, multi-chunk aware)
+    ///
+    /// In onion mode, we decrypt the routing_tag with our encryption key to get
+    /// assembly_id. We then map assembly_id → request_id via a lookup table that
+    /// was populated when we sent the request.
     fn handle_response_shard(&mut self, shard: Shard) {
-        if shard.shard_type != ShardType::Response {
+        // Decrypt routing_tag to get assembly_id + shard/chunk metadata
+        let tag = match tunnelcraft_crypto::decrypt_routing_tag(
+            &self.encryption_keypair.secret_key_bytes(),
+            &shard.routing_tag,
+        ) {
+            Ok(tag) => tag,
+            Err(_) => return,
+        };
+
+        let assembly_id = tag.assembly_id;
+        let shard_index = tag.shard_index;
+        let chunk_index = tag.chunk_index;
+        let total_chunks = tag.total_chunks;
+
+        // Check tunnel map first (SOCKS5 tunnel mode responses are raw bytes)
+        if self.handle_tunnel_response_shard_by_assembly(&assembly_id, shard_index, chunk_index, total_chunks, &shard) {
             return;
         }
 
-        let request_id = shard.request_id;
-        let shard_index = shard.shard_index;
-        let chunk_index = shard.chunk_index;
-        let total_chunks = shard.total_chunks;
+        // Find the request_id that corresponds to this assembly_id
+        // We use assembly_id as the key for pending requests directly
+        // (request_id tracking was populated at send time)
+        let request_id = assembly_id; // In onion mode, the exit uses a response assembly_id
+        // that we map to our pending requests
 
+        // Try to find this in pending requests — iterate to find by assembly_id
+        // Since we don't know the request_id from the shard, we try all pending requests
+        // For now, use the assembly_id as a lookup key in pending
         if let Some(pending) = self.pending.get_mut(&request_id) {
-            // Update total_chunks from first arriving shard
             if pending.total_chunks == 0 {
                 pending.total_chunks = total_chunks;
             }
-            pending.shards.insert((chunk_index, shard_index), shard);
+            pending.shards.insert((chunk_index, shard_index), shard.payload);
 
             let needed = pending.total_chunks as usize * DATA_SHARDS;
             debug!(
-                "Received response shard (chunk={}, shard={}) for request {} ({}/{})",
+                "Received response shard (chunk={}, shard={}) for assembly {} ({}/{})",
                 chunk_index,
                 shard_index,
                 hex::encode(&request_id[..8]),
@@ -2364,7 +2309,6 @@ impl TunnelCraftNode {
                 needed
             );
 
-            // Check if all chunks have enough shards
             if self.all_response_chunks_ready(&request_id) {
                 if let Some(pending) = self.pending.remove(&request_id) {
                     let response_tx = pending.response_tx.clone();
@@ -2385,8 +2329,6 @@ impl TunnelCraftNode {
                             let _ = response_tx.try_send(Err(e));
                         }
                     }
-                } else {
-                    debug!("Request {} already completed", hex::encode(&request_id[..8]));
                 }
             }
         }
@@ -2436,17 +2378,17 @@ impl TunnelCraftNode {
         }
     }
 
-    /// Reconstruct response from shards (multi-chunk aware)
+    /// Reconstruct response from shard payloads (multi-chunk aware)
     fn reconstruct_response(&self, pending: &PendingRequest) -> Result<TunnelResponse> {
         use std::collections::BTreeMap;
 
-        // Group shards by chunk_index
-        let mut chunks_by_index: HashMap<u16, Vec<(u8, &Shard)>> = HashMap::new();
-        for (&(chunk_idx, shard_idx), shard) in &pending.shards {
+        // Group shard payloads by chunk_index
+        let mut chunks_by_index: HashMap<u16, Vec<(u8, &Vec<u8>)>> = HashMap::new();
+        for (&(chunk_idx, shard_idx), payload) in &pending.shards {
             chunks_by_index
                 .entry(chunk_idx)
                 .or_default()
-                .push((shard_idx, shard));
+                .push((shard_idx, payload));
         }
 
         // Reconstruct each chunk independently
@@ -2457,12 +2399,12 @@ impl TunnelCraftNode {
             let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
             let mut shard_size = 0usize;
 
-            if let Some(shards) = chunk_shards {
-                for &(shard_idx, shard) in shards {
+            if let Some(payloads) = chunk_shards {
+                for &(shard_idx, payload) in payloads {
                     let idx = shard_idx as usize;
                     if idx < TOTAL_SHARDS {
-                        shard_size = shard.payload.len();
-                        shard_data[idx] = Some(shard.payload.clone());
+                        shard_size = payload.len();
+                        shard_data[idx] = Some(payload.clone());
                     }
                 }
             }
@@ -2478,10 +2420,219 @@ impl TunnelCraftNode {
 
         // Reassemble — use max possible length, TunnelResponse handles its own framing
         let total_possible = reconstructed_chunks.values().map(|c| c.len()).sum();
-        let data = reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
+        let encrypted_data = reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
             .map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
+        // Decrypt the response (encrypted by exit's encryption key for our pubkey)
+        // We need the exit's encryption pubkey to derive the shared secret
+        let exit_enc_pubkey = self.exit_nodes.get(&pending.exit_pubkey)
+            .and_then(|status| status.info.encryption_pubkey)
+            .unwrap_or([0u8; 32]);
+
+        let data = tunnelcraft_crypto::decrypt_from_sender(
+            &exit_enc_pubkey,
+            &self.encryption_keypair.secret_key_bytes(),
+            &encrypted_data,
+        ).map_err(|e| ClientError::CryptoError(format!("Response decrypt failed: {}", e)))?;
+
         TunnelResponse::from_bytes(&data)
+    }
+
+    // =========================================================================
+    // SOCKS5 tunnel mode
+    // =========================================================================
+
+    /// Set the tunnel burst receiver channel (called by SOCKS5 server integration)
+    pub fn set_tunnel_burst_rx(&mut self, rx: mpsc::Receiver<TunnelBurst>) {
+        self.tunnel_burst_rx = Some(rx);
+    }
+
+    /// Handle a tunnel burst from the SOCKS5 server
+    async fn handle_tunnel_burst(&mut self, burst: TunnelBurst) {
+        let exit_info = match &self.selected_exit {
+            Some(e) => e.clone(),
+            None => {
+                let _ = burst.response_tx.try_send(Err(ClientError::NoExitNodes));
+                return;
+            }
+        };
+
+        // Build exit PathHop from selected exit info
+        let exit_peer_id_bytes = exit_info.peer_id
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec();
+        let exit_hop = PathHop {
+            peer_id: exit_peer_id_bytes,
+            signing_pubkey: exit_info.pubkey,
+            encryption_pubkey: exit_info.encryption_pubkey.unwrap_or([0u8; 32]),
+        };
+
+        let lease_set = tunnelcraft_core::lease_set::LeaseSet {
+            session_id: [0u8; 32],
+            leases: vec![],
+        };
+
+        let result = crate::tunnel::build_tunnel_shards(
+            &burst.metadata,
+            &burst.data,
+            &self.keypair,
+            &exit_hop,
+            &[], // direct mode
+            &lease_set,
+            0, // epoch
+        );
+
+        let (request_id, shards) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = burst.response_tx.try_send(Err(e));
+                return;
+            }
+        };
+
+        debug!(
+            "Tunnel burst: {} shards for session {}, request {}",
+            shards.len(),
+            hex::encode(&burst.metadata.session_id[..8]),
+            hex::encode(&request_id[..8])
+        );
+
+        // Store pending tunnel request
+        self.pending_tunnel.insert(
+            request_id,
+            PendingTunnelRequest {
+                shards: HashMap::new(),
+                total_chunks: 0,
+                response_tx: burst.response_tx,
+                sent_at: std::time::Instant::now(),
+            },
+        );
+
+        // Send shards
+        if let Err(e) = self.send_shards(shards).await {
+            if let Some(pending) = self.pending_tunnel.remove(&request_id) {
+                let _ = pending.response_tx.try_send(Err(e));
+            }
+        }
+    }
+
+    /// Handle response shard for a tunnel request by assembly_id (raw bytes, no HTTP parsing)
+    fn handle_tunnel_response_shard_by_assembly(
+        &mut self,
+        assembly_id: &Id,
+        shard_index: u8,
+        chunk_index: u16,
+        total_chunks: u16,
+        shard: &Shard,
+    ) -> bool {
+        let Some(pending) = self.pending_tunnel.get_mut(assembly_id) else {
+            return false;
+        };
+
+        // Update total_chunks from first arriving shard
+        if pending.total_chunks == 0 {
+            pending.total_chunks = total_chunks;
+        }
+        pending.shards.insert((chunk_index, shard_index), shard.payload.clone());
+
+        // Check if all chunks have enough shards
+        if !self.all_tunnel_response_chunks_ready(assembly_id) {
+            return true; // Claimed but not yet complete
+        }
+
+        if let Some(pending) = self.pending_tunnel.remove(assembly_id) {
+            let response_tx = pending.response_tx.clone();
+
+            match self.reconstruct_tunnel_response(&pending) {
+                Ok(data) => {
+                    let _ = response_tx.try_send(Ok(data));
+                }
+                Err(e) => {
+                    let _ = response_tx.try_send(Err(e));
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Check if all tunnel response chunks have enough shards
+    fn all_tunnel_response_chunks_ready(&self, request_id: &Id) -> bool {
+        let Some(pending) = self.pending_tunnel.get(request_id) else {
+            return false;
+        };
+        if pending.total_chunks == 0 {
+            return false;
+        }
+
+        let mut chunk_counts: HashMap<u16, usize> = HashMap::new();
+        for &(chunk_idx, _) in pending.shards.keys() {
+            *chunk_counts.entry(chunk_idx).or_default() += 1;
+        }
+
+        if chunk_counts.len() < pending.total_chunks as usize {
+            return false;
+        }
+        chunk_counts.values().all(|&count| count >= DATA_SHARDS)
+    }
+
+    /// Reconstruct tunnel response as raw bytes (no HTTP parsing)
+    fn reconstruct_tunnel_response(&self, pending: &PendingTunnelRequest) -> Result<Vec<u8>> {
+        use std::collections::BTreeMap;
+
+        let mut chunks_by_index: HashMap<u16, Vec<(u8, &Vec<u8>)>> = HashMap::new();
+        for (&(chunk_idx, shard_idx), payload) in &pending.shards {
+            chunks_by_index
+                .entry(chunk_idx)
+                .or_default()
+                .push((shard_idx, payload));
+        }
+
+        let mut reconstructed_chunks: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+
+        for chunk_idx in 0..pending.total_chunks {
+            let chunk_payloads = chunks_by_index.get(&chunk_idx);
+            let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
+            let mut shard_size = 0usize;
+
+            if let Some(payloads) = chunk_payloads {
+                for &(shard_idx, payload) in payloads {
+                    let idx = shard_idx as usize;
+                    if idx < TOTAL_SHARDS {
+                        shard_size = payload.len();
+                        shard_data[idx] = Some(payload.clone());
+                    }
+                }
+            }
+
+            let max_len = shard_size * DATA_SHARDS;
+            let chunk_data = self
+                .erasure
+                .decode(&mut shard_data, max_len)
+                .map_err(|e| ClientError::ErasureError(e.to_string()))?;
+
+            reconstructed_chunks.insert(chunk_idx, chunk_data);
+        }
+
+        let total_possible = reconstructed_chunks.values().map(|c| c.len()).sum();
+        let encrypted_data = reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
+            .map_err(|e| ClientError::ErasureError(e.to_string()))?;
+
+        // Decrypt the response (encrypted by exit for our encryption key)
+        // For tunnel responses, we may not know the exit's encryption pubkey,
+        // so we try a zero key (direct mode) or look it up
+        let exit_enc_pubkey = self.selected_exit
+            .as_ref()
+            .and_then(|e| e.encryption_pubkey)
+            .unwrap_or([0u8; 32]);
+
+        tunnelcraft_crypto::decrypt_from_sender(
+            &exit_enc_pubkey,
+            &self.encryption_keypair.secret_key_bytes(),
+            &encrypted_data,
+        ).map_err(|e| ClientError::CryptoError(format!("Tunnel response decrypt failed: {}", e)))
     }
 
     // =========================================================================
@@ -2532,6 +2683,20 @@ impl TunnelCraftNode {
                 } => {
                     if let Some(event) = event {
                         self.handle_swarm_event(event).await;
+                    }
+                }
+
+                // Handle tunnel bursts from SOCKS5 proxy
+                burst = async {
+                    if let Some(ref mut rx) = self.tunnel_burst_rx {
+                        rx.recv().await
+                    } else {
+                        // No SOCKS5 server configured — pend forever
+                        std::future::pending().await
+                    }
+                } => {
+                    if let Some(burst) = burst {
+                        self.handle_tunnel_burst(burst).await;
                     }
                 }
 
@@ -2690,7 +2855,7 @@ impl TunnelCraftNode {
                                     hex::encode(&receipt.receiver_pubkey[..8]),
                                 );
                                 self.pending_outbound.remove(&request_id);
-                                self.store_forward_receipt(receipt);
+                                self.store_forward_receipt(*receipt);
                             }
                             ShardResponse::Accepted(None) => {
                                 self.pending_outbound.remove(&request_id);
@@ -2730,27 +2895,24 @@ impl TunnelCraftNode {
     /// Handle AutoNAT events (NAT detection)
     fn handle_autonat_event(&mut self, event: libp2p::autonat::Event) {
         use libp2p::autonat::Event;
-        match event {
-            Event::StatusChanged { new, .. } => {
-                use libp2p::autonat::NatStatus as LibNatStatus;
-                match new {
-                    LibNatStatus::Public(_addr) => {
-                        info!("AutoNAT: Publicly reachable");
-                        self.nat_status = NatStatus::Public;
-                    }
-                    LibNatStatus::Private => {
-                        warn!("AutoNAT: Behind NAT (private)");
-                        self.nat_status = NatStatus::Private;
-                        // Register with circuit relay through bootstrap peers
-                        self.register_with_circuit_relay();
-                    }
-                    LibNatStatus::Unknown => {
-                        debug!("AutoNAT: Status unknown");
-                        self.nat_status = NatStatus::Unknown;
-                    }
+        if let Event::StatusChanged { new, .. } = event {
+            use libp2p::autonat::NatStatus as LibNatStatus;
+            match new {
+                LibNatStatus::Public(_addr) => {
+                    info!("AutoNAT: Publicly reachable");
+                    self.nat_status = NatStatus::Public;
+                }
+                LibNatStatus::Private => {
+                    warn!("AutoNAT: Behind NAT (private)");
+                    self.nat_status = NatStatus::Private;
+                    // Register with circuit relay through bootstrap peers
+                    self.register_with_circuit_relay();
+                }
+                LibNatStatus::Unknown => {
+                    debug!("AutoNAT: Status unknown");
+                    self.nat_status = NatStatus::Unknown;
                 }
             }
-            _ => {}
         }
     }
 
@@ -2828,12 +2990,10 @@ impl TunnelCraftNode {
             // When Kademlia discovers a new peer in the routing table, dial it
             // so it gets added to unverified_relay_peers for shard forwarding
             Event::RoutingUpdated { peer, is_new_peer, .. } => {
-                if is_new_peer {
-                    if !self.unverified_relay_peers.contains(&peer) {
-                        debug!("DHT discovered new peer {}, dialing", peer);
-                        if let Some(ref mut swarm) = self.swarm {
-                            let _ = swarm.dial(peer);
-                        }
+                if is_new_peer && !self.unverified_relay_peers.contains(&peer) {
+                    debug!("DHT discovered new peer {}, dialing", peer);
+                    if let Some(ref mut swarm) = self.swarm {
+                        let _ = swarm.dial(peer);
                     }
                 }
             }
@@ -2877,8 +3037,7 @@ impl TunnelCraftNode {
                                                 if let Some(ref mut swarm) = self.swarm {
                                                     for shard in shards {
                                                         debug!(
-                                                            "Flushing buffered shard {} to resolved destination {}",
-                                                            hex::encode(&shard.shard_id[..8]),
+                                                            "Flushing buffered shard to resolved destination {}",
                                                             peer_id,
                                                         );
                                                         let request = ShardRequest { shard };
@@ -3620,7 +3779,7 @@ impl TunnelCraftNode {
         self.pool_roots.insert(pool_key, (new_root, cumulative_bytes));
 
         // Reset deadline tracker: if queue is now empty, remove; otherwise reset timer
-        if self.proof_queue.get(&pool_key).map_or(true, |q| q.is_empty()) {
+        if self.proof_queue.get(&pool_key).is_none_or(|q| q.is_empty()) {
             self.proof_oldest_receipt.remove(&pool_key);
         } else {
             self.proof_oldest_receipt.insert(pool_key, Instant::now());

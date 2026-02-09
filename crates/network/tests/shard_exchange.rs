@@ -15,21 +15,13 @@ use tunnelcraft_network::{
     TunnelCraftBehaviour, TunnelCraftBehaviourEvent, PeerId,
 };
 
-/// Create a test shard
+/// Create a test shard using the new onion format
 fn create_test_shard() -> Shard {
-    let user_pubkey = [4u8; 32];
-    Shard::new_request(
-        [1u8; 32],  // shard_id
-        [2u8; 32],  // request_id
-        user_pubkey, // user_pubkey
-        [5u8; 32],  // destination
-        2,          // hops_remaining
-        b"test payload".to_vec(),
-        0,          // shard_index
-        5,          // total_shards
-        2,          // total_hops
-        0,          // chunk_index
-        1,          // total_chunks
+    Shard::new(
+        [1u8; 32],              // ephemeral_pubkey
+        vec![2u8; 64],          // header (onion layers)
+        b"test payload".to_vec(), // payload
+        vec![3u8; 92],          // routing_tag
     )
 }
 
@@ -202,8 +194,8 @@ async fn test_shard_send_and_receive() {
                         if let Event::Message { message: libp2p::request_response::Message::Response { response, .. }, .. } = shard_event {
                             assert!(matches!(response, ShardResponse::Accepted(_)));
                             got_response = true;
-                            if received_shard.is_some() {
-                                return (received_shard.unwrap(), true);
+                            if let Some(shard) = received_shard.take() {
+                                return (shard, true);
                             }
                         }
                     }
@@ -229,9 +221,9 @@ async fn test_shard_send_and_receive() {
 
     let (received, success) = result;
     assert!(success);
-    assert_eq!(received.shard_id, shard.shard_id);
-    assert_eq!(received.request_id, shard.request_id);
+    assert_eq!(received.ephemeral_pubkey, shard.ephemeral_pubkey);
     assert_eq!(received.payload, shard.payload);
+    assert_eq!(received.routing_tag, shard.routing_tag);
 }
 
 #[tokio::test]
@@ -287,10 +279,8 @@ async fn test_shard_rejection() {
                 event = swarm1.select_next_some() => {
                     if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
                         use libp2p::request_response::Event;
-                        if let Event::Message { message: libp2p::request_response::Message::Response { response, .. }, .. } = shard_event {
-                            if let ShardResponse::Rejected(reason) = response {
-                                return reason;
-                            }
+                        if let Event::Message { message: libp2p::request_response::Message::Response { response: ShardResponse::Rejected(reason), .. }, .. } = shard_event {
+                            return reason;
                         }
                     }
                 }
@@ -357,9 +347,12 @@ async fn test_multiple_shards_erasure_coding() {
 
     // Send 5 shards (simulating 5/3 erasure coding)
     for i in 0..5u8 {
-        let mut shard = create_test_shard();
-        shard.shard_id = [i + 10; 32];
-        shard.shard_index = i;
+        let shard = Shard::new(
+            [1u8; 32],
+            vec![2u8; 64],
+            format!("payload_{}", i).into_bytes(),
+            vec![3u8; 92],
+        );
         let request = ShardRequest { shard };
         swarm1.behaviour_mut().send_shard(peer2, request);
     }

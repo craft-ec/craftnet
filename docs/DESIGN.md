@@ -2,19 +2,20 @@
 
 ## Executive Summary
 
-TunnelCraft is a decentralized, trustless VPN network that provides strong privacy through fragmentation. The design achieves practical anonymity with cryptographic verification at every step.
+TunnelCraft is a decentralized, trustless VPN network. It is **private but not anonymous** — no single node sees the full picture, and decentralization eliminates the single trust point that centralized VPNs require.
 
-**Key Innovation**: Privacy through fragmentation. Trustless through verification.
+**Key Innovation**: Privacy through fragmentation + decentralized relay operators + trustless verification.
 
 ---
 
 ## Core Philosophy
 
 ```
-Every node is equal. No dedicated servers.
+No single trust point. Independent relay operators.
 No trust required. Only cryptographic verification.
-Random routing. Network decides path.
-User controls privacy level. Network handles routing.
+Best-effort routing. Network finds fastest path.
+User controls privacy level (min relay count).
+L4 TCP tunneling. TLS end-to-end.
 ```
 
 ---
@@ -26,18 +27,16 @@ User controls privacy level. Network handles routing.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   LIBP2P KADEMLIA DHT                                        │
-│   • Peer discovery                                           │
-│   • Exit lookup                                              │
-│   • One-time pubkey announcement                             │
-│   • NAT traversal                                            │
-│   • Subscription gossip                                      │
+│   LIBP2P                                                     │
+│   • Kademlia DHT: peer/exit discovery                        │
+│   • Gossipsub: subscription status, topology                 │
+│   • NAT traversal via circuit relay                          │
 │                                                              │
 │   SOLANA                                                     │
-│   • Subscriptions                                            │
+│   • Subscriptions (tier + expiry)                            │
 │   • Per-user reward pools                                    │
-│   • Receipt submission + claims                              │
-│   • Rewards                                                  │
+│   • ForwardReceipt submission + claims                       │
+│   • Bandwidth-weighted settlement                            │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -46,61 +45,86 @@ User controls privacy level. Network handles routing.
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| P2P | libp2p Kademlia DHT | Discovery, NAT traversal, subscription gossip |
-| Coding | Reed-Solomon (5/3) | Resilience, fragmentation |
-| Routing | Destination-based with DHT | Anonymity, load distribution |
-| Proof | ForwardReceipts (ed25519) | Proof of forwarding |
+| P2P | libp2p (Kademlia, gossipsub) | Discovery, NAT traversal, subscription gossip |
+| Coding | Reed-Solomon (5/3, 3KB chunks) | Resilience, fragmentation |
+| Routing | Best-effort with min relay count | Privacy, load distribution |
+| Proof | ForwardReceipts (ed25519) | Proof of forwarding + bandwidth |
 | Settlement | Solana (per-user pool) | Subscription + proportional claiming |
+
+---
+
+## Two Operating Modes
+
+### TCP Tunnel Mode (L4, Primary)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│   Browser/App → SOCKS5 proxy (localhost:1080)                │
+│     → TunnelCraft network → Exit node                        │
+│       → Raw TCP connection to destination                    │
+│                                                              │
+│   Exit sees: host:port + TLS ciphertext                      │
+│   Exit does NOT see: URLs, headers, request bodies           │
+│   TLS is end-to-end: browser ↔ destination                   │
+│                                                              │
+│   Payload prefix: 0x01                                       │
+│   Metadata: TunnelMetadata { host, port, session_id }        │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### HTTP Mode (L7, Legacy)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│   Client builds HTTP request shards                          │
+│     → TunnelCraft network → Exit node                        │
+│       → Exit fetches URL via reqwest                         │
+│                                                              │
+│   Exit sees: full HTTP request (URL, headers, body)          │
+│   For HTTPS: exit terminates TLS with destination            │
+│                                                              │
+│   Payload prefix: 0x00 (default)                             │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Routing Model
 
-### User Controls Privacy, Network Controls Path
+### Best-Effort with Minimum Relay Count
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   USER DECIDES                                               │
-│   • Hop count (0, 1, 2, 3)                                   │
+│   • Minimum relay count (0, 1, 2, 3)                         │
 │   • Which exits to use                                       │
 │                                                              │
 │   NETWORK DECIDES                                            │
-│   • Actual path (random per shard)                           │
+│   • Actual path (best-effort fastest)                        │
 │   • Which relays                                             │
 │                                                              │
-│   RESULT                                                     │
-│   • Each shard takes different route                         │
-│   • No bottleneck                                            │
-│   • Maximum anonymity                                        │
+│   NEVER DROPS                                                │
+│   • hops_remaining > 0: forward to a relay, decrement        │
+│   • hops_remaining = 0: forward toward exit                  │
+│   • Can't reach exit directly: forward to a peer that can    │
+│   • Shards are NEVER dropped due to missing peers            │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Hop Modes
+### Privacy Levels
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                                                              │
-│   0 HOP                                                      │
-│   User → Exit                                                │
-│   Fast, less private                                         │
-│                                                              │
-│   1+ HOP                                                     │
-│   User → [random relays] → Exit                              │
-│   Shard: hops_remaining = N                                  │
-│   Each relay: pick random next, decrement, sign              │
-│   When hops_remaining = 0: forward to exit                   │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-| Mode | Hops | Latency | Privacy |
-|------|------|---------|---------|
-| Direct | 0 | ~30ms | Exit sees IP |
-| Light | 1 | ~60ms | 1 relay hides IP |
-| Standard | 2 | ~90ms | Good privacy |
-| Paranoid | 3 | ~120ms | Maximum privacy |
+| Mode | Min relays | Path | Privacy |
+|------|-----------|------|---------|
+| Direct | 0 | client → exit | Exit sees client IP |
+| Light | 1 | client → relay → exit | 1 relay hides IP from exit |
+| Standard | 2 | client → relay1 → relay2 → exit | No single node sees both |
+| Paranoid | 3 | client → relay1 → relay2 → relay3 → exit | Maximum privacy |
 
 ---
 
@@ -118,10 +142,12 @@ User controls privacy level. Network handles routing.
 │   B forwards to Exit → Exit signs receipt for B              │
 │                                                              │
 │   Each receipt proves: "I received this shard"               │
-│   Receipt includes: request_id, shard_index,                 │
-│                     receiver_pubkey, timestamp, sig          │
+│   Receipt includes: request_id, shard_id,                    │
+│     sender_pubkey, receiver_pubkey, user_proof,              │
+│     payload_size, epoch, timestamp, signature                │
 │                                                              │
 │   Receipts are the ONLY settlement primitive.                │
+│   Bandwidth-weighted: payload_size matters.                  │
 │   No credit indexes, no bitmap, no sequencer.                │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
@@ -178,6 +204,7 @@ User controls privacy level. Network handles routing.
 │                                                              │
 │   USER                                                       │
 │   Verified by: On-chain SubscriptionPDA (active tier)        │
+│   Bound by: user_proof = SHA256(request_id || pubkey || sig) │
 │                                                              │
 │   RELAY                                                      │
 │   Verified by: ForwardReceipt from next hop                  │
@@ -212,6 +239,8 @@ User controls privacy level. Network handles routing.
 │                                                              │
 │   2. RELAYS FORWARD SHARDS                                   │
 │      Collect ForwardReceipts as proof of work                │
+│      Receipts include payload_size for bandwidth weighting   │
+│      user_proof binds receipts to user's pool                │
 │      Subscribed users get priority processing                │
 │      Non-subscribed users get best-effort                    │
 │                                                              │
@@ -221,8 +250,8 @@ User controls privacy level. Network handles routing.
 │      Increments relay's receipt count for that pool          │
 │                                                              │
 │   4. END OF CYCLE: CLAIM REWARDS                             │
-│      relay_share = relay_receipts / total_receipts           │
-│      relay_payout = relay_share * pool_balance               │
+│      Weighted by bandwidth: sum(payload_size) per relay      │
+│      relay_payout = relay_bandwidth / total_bandwidth * pool │
 │      Pull-based: relay claims its weighted share             │
 │                                                              │
 │   5. POOL RESETS                                             │
@@ -239,9 +268,6 @@ User controls privacy level. Network handles routing.
 | Basic | 5 USDC | 10 GB | 5 USDC |
 | Standard | 15 USDC | 100 GB | 15 USDC |
 | Premium | 40 USDC | 1 TB + best-effort beyond | 40 USDC |
-
-Premium users who exhaust their pool still get service at lower
-priority (subsidized by network goodwill / best-effort).
 
 ### Why Per-User Pool (Not Global Pool)
 
@@ -268,6 +294,44 @@ priority (subsidized by network goodwill / best-effort).
 
 ---
 
+## Privacy Model
+
+### Private But Not Anonymous
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│   RELAYS SEE:                                                │
+│   • user_pubkey (pseudonymous, not real identity)            │
+│   • destination (exit pubkey)                                │
+│   • opaque encrypted payload                                 │
+│                                                              │
+│   RELAYS DON'T SEE:                                          │
+│   • Actual content (TLS end-to-end via SOCKS5)               │
+│   • Client's real identity or IP (after 1+ relays)           │
+│                                                              │
+│   EXIT SEES:                                                 │
+│   • host:port + TLS ciphertext (tunnel mode)                 │
+│   • Cannot read content                                      │
+│                                                              │
+│   NO SINGLE ENTITY SEES THE FULL PICTURE                     │
+│   Relay operators are independent, not one company           │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Competitive Position
+
+| Product | Hops | Centralized? | Content private? | Routing metadata hidden? | Trust model |
+|---------|------|-------------|-----------------|-------------------------|-------------|
+| NordVPN/ExpressVPN | 1 | Yes | Yes (HTTPS) | No — provider sees all | Trust the company |
+| Mullvad multi-hop | 2 | Yes | Yes | Split — same company | Trust the company |
+| **TunnelCraft** | **2+** | **No** | **Yes (TLS e2e)** | **Split — independent operators** | **No single trust point** |
+| Tor | 3 | No | Yes | Yes — onion encryption | No trust needed |
+| Nym | 3 | No | Yes | Yes + timing obfuscation | No trust needed |
+
+---
+
 ## Subscription Verification
 
 ### Gossip-Based (Zero RPC)
@@ -291,30 +355,6 @@ priority (subsidized by network goodwill / best-effort).
 │   • Catches fake gossip messages                             │
 │   • Fakers reported for abuse                                │
 │                                                              │
-│   CACHING BEHAVIOR:                                          │
-│   • Every relay caches independently                         │
-│   • First request through a relay: cache miss → best-effort  │
-│   • Subsequent requests: cache hit → instant priority        │
-│   • Active subscriptions cached until expires_at             │
-│   • Natural latency penalty for non-subscribers              │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### No Relay Attestation
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                                                              │
-│   WHY NOT "FIRST RELAY ATTESTS, REST SKIP CHECK"?            │
-│                                                              │
-│   Attack: User runs custom first relay                       │
-│   → Forges "subscribed" attestation                          │
-│   → Gets priority service for free at all subsequent hops    │
-│                                                              │
-│   Solution: Every relay verifies independently (via cache)   │
-│   No relay trusts another relay's attestation.               │
-│                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -332,35 +372,52 @@ priority (subsidized by network goodwill / best-effort).
 │     request_id: bytes32,                                     │
 │     user_pubkey: pubkey,                                     │
 │     destination: exit_pubkey,                                │
-│     hops_remaining: u8,                                      │
-│     chain: [ChainEntry],     // Signature chain              │
+│     user_proof: bytes32,        // SHA256(req_id||pk||sig)   │
+│     hops_remaining: u8,         // Decremented per relay     │
+│     total_hops: u8,             // Never decremented         │
+│     sender_pubkey: pubkey,      // Last relay's identity     │
 │     payload: encrypted,                                      │
-│     shard_index: u8,                                         │
-│     total_shards: u8,                                        │
+│     shard_index: u8,            // 0-4 within chunk          │
+│     total_shards: u8,           // 5                         │
+│     chunk_index: u16,           // Which 3KB chunk           │
+│     total_chunks: u16,          // Total chunks in request   │
 │   }                                                          │
 │                                                              │
-│   No credit_hash, no credit_indexes, no credit_auth.         │
-│   Payment is handled by the subscription pool model.         │
+│   No credit_hash, no credit_indexes, no ChainEntry vec.      │
+│   sender_pubkey replaces the chain — only last hop tracked.  │
+│   user_proof binds to settlement pool.                       │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Response Shard
+---
+
+## Erasure Coding
+
+### Parameters
+
+```
+Data shards: 3
+Parity shards: 2
+Total shards: 5
+Chunk size: 3KB (before encoding, ~1KB per shard)
+Redundancy ratio: 1.67x
+```
+
+### Chunked Encoding
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   {                                                          │
-│     shard_id: bytes32,                                       │
-│     request_id: bytes32,                                     │
-│     user_pubkey: pubkey,                                     │
-│     destination: user_pubkey,   // Must match request        │
-│     hops_remaining: u8,                                      │
-│     chain: [ChainEntry],                                     │
-│     payload: encrypted,                                      │
-│     shard_index: u8,                                         │
-│     total_shards: u8,                                        │
-│   }                                                          │
+│   Large payload (e.g. 9KB)                                   │
+│   → Split into 3KB chunks: [chunk_0, chunk_1, chunk_2]       │
+│   → Each chunk → 5 shard payloads (~1KB each)                │
+│   → Total: 3 chunks × 5 shards = 15 shards                  │
+│                                                              │
+│   Each shard carries chunk_index and total_chunks             │
+│   Exit collects 3+ shards per chunk to reconstruct           │
+│                                                              │
+│   Small payload (<3KB) → 1 chunk → 5 shards                  │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -375,65 +432,26 @@ priority (subsidized by network goodwill / best-effort).
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   ATTACK: Exit redirects response to colluding user         │
-│                                                              │
-│   1. Real user (ABC) sends request                           │
-│   2. Exit tries response to colluder (XYZ)                   │
-│   3. First relay checks: XYZ == ABC?                         │
-│   4. No → Drop                                               │
-│   5. Attack dies at first relay                              │
-│                                                              │
-│   ─────────────────────────────────────────────────          │
+│   → Relay checks destination == cached origin → Drop         │
 │                                                              │
 │   ATTACK: Relay submits same receipt twice                   │
-│                                                              │
-│   1. Receipt deduped by (request_id, shard_index,            │
-│      receiver_pubkey) on-chain                               │
-│   2. Second submission rejected                              │
-│                                                              │
-│   ─────────────────────────────────────────────────          │
+│   → Deduped by (request_id, shard_index, receiver_pubkey)    │
 │                                                              │
 │   ATTACK: Relay forges a ForwardReceipt                      │
-│                                                              │
-│   1. Receipt is ed25519 signed by receiver                   │
-│   2. Can't forge without receiver's private key              │
-│   3. On-chain verifies signature                             │
-│                                                              │
-│   ─────────────────────────────────────────────────          │
+│   → ed25519 signed by receiver — can't forge                 │
 │                                                              │
 │   ATTACK: Relay doesn't forward, claims receipt              │
+│   → No forwarding → no receipt from next hop                 │
 │                                                              │
-│   1. No forwarding → no receipt from next hop                │
-│   2. Can't claim without receipt                             │
-│                                                              │
-│   ─────────────────────────────────────────────────          │
-│                                                              │
-│   ATTACK: User spams overlapping requests (abuse)            │
-│                                                              │
-│   1. More receipts against user's pool                       │
-│   2. Per-receipt value drops                                 │
-│   3. Relays detect low yield per receipt                     │
-│   4. Relays stop serving that user                           │
-│   5. Abuse is self-correcting and self-contained             │
-│   6. Other users' pools unaffected                           │
-│                                                              │
-│   ─────────────────────────────────────────────────          │
-│                                                              │
-│   ATTACK: Pool inflation via colluding exit                  │
-│                                                              │
-│   1. Per-user pool: colluding exit only inflates             │
-│      receipts against the abuser's OWN pool                  │
-│   2. Exit's per-receipt yield drops                          │
-│   3. No dilution of honest users' pools                      │
-│   4. No global pool to drain                                 │
-│                                                              │
-│   ─────────────────────────────────────────────────          │
+│   ATTACK: User spams to inflate pool receipts                │
+│   → Per-user pool: only dilutes own pool                     │
+│   → Relays detect low yield → stop serving                   │
 │                                                              │
 │   ATTACK: Fake subscription via gossip                       │
+│   → Random audit catches fakers in minutes                   │
 │                                                              │
-│   1. Malicious node gossips "user X is subscribed"           │
-│   2. Random audit: relay spot-checks on-chain                │
-│   3. Fake caught → user reported for abuse                   │
-│   4. Bounded damage: free priority for a few minutes         │
+│   ATTACK: Receipt replay across epochs                       │
+│   → ForwardReceipt.epoch prevents cross-epoch replay         │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -446,129 +464,97 @@ priority (subsidized by network goodwill / best-effort).
 | Subscription | Gossip + random audit | Active subscription verified |
 | Proof of work | On-chain | ForwardReceipt signature valid |
 | Anti-double-claim | On-chain | Receipt deduped by unique tuple |
+| Anti-replay | On-chain | Epoch field prevents cross-epoch |
 | Anti-abuse | Per-user pool | Abuse dilutes abuser's own pool only |
 | Priority | Relays | Subscribed → priority, else best-effort |
+| Settlement binding | user_proof | Receipts bound to specific user's pool |
 
 ---
 
-## Erasure Coding
+## NAT Constraints
 
-### Parameters
+### Node Roles
 
-```
-Total shards: 5
-Required for reconstruction: 3
-Redundancy ratio: 1.67x
-```
+| Role | Phone | Home (UPnP) | VPS |
+|------|-------|-------------|-----|
+| Client | Yes | Yes | Yes |
+| Relay | No (pre-onion) | Yes (backbone) | Yes (backbone) |
+| Exit | No | Yes | Yes |
 
-### Per Request
+**Phone cannot be exit**: TCP session pool, shard reconstruction, response encoding — too heavy on battery and mobile data.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                                                              │
-│   3 EXITS x 5 SHARDS = 15 SHARDS                             │
-│                                                              │
-│   Each shard: Random path                                    │
-│   Each chunk: Random path                                    │
-│   First exit to complete wins                                │
-│                                                              │
-│   No two shards take same route                              │
-│   Maximum distribution                                       │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
+**Phone cannot be relay (pre-onion)**: Only 10-30 connections, not enough for random peer selection. Future: with topology gossip + onion routing, phones CAN relay on explicit paths.
+
+**Home users with UPnP are the relay backbone** — same role as seeders in BitTorrent.
+
+### NAT Traversal: Circuit Relay
+
+TunnelCraft uses circuit relay (libp2p) — works on ALL NAT types including symmetric NAT (mobile carriers). NATted nodes connect outbound to public relays, and all traffic flows through established connections.
 
 ---
 
-## Privacy Model
+## Mobile VPN Integration
 
-### What's Private
+```
+App traffic
+  → OS routes to TUN interface
+    → VPN extension reads IP packets
+      → tun2socks reassembles TCP, connects to SOCKS5
+        → SOCKS5 proxy (Rust, localhost:1080)
+          → TunnelCraft network
+```
 
-| Property | Protected By |
-|----------|--------------|
-| Content | E2E encryption |
-| User identity | One-time keys per request |
-| Wallet linkage | Subscription (not per-request payment) |
-| Traffic patterns | Random routing |
-| Request/response correlation | Different paths |
-
-### Privacy Matrix
-
-| Party | Knows User IP | Knows Content | Can Correlate |
-|-------|---------------|---------------|---------------|
-| First relay | Partial (1 of 15) | No | No |
-| Middle relay | No | No | No |
-| Exit | No | Yes | No |
-| Last relay | No | No | No |
+The SOCKS5 proxy runs inside the Rust library. The uniffi surface is just `start(port)` / `stop()` / `status()`. No uniffi bindings needed for SOCKS5 itself.
 
 ---
 
-## Service Quality
-
-### Not Security, Just Quality
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                                                              │
-│   CRYPTOGRAPHICALLY VERIFIED                                 │
-│   • Subscription valid (gossip + random audit)               │
-│   • Work done (ForwardReceipt)                               │
-│   • Delivery complete                                        │
-│   • No redirect possible                                     │
-│                                                              │
-│   MARKET DETERMINED                                          │
-│   • Response quality (garbage or real?)                      │
-│   • Speed                                                    │
-│   • Reliability                                              │
-│                                                              │
-│   Bad exit sends garbage?                                    │
-│   • Can't steal from pool (receipts prove work)              │
-│   • Can't redirect (blocked by relays)                       │
-│   • User picks different exit next time                      │
-│   • Market punishment                                        │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Full Flow
+## Full Flow (Tunnel Mode)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   1. USER SUBSCRIBES                                         │
-│      • Buys subscription on-chain (tier)                     │
-│      • Payment deposited to user's own pool PDA              │
+│      • On-chain: tier + payment → pool PDA                   │
 │      • Subscription event gossiped to network                │
 │                                                              │
-│   2. REQUEST ROUTING                                         │
-│      • User creates request shards, sends to first relays    │
-│      • Each relay: checks subscription (cache), forwards     │
-│      • Next hop signs ForwardReceipt for sender              │
-│      • Sender stores receipt for later claiming               │
+│   2. SOCKS5 CONNECT                                          │
+│      • Browser sends CONNECT example.com:443                 │
+│      • SOCKS5 proxy generates session_id                     │
+│      • Buffers TCP bytes (50ms / 18KB flush)                 │
+│                                                              │
+│   3. SHARD CREATION                                          │
+│      • Payload: [0x01][metadata_len][metadata][tcp_data]     │
+│      • Chunk into 3KB pieces → 5 shards per chunk            │
+│      • user_proof set on all shards                          │
+│                                                              │
+│   4. REQUEST ROUTING                                         │
+│      • Shards sent to first relays                           │
+│      • Each relay: check subscription, decrement hops,       │
+│        forward, collect ForwardReceipt from next hop         │
 │      • Relays cache: request_id → user_pubkey                │
-│      • hops_remaining = 0: forward to exit                   │
+│      • hops_remaining = 0: forward toward exit               │
 │                                                              │
-│   3. EXIT RECEIVES                                           │
-│      • Reconstructs from 3+ shards                           │
-│      • Fetches from internet                                 │
-│      • Stores receipts from first response relays             │
+│   5. EXIT RECEIVES                                           │
+│      • Reconstructs payload from 3+ shards per chunk         │
+│      • Detects 0x01 prefix → tunnel mode                     │
+│      • Parses TunnelMetadata → opens TCP to host:port        │
+│      • Writes tcp_data to destination socket                 │
+│      • Reads response bytes                                  │
 │                                                              │
-│   4. RESPONSE ROUTING                                        │
-│      • Exit creates response shards                          │
+│   6. RESPONSE ROUTING                                        │
+│      • Exit creates response shards from response bytes      │
 │      • Relays check: destination == cached user_pubkey       │
-│      • Each relay gets receipt from next hop, stores it      │
+│      • Each relay collects receipt from next hop              │
 │                                                              │
-│   5. DELIVERY                                                │
+│   7. DELIVERY                                                │
 │      • Last relay delivers to user                           │
 │      • User signs ForwardReceipt for last relay              │
+│      • SOCKS5 proxy writes response to browser socket        │
 │                                                              │
-│   6. SETTLEMENT                                              │
+│   8. SETTLEMENT                                              │
 │      • Relays submit receipts to user's pool on-chain        │
-│      • Deduped by (request_id, shard_index, receiver_pubkey) │
-│      • End of cycle: relay claims proportional share         │
-│      • relay_payout = (relay_receipts / total) * pool        │
+│      • Weighted by bandwidth (payload_size)                  │
+│      • End of cycle: claim proportional share                │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -580,25 +566,23 @@ Redundancy ratio: 1.67x
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   DISCOVERY:  DHT (exits, relays, pubkeys)                   │
-│   ROUTING:    Destination-based with DHT peer lookup          │
-│   PRIVACY:    User sets hop count                            │
-│   PROOF:      ForwardReceipts (signed proof of delivery)     │
+│   DISCOVERY:  libp2p Kademlia DHT                            │
+│   ROUTING:    Best-effort with minimum relay count            │
+│   TRANSPORT:  L4 TCP tunnel (SOCKS5) + L7 HTTP (legacy)      │
+│   PRIVACY:    Private (not anonymous). TLS end-to-end.       │
+│   PROOF:      ForwardReceipts (bandwidth-weighted)           │
 │   SECURITY:   Relays verify destination = origin             │
+│   BINDING:    user_proof = SHA256(req_id || pk || sig)        │
 │   PAYMENT:    Subscription → per-user pool                   │
-│   CLAIMING:   Proportional (receipts / total * pool)         │
+│   CLAIMING:   Proportional by bandwidth forwarded            │
 │   GOSSIP:     Subscription status + random audit             │
 │   TRUST:      None required                                  │
-│                                                              │
-│   ─────────────────────────────────────────────────          │
 │                                                              │
 │   Every step verified cryptographically.                     │
 │   Abuse is self-correcting (per-user pool).                  │
 │   No bitmap. No sequencer. No credit indexes.                │
 │   ForwardReceipt is the only settlement primitive.           │
 │   Market handles service quality.                            │
-│                                                              │
-│   TRUSTLESS VPN.                                             │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```

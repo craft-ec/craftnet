@@ -19,6 +19,7 @@ mod protocol;
 mod relay_status;
 mod status;
 mod subscription;
+mod topology;
 
 pub use behaviour::{
     TunnelCraftBehaviour, TunnelCraftBehaviourEvent,
@@ -35,6 +36,7 @@ pub use proof_message::{ProofMessage, PoolType, ProofStateQuery, ProofStateRespo
 pub use relay_status::{RelayStatusMessage, RelayStatusType};
 pub use status::{ExitStatusMessage, ExitStatusType};
 pub use subscription::SubscriptionAnnouncement;
+pub use topology::{TopologyMessage, TOPOLOGY_TOPIC};
 pub use bootstrap::{
     DEFAULT_BOOTSTRAP_NODES, DEFAULT_PORT,
     default_bootstrap_peers, parse_bootstrap_nodes, parse_bootstrap_addr,

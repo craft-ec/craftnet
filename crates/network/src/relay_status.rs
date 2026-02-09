@@ -40,6 +40,8 @@ pub struct RelayStatusMessage {
     pub bandwidth_available_kbps: u32,
     /// Uptime in seconds
     pub uptime_secs: u64,
+    /// X25519 encryption pubkey (hex-encoded, for onion routing)
+    pub encryption_pubkey: Option<String>,
     /// Unix timestamp (seconds)
     pub timestamp: u64,
 }
@@ -64,6 +66,7 @@ impl RelayStatusMessage {
             queue_depth,
             bandwidth_available_kbps,
             uptime_secs,
+            encryption_pubkey: None,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -82,6 +85,7 @@ impl RelayStatusMessage {
             queue_depth: 0,
             bandwidth_available_kbps: 0,
             uptime_secs: 0,
+            encryption_pubkey: None,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

@@ -25,14 +25,14 @@ impl TunnelResponse {
 
         let status = lines
             .next()
-            .ok_or_else(|| ClientError::InvalidResponse)?;
+            .ok_or(ClientError::InvalidResponse)?;
         let status: u16 = String::from_utf8_lossy(status)
             .parse()
             .map_err(|_| ClientError::InvalidResponse)?;
 
         let header_count = lines
             .next()
-            .ok_or_else(|| ClientError::InvalidResponse)?;
+            .ok_or(ClientError::InvalidResponse)?;
         let header_count: usize = String::from_utf8_lossy(header_count)
             .parse()
             .map_err(|_| ClientError::InvalidResponse)?;
@@ -41,7 +41,7 @@ impl TunnelResponse {
         for _ in 0..header_count {
             let header_line = lines
                 .next()
-                .ok_or_else(|| ClientError::InvalidResponse)?;
+                .ok_or(ClientError::InvalidResponse)?;
             let header_str = String::from_utf8_lossy(header_line);
             if let Some((key, value)) = header_str.split_once(':') {
                 headers.insert(key.trim().to_string(), value.trim().to_string());
@@ -50,7 +50,7 @@ impl TunnelResponse {
 
         let body_len = lines
             .next()
-            .ok_or_else(|| ClientError::InvalidResponse)?;
+            .ok_or(ClientError::InvalidResponse)?;
         let body_len: usize = String::from_utf8_lossy(body_len)
             .parse()
             .map_err(|_| ClientError::InvalidResponse)?;

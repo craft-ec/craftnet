@@ -39,27 +39,38 @@ impl ChainEntry {
     }
 }
 
-/// Hop count configuration for privacy levels
+/// Minimum relay count for privacy levels.
+///
+/// Controls the minimum number of relays a shard must pass through before
+/// it can be forwarded to the destination. This is a privacy guarantee,
+/// not an exact hop count — once the minimum is met, the shard takes the
+/// fastest available path to the destination (best-effort routing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HopMode {
-    /// Direct to exit (0 hops) - fast, less private
+    /// Direct to exit (0 relays) - fastest, no privacy
     Direct,
-    /// 1 relay hop - basic privacy
+    /// 1 relay minimum - basic privacy
     Light,
-    /// 2 relay hops - good privacy
+    /// 2 relays minimum - good privacy
     Standard,
-    /// 3 relay hops - maximum privacy
+    /// 3 relays minimum - maximum privacy
     Paranoid,
 }
 
 impl HopMode {
-    pub fn hop_count(&self) -> u8 {
+    /// Minimum number of relays a shard must traverse.
+    pub fn min_relays(&self) -> u8 {
         match self {
             HopMode::Direct => 0,
             HopMode::Light => 1,
             HopMode::Standard => 2,
             HopMode::Paranoid => 3,
         }
+    }
+
+    /// Deprecated: use `min_relays()` instead.
+    pub fn hop_count(&self) -> u8 {
+        self.min_relays()
     }
 
     pub fn from_count(count: u8) -> Self {
@@ -148,6 +159,12 @@ pub struct ExitInfo {
     pub city: Option<String>,
     pub reputation: u64,
     pub latency_ms: u32,
+    /// X25519 encryption pubkey (for onion routing)
+    #[serde(default)]
+    pub encryption_pubkey: Option<[u8; 32]>,
+    /// libp2p PeerId string (learned from gossipsub or DHT)
+    #[serde(default)]
+    pub peer_id: Option<String>,
 }
 
 /// Information about a relay node (stored in DHT)
@@ -174,9 +191,10 @@ pub struct PeerInfo {
 /// delivery. Relay A uses this receipt as on-chain proof for settlement.
 /// This replaces TCP ACK (which is fakeable at the transport level).
 ///
-/// The `user_proof` field binds this receipt to the originating user,
-/// preventing colluding relays from creating fake receipts against
-/// other users' pools. `user_proof = SHA256(request_id || user_pubkey || user_signature_on_request)`.
+/// The `blind_token` field is a per-hop unique derivation:
+/// `blind_token = SHA256(user_proof || shard_id || relay_pubkey)`.
+/// Each relay sees a different blind_token, preventing colluding relays
+/// from correlating receipts across the same path.
 ///
 /// The `epoch` field prevents cross-epoch receipt replay: a relay cannot
 /// resubmit the same receipts to future subscription epochs for double rewards.
@@ -184,15 +202,15 @@ pub struct PeerInfo {
 pub struct ForwardReceipt {
     /// Request this shard belongs to
     pub request_id: Id,
-    /// Unique shard identifier (hash) — distinguishes request vs response shards
+    /// Per-hop unique shard identifier (includes relay_pubkey in derivation)
     pub shard_id: Id,
     /// Public key of the relay that forwarded the shard (anti-Sybil: binds receipt to sender)
     pub sender_pubkey: PublicKey,
     /// Public key of the receiving node (signs this receipt)
     pub receiver_pubkey: PublicKey,
-    /// Binding proof tying this receipt to the originating user's pool.
-    /// SHA256(request_id || user_pubkey || user_signature_on_request)
-    pub user_proof: Id,
+    /// Per-hop unique blind token: SHA256(user_proof || shard_id || relay_pubkey)
+    /// Prevents cross-relay correlation of settlement data.
+    pub blind_token: Id,
     /// Actual payload bytes in the forwarded shard.
     /// Settlement weights rewards by bandwidth, not receipt count.
     pub payload_size: u32,
@@ -207,13 +225,14 @@ pub struct ForwardReceipt {
 
 impl ForwardReceipt {
     /// Get the data that the receiver signs (180 bytes):
-    /// request_id(32) || shard_id(32) || sender_pubkey(32) || receiver_pubkey(32) || user_proof(32) || payload_size_le(4) || epoch_le(8) || timestamp_le(8)
+    /// request_id(32) || shard_id(32) || sender_pubkey(32) || receiver_pubkey(32) || blind_token(32) || payload_size_le(4) || epoch_le(8) || timestamp_le(8)
+    #[allow(clippy::too_many_arguments)]
     pub fn signable_data(
         request_id: &Id,
         shard_id: &Id,
         sender_pubkey: &PublicKey,
         receiver_pubkey: &PublicKey,
-        user_proof: &Id,
+        blind_token: &Id,
         payload_size: u32,
         epoch: u64,
         timestamp: u64,
@@ -223,7 +242,7 @@ impl ForwardReceipt {
         data.extend_from_slice(shard_id);
         data.extend_from_slice(sender_pubkey);
         data.extend_from_slice(receiver_pubkey);
-        data.extend_from_slice(user_proof);
+        data.extend_from_slice(blind_token);
         data.extend_from_slice(&payload_size.to_le_bytes());
         data.extend_from_slice(&epoch.to_le_bytes());
         data.extend_from_slice(&timestamp.to_le_bytes());
@@ -239,11 +258,18 @@ mod tests {
     // ==================== HopMode Tests ====================
 
     #[test]
-    fn test_hop_mode_hop_count() {
-        assert_eq!(HopMode::Direct.hop_count(), 0);
-        assert_eq!(HopMode::Light.hop_count(), 1);
-        assert_eq!(HopMode::Standard.hop_count(), 2);
-        assert_eq!(HopMode::Paranoid.hop_count(), 3);
+    fn test_hop_mode_min_relays() {
+        assert_eq!(HopMode::Direct.min_relays(), 0);
+        assert_eq!(HopMode::Light.min_relays(), 1);
+        assert_eq!(HopMode::Standard.min_relays(), 2);
+        assert_eq!(HopMode::Paranoid.min_relays(), 3);
+    }
+
+    #[test]
+    fn test_hop_mode_hop_count_compat() {
+        // hop_count() is a deprecated alias for min_relays()
+        assert_eq!(HopMode::Direct.hop_count(), HopMode::Direct.min_relays());
+        assert_eq!(HopMode::Paranoid.hop_count(), HopMode::Paranoid.min_relays());
     }
 
     #[test]
@@ -265,7 +291,7 @@ mod tests {
     #[test]
     fn test_hop_mode_roundtrip() {
         for mode in [HopMode::Direct, HopMode::Light, HopMode::Standard, HopMode::Paranoid] {
-            let count = mode.hop_count();
+            let count = mode.min_relays();
             assert_eq!(HopMode::from_count(count), mode);
         }
     }
@@ -329,8 +355,8 @@ mod tests {
         let shard_id = [3u8; 32];
         let sender_pubkey = [5u8; 32];
         let receiver_pubkey = [2u8; 32];
-        let user_proof = [4u8; 32];
-        let data = ForwardReceipt::signable_data(&request_id, &shard_id, &sender_pubkey, &receiver_pubkey, &user_proof, 1024, 42, 1000);
+        let blind_token = [4u8; 32];
+        let data = ForwardReceipt::signable_data(&request_id, &shard_id, &sender_pubkey, &receiver_pubkey, &blind_token, 1024, 42, 1000);
 
         // 32 (request_id) + 32 (shard_id) + 32 (sender_pubkey) + 32 (receiver_pubkey) + 32 (user_proof) + 4 (payload_size) + 8 (epoch) + 8 (timestamp) = 180
         assert_eq!(data.len(), 180);
@@ -338,7 +364,7 @@ mod tests {
         assert_eq!(&data[32..64], &shard_id);
         assert_eq!(&data[64..96], &sender_pubkey);
         assert_eq!(&data[96..128], &receiver_pubkey);
-        assert_eq!(&data[128..160], &user_proof);
+        assert_eq!(&data[128..160], &blind_token);
         assert_eq!(&data[160..164], &1024u32.to_le_bytes());
         assert_eq!(&data[164..172], &42u64.to_le_bytes());
         assert_eq!(&data[172..180], &1000u64.to_le_bytes());
@@ -346,10 +372,10 @@ mod tests {
 
     #[test]
     fn test_forward_receipt_signable_data_different_inputs() {
-        let user_proof = [5u8; 32];
+        let blind_token = [5u8; 32];
         let sender = [9u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &user_proof, 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[11u8; 32], &sender, &[2u8; 32], &user_proof, 1024, 0, 100);
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[11u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
         // Different shard_id should produce different data
         assert_ne!(data1, data2);
     }
@@ -357,15 +383,15 @@ mod tests {
     #[test]
     fn test_forward_receipt_same_relay_different_shards() {
         // Same relay, same request — but different shard_ids (e.g. request vs response shard)
-        let user_proof = [5u8; 32];
+        let blind_token = [5u8; 32];
         let sender = [9u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &user_proof, 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[20u8; 32], &sender, &[2u8; 32], &user_proof, 1024, 0, 100);
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[20u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
         assert_ne!(data1, data2);
     }
 
     #[test]
-    fn test_forward_receipt_different_user_proofs() {
+    fn test_forward_receipt_different_blind_tokens() {
         let sender = [9u8; 32];
         let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &[5u8; 32], 1024, 0, 100);
         let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &[6u8; 32], 1024, 0, 100);
@@ -374,18 +400,18 @@ mod tests {
 
     #[test]
     fn test_forward_receipt_different_senders() {
-        let user_proof = [5u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[9u8; 32], &[2u8; 32], &user_proof, 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[8u8; 32], &[2u8; 32], &user_proof, 1024, 0, 100);
+        let blind_token = [5u8; 32];
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[9u8; 32], &[2u8; 32], &blind_token, 1024, 0, 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[8u8; 32], &[2u8; 32], &blind_token, 1024, 0, 100);
         assert_ne!(data1, data2, "Different senders should produce different signable data");
     }
 
     #[test]
     fn test_forward_receipt_different_epochs() {
-        let user_proof = [5u8; 32];
+        let blind_token = [5u8; 32];
         let sender = [9u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &user_proof, 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &user_proof, 1024, 1, 100);
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 1, 100);
         assert_ne!(data1, data2, "Different epochs should produce different signable data");
     }
 
@@ -401,6 +427,8 @@ mod tests {
             city: Some("New York".to_string()),
             reputation: 100,
             latency_ms: 50,
+            encryption_pubkey: None,
+            peer_id: None,
         };
 
         assert_eq!(exit.pubkey, [1u8; 32]);
@@ -422,6 +450,8 @@ mod tests {
             city: None,
             reputation: 0,
             latency_ms: 0,
+            encryption_pubkey: None,
+            peer_id: None,
         };
 
         assert!(exit.address.is_empty());
@@ -484,6 +514,8 @@ mod tests {
             city: Some("Frankfurt".to_string()),
             reputation: 50,
             latency_ms: 100,
+            encryption_pubkey: None,
+            peer_id: None,
         };
 
         let json = serde_json::to_string(&exit).unwrap();

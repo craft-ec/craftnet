@@ -8,7 +8,7 @@ use tracing::info;
 use crate::{default_settings_path, Result, SettingsError};
 
 /// Main settings structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     /// Network settings
     #[serde(default)]
@@ -27,17 +27,6 @@ pub struct Settings {
     config_path: Option<PathBuf>,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            network: NetworkSettings::default(),
-            node: NodeSettings::default(),
-            ui: UiSettings::default(),
-            config_path: None,
-        }
-    }
-}
-
 impl Settings {
     /// Load settings from the default path, or create defaults
     pub fn load_or_default() -> Result<Self> {
@@ -54,8 +43,7 @@ impl Settings {
             info!("Loaded settings from {:?}", path);
             Ok(settings)
         } else {
-            let mut settings = Self::default();
-            settings.config_path = Some(path.clone());
+            let settings = Self { config_path: Some(path.clone()), ..Default::default() };
             Ok(settings)
         }
     }

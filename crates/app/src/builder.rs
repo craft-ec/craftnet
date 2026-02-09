@@ -117,12 +117,10 @@ impl AppBuilder {
 
         // Initialize logging
         if !self.skip_logging {
-            let level = self.log_level.unwrap_or_else(|| {
-                if self.verbose {
-                    LogLevel::Debug
-                } else {
-                    LogLevel::Info
-                }
+            let level = self.log_level.unwrap_or(if self.verbose {
+                LogLevel::Debug
+            } else {
+                LogLevel::Info
             });
 
             // Try to initialize, ignore if already initialized

@@ -1,506 +1,280 @@
-# TunnelCraft: Implementation Plan
+# TunnelCraft: Implementation Roadmap
 
 ## Overview
 
-10-month implementation plan for trustless P2P VPN with:
-- DHT for discovery
-- Random routing (network decides path)
-- Chain signatures for proof
-- Trustless verification (relays check destination)
-- Two-phase settlement
+Implementation roadmap for a decentralized P2P VPN with:
+- libp2p for discovery and NAT traversal
+- Best-effort routing with minimum relay count
+- SOCKS5 proxy + TCP tunnel mode (L4)
+- ForwardReceipt-based settlement
+- Trustless relay verification
 
 ---
 
-## Phase 1: Core Types (Weeks 1-3)
-
-### Goal
-Define data structures and traits.
+## Phase 1: Core Types - COMPLETE
 
 ### Deliverables
 
 ```rust
-// Shard structure
-pub struct Shard { ... }
+pub struct Shard {
+    pub shard_id: Id,
+    pub request_id: Id,
+    pub user_pubkey: PublicKey,
+    pub destination: PublicKey,
+    pub user_proof: Id,            // Settlement binding
+    pub hops_remaining: u8,
+    pub total_hops: u8,
+    pub sender_pubkey: PublicKey,   // Last relay identity
+    pub payload: Vec<u8>,
+    pub shard_type: ShardType,
+    pub shard_index: u8,
+    pub total_shards: u8,
+    pub chunk_index: u16,
+    pub total_chunks: u16,
+}
 
-// Chain entry
-pub struct ChainEntry {
-    pub pubkey: PublicKey,
+pub struct ForwardReceipt {
+    pub request_id: Id,
+    pub shard_id: Id,
+    pub sender_pubkey: PublicKey,
+    pub receiver_pubkey: PublicKey,
+    pub user_proof: Id,
+    pub payload_size: u32,
+    pub epoch: u64,
+    pub timestamp: u64,
     pub signature: Signature,
 }
 
-// Relay cache for trustless verification
-pub struct RelayCache {
-    requests: HashMap<[u8; 32], PublicKey>,
+pub struct TunnelMetadata {
+    pub host: String,
+    pub port: u16,
+    pub session_id: Id,
+    pub is_close: bool,
 }
 ```
 
-### Tasks
-
-```
-- [ ] Shard struct
-- [ ] ChainEntry struct
-- [ ] RelayCache struct
-- [ ] Serialization (bincode)
-- [ ] Unit tests
-```
+**Status**: Complete. All types implemented with serialization/deserialization and tests.
 
 ---
 
-## Phase 2: Erasure Coding (Weeks 4-5)
-
-### Goal
-Reed-Solomon 5/3 encoding.
+## Phase 2: Erasure Coding - COMPLETE
 
 ### Deliverables
 
 ```rust
-pub struct Encoder {
-    rs: ReedSolomon,
-}
+pub const DATA_SHARDS: usize = 3;
+pub const PARITY_SHARDS: usize = 2;
+pub const TOTAL_SHARDS: usize = 5;
 
-impl Encoder {
-    pub fn encode(&self, data: &[u8]) -> Vec<Vec<u8>>;
-    pub fn decode(&self, shards: &[Option<Vec<u8>>]) -> Result<Vec<u8>>;
-}
+// Chunked encoding: 3KB chunks → 5 shard payloads each
+pub fn chunk_and_encode(data: &[u8]) -> Result<Vec<(u16, Vec<Vec<u8>>)>>;
+pub fn reassemble(shards: &[(u16, Vec<Option<Vec<u8>>>)], original_len: usize) -> Result<Vec<u8>>;
 ```
 
-### Tasks
-
-```
-- [ ] Encode function
-- [ ] Decode with 3+ shards
-- [ ] Handle large payloads (chunking)
-- [ ] Unit tests
-```
+**Status**: Complete. Reed-Solomon 5/3 with 3KB chunked encoding.
 
 ---
 
-## Phase 3: Chain Signatures (Weeks 6-8)
-
-### Goal
-Signature chain accumulation and verification.
+## Phase 3: Cryptography - COMPLETE
 
 ### Deliverables
 
 ```rust
-impl Shard {
-    pub fn add_signature(&mut self, keypair: &Keypair);
-    pub fn verify_chain(&self) -> bool;
+pub struct SigningKeypair { ... }
+
+impl SigningKeypair {
+    pub fn generate() -> Self;
+    pub fn public_key_bytes(&self) -> PublicKey;
 }
+
+pub fn sign_data(keypair: &SigningKeypair, data: &[u8]) -> Signature;
+pub fn verify_data(pubkey: &PublicKey, data: &[u8], signature: &Signature) -> bool;
 ```
 
-### Tasks
-
-```
-- [ ] Signature creation
-- [ ] Chain accumulation
-- [ ] Chain verification
-- [ ] Unit tests
-```
+**Status**: Complete. Ed25519 signing, X25519 key exchange, ChaCha20Poly1305 encryption.
 
 ---
 
-## Phase 4: Relay Logic (Weeks 9-12)
-
-### Goal
-Request/response handling with trustless verification.
+## Phase 4: Relay Logic - COMPLETE
 
 ### Deliverables
 
 ```rust
-impl Relay {
-    // Cache request origins
-    pub async fn handle_request(&self, shard: Shard) -> Result<()>;
-    
-    // CRITICAL: Verify destination matches origin
-    pub async fn handle_response(&self, shard: Shard) -> Result<()>;
-    
-    // Last hop delivery with TCP ACK
-    pub async fn deliver_to_user(&self, shard: Shard) -> Result<()>;
+impl RelayHandler {
+    // Cache request origins, stamp sender_pubkey, decrement hops
+    pub fn handle_request(&mut self, shard: Shard) -> Result<Option<Shard>>;
+
+    // CRITICAL: Verify destination matches origin, then forward
+    pub fn handle_response(&mut self, shard: Shard) -> Result<Option<Shard>>;
 }
 ```
 
-### Key Implementation
-
-```rust
-pub async fn handle_response(&self, mut shard: Shard) -> Result<()> {
-    // TRUSTLESS VERIFICATION
-    if let Some(expected_user) = self.cache.get(&shard.request_id) {
-        if shard.destination != *expected_user {
-            // DROP - Exit tried to redirect
-            return Err(Error::DestinationMismatch);
-        }
-    }
-    
-    // Continue with signing and forwarding...
-}
-```
-
-### Tasks
-
-```
-- [ ] Request handling
-- [ ] Origin caching
-- [ ] Response handling
-- [ ] Destination verification (trustless)
-- [ ] Random next hop selection
-- [ ] Last hop TCP ACK
-- [ ] Integration tests
-```
+**Status**: Complete. Best-effort routing with minimum relay count. Trustless destination verification.
 
 ---
 
-## Phase 5: Networking (Weeks 13-16)
-
-### Goal
-Hyperswarm DHT integration.
+## Phase 5: Networking - COMPLETE
 
 ### Deliverables
 
 ```rust
-pub struct NetworkManager {
-    swarm: Hyperswarm,
-}
+// libp2p integration with Kademlia DHT, gossipsub, circuit relay
+pub struct NetworkManager { ... }
 
 impl NetworkManager {
     pub async fn find_exits(&self) -> Vec<ExitInfo>;
     pub async fn find_peers(&self) -> Vec<PeerInfo>;
-    pub async fn announce_pubkey(&self, pubkey: PublicKey);
-    pub async fn lookup_address(&self, pubkey: PublicKey) -> Address;
+    pub async fn announce(&self, pubkey: PublicKey);
 }
 ```
 
-### Tasks
-
-```
-- [ ] Hyperswarm setup
-- [ ] Exit discovery
-- [ ] Peer discovery
-- [ ] Pubkey announcement
-- [ ] Address lookup
-- [ ] NAT traversal testing
-```
+**Status**: Complete. libp2p with Kademlia, gossipsub, NAT traversal via circuit relay.
 
 ---
 
-## Phase 6: Exit Node (Weeks 17-20)
-
-### Goal
-Complete exit node with settlement.
+## Phase 6: Exit Node - COMPLETE
 
 ### Deliverables
 
 ```rust
-impl ExitNode {
-    pub async fn handle_request(&self, shards: Vec<Shard>) -> Result<()>;
-    pub async fn settle_request(&self, settlement: RequestSettlement) -> Result<()>;
+impl ExitHandler {
+    // Dual-mode: TCP tunnel (0x01) or HTTP fetch (0x00)
+    pub async fn process_shard(&mut self, shard: Shard) -> Result<Option<Vec<Shard>>>;
+}
+
+pub struct TunnelHandler {
+    sessions: HashMap<Id, TcpSession>,
 }
 ```
 
-### Tasks
-
-```
-- [ ] Shard collection
-- [ ] Request reconstruction
-- [ ] credit_secret extraction
-- [ ] Request settlement (Phase 1)
-- [ ] HTTP fetch
-- [ ] Response shard creation
-- [ ] Random distribution
-- [ ] Integration tests
-```
+**Status**: Complete. HTTP fetch + TCP tunnel handler with session pool.
 
 ---
 
-## Phase 7: Settlement Contracts (Weeks 21-26)
-
-### Goal
-Solana smart contracts.
+## Phase 7: Settlement - PARTIAL
 
 ### Deliverables
 
 ```rust
 #[program]
 pub mod tunnelcraft {
-    pub fn purchase_credit(...) -> Result<()>;
-    pub fn settle_request(...) -> Result<()>;  // Phase 1: PENDING
-    pub fn settle_response(...) -> Result<()>; // Phase 2: COMPLETE
-    pub fn claim_work(...) -> Result<()>;
-    pub fn withdraw(...) -> Result<()>;
+    pub fn subscribe(tier: u8, payment: u64) -> Result<()>;
+    pub fn submit_receipts(receipts: Vec<ForwardReceipt>) -> Result<()>;
+    pub fn claim_rewards() -> Result<()>;
+    pub fn withdraw(amount: u64) -> Result<()>;
 }
 ```
 
-### Key Verification
-
-```rust
-pub fn settle_response(...) -> Result<()> {
-    // TRUSTLESS: Destination must match stored user_pubkey
-    require!(
-        chain_destination == request.user_pubkey,
-        Error::DestinationMismatch
-    );
-    // ...
-}
-```
-
-### Tasks
-
-```
-- [ ] Credit accounts
-- [ ] Request settlement (stores user_pubkey)
-- [ ] Response settlement (verifies destination)
-- [ ] Points calculation
-- [ ] Claim logic
-- [ ] Epoch rewards
-- [ ] Withdrawal
-- [ ] Devnet testing
-```
+**Status**: Settlement client implemented (mock + Photon live mode). On-chain program structure defined. Bandwidth-weighted settlement with user_proof binding.
 
 ---
 
-## Phase 8: Client Library (Weeks 27-30)
-
-### Goal
-User-facing SDK.
+## Phase 8: Client SDK + SOCKS5 - COMPLETE
 
 ### Deliverables
 
 ```rust
-pub struct Client {
-    identity: IdentityManager,
-    network: NetworkManager,
-    encoder: Encoder,
+pub struct TunnelCraftNode { ... }
+
+impl TunnelCraftNode {
+    pub async fn connect(&mut self) -> Result<()>;
+    pub async fn request(&mut self, url: &str) -> Result<TunnelResponse>;
+    pub async fn send_tunnel_burst(&mut self, metadata: TunnelMetadata, data: &[u8]) -> Result<...>;
 }
 
-impl Client {
-    pub async fn request(&self, url: &str, hops: u8) -> Result<Response>;
-    pub fn set_hop_count(&mut self, hops: u8);
-    pub fn select_exits(&mut self, exits: Vec<ExitInfo>);
-}
+pub struct RequestBuilder { ... }      // HTTP mode
+pub fn build_tunnel_shards(...);       // Tunnel mode
+
+pub struct Socks5Server { ... }        // RFC 1928 SOCKS5 proxy
 ```
 
-### Tasks
-
-```
-- [ ] Credit management
-- [ ] One-time key generation
-- [ ] Request creation
-- [ ] Response assembly
-- [ ] Hop count setting
-- [ ] Exit selection
-```
+**Status**: Complete. Full client SDK with SOCKS5 proxy, tunnel shard builder, and HTTP request builder.
 
 ---
 
-## Phase 9: Applications (Weeks 31-36)
-
-### Goal
-CLI and desktop apps.
+## Phase 9: Applications - COMPLETE (Structure)
 
 ### CLI
-
 ```bash
 tunnelcraft connect [--hops 2]
 tunnelcraft status
-tunnelcraft purchase <amount>
 tunnelcraft balance
 ```
 
-### Desktop (Tauri)
+### Desktop (Electron)
+- System tray, connect/disconnect, privacy level selector, network stats, request panel
 
-```
-Features:
-- [ ] System tray
-- [ ] Hop count slider
-- [ ] Exit selection
-- [ ] Credit management
-- [ ] Connection status
-```
+### Mobile (React Native)
+- iOS: Network Extension + TUN interface
+- Android: VpnService + TUN interface
+- tun2socks → SOCKS5 proxy (localhost:1080)
 
-### Node Operator
-
-```
-Features:
-- [ ] Earnings display
-- [ ] Points tracking
-- [ ] Withdrawal
-- [ ] Traffic stats
-```
+**Status**: UI complete for all platforms. Native bridges implemented. Integration testing pending.
 
 ---
 
-## Phase 10: Hardening & Launch (Weeks 37-42)
+## Phase 10: Hardening & Launch - PENDING
 
 ### Security
-
-```
-- [ ] External audit
-- [ ] Penetration testing
-- [ ] Bug bounty program
-```
+- External audit
+- Penetration testing
+- Bug bounty program
 
 ### Performance
-
-```
-- [ ] Profiling
-- [ ] Optimization
-- [ ] Load testing
-```
+- Profiling
+- Optimization
+- Load testing
 
 ### Launch
-
-```
-- [ ] Bootstrap nodes (50+)
-- [ ] Testnet
-- [ ] Mainnet
-- [ ] Documentation
-```
+- Bootstrap nodes (50+)
+- Testnet
+- Mainnet
 
 ---
 
-## Milestones
+## Future: Anonymity Layer
 
-| Phase | Weeks | Milestone |
-|-------|-------|-----------|
-| 1 | 1-3 | Core types |
-| 2 | 4-5 | Erasure coding |
-| 3 | 6-8 | Chain signatures |
-| 4 | 9-12 | Relay logic + trustless verification |
-| 5 | 13-16 | Networking |
-| 6 | 17-20 | Exit node |
-| 7 | 21-26 | Settlement contracts |
-| 8 | 27-30 | Client library |
-| 9 | 31-36 | Applications |
-| 10 | 37-42 | Hardening & launch |
+### Phase A: Topology Gossip
+- Relays gossip connected peer lists via gossipsub
+- Client builds local topology graph
+- Event-driven updates (connect/disconnect/heartbeat timeout)
 
-**Total: ~10 months**
+### Phase B: Onion Routing
+- Client picks exact paths from topology graph
+- Layered onion encryption (Sphinx or simplified variant)
+- Each relay decrypts one layer, sees only next hop
+- Fixed hop count (not best-effort)
 
----
+### Phase C: Lease Sets
+- Client publishes anonymous entry points (gateway + tunnel_id)
+- Exit picks gateway from lease set, builds onion path to it
+- Connections ARE the lease set (no pre-built tunnels)
 
-## Team
+### Phase D: Blind Subscription Tokens
+- Blind-signed tokens prove valid subscription without revealing identity
+- `subscription_id` rotates per epoch (no cross-epoch tracking)
+- Every relay verifies blind signature
+- Settlement uses `subscription_id` → pool commitment
 
-### Minimum: 4 people
-
-| Role | Focus |
-|------|-------|
-| Protocol | Core, relay, exit |
-| Blockchain | Solana contracts |
-| Client | Desktop, mobile, CLI |
-| DevOps | Infra, security |
-
----
-
-## Key Implementation Notes
-
-### Trustless Verification
-
-```
-MOST CRITICAL CODE:
-
-impl Relay {
-    pub async fn handle_response(&self, shard: Shard) -> Result<()> {
-        // This is what makes the system trustless
-        if let Some(expected) = self.cache.get(&shard.request_id) {
-            if shard.destination != *expected {
-                return Err(Error::DestinationMismatch);  // DROP
-            }
-        }
-        // ...
-    }
-}
-
-This single check prevents all redirect attacks.
-```
-
-### Two-Phase Settlement
-
-```
-Phase 1: Exit settles request
-- Stores user_pubkey (locked)
-- Status: PENDING
-
-Phase 2: Last relay settles response  
-- Verifies destination == user_pubkey
-- Status: COMPLETE
-
-Both phases must complete for payment.
-```
-
-### Points System
-
-```
-Request relay: 1 point
-Response relay: 1 point
-Exit (request): 1 point
-Exit (response): 2 points (fetch work)
-
-Total per round trip: ~7 points
-Exit gets 3/7 ≈ 43%
-```
+### Phase E: Participatory Relay
+- Free users earn credits by forwarding shards
+- `net_balance = shards_forwarded - shards_consumed`
+- Net positive → no throttle (Basic-tier treatment)
+- Gateway-local accounting (no global ledger)
 
 ---
 
-## Budget
+## Current Status Summary
 
-### Development
-
-| Category | Cost |
-|----------|------|
-| Team (4 × 10 months) | $400K |
-| Security audit | $50K |
-| Infrastructure | $20K |
-| Legal | $30K |
-| Contingency | $50K |
-| **Total** | **$550K** |
-
-### Monthly Operations
-
-| Category | Cost |
-|----------|------|
-| Bootstrap nodes | $5K |
-| Monitoring | $1K |
-| Support | $2K |
-| **Total** | **$8K/month** |
-
----
-
-## Success Metrics
-
-### Technical
-
-```
-- [ ] <100ms routing latency (3 hops)
-- [ ] 99.9% shard delivery
-- [ ] Zero successful redirect attacks
-```
-
-### Adoption
-
-```
-- [ ] 10K+ users
-- [ ] 1K+ node operators
-- [ ] 100K+ daily requests
-```
-
----
-
-## Summary
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                                                              │
-│   CORE INNOVATION                                            │
-│                                                              │
-│   Relays verify: destination == origin                       │
-│   Chain verifies: destination == stored user_pubkey          │
-│                                                              │
-│   Two layers of protection.                                  │
-│   No trust required.                                         │
-│   Attacks impossible.                                        │
-│                                                              │
-│   RESULT                                                     │
-│                                                              │
-│   Trustless VPN in 10 months.                                │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
+| Phase | Status | Key Files |
+|-------|--------|-----------|
+| 1. Core Types | Complete | `crates/core/src/{shard,types,tunnel}.rs` |
+| 2. Erasure Coding | Complete | `crates/erasure/src/{lib,chunker}.rs` |
+| 3. Cryptography | Complete | `crates/crypto/src/{keys,sign}.rs` |
+| 4. Relay Logic | Complete | `crates/relay/src/handler.rs` |
+| 5. Networking | Complete | `crates/network/src/{swarm,protocol}.rs` |
+| 6. Exit Node | Complete | `crates/exit/src/{handler,tunnel_handler}.rs` |
+| 7. Settlement | Partial | `crates/settlement/src/client.rs`, `programs/` |
+| 8. Client + SOCKS5 | Complete | `crates/client/src/{node,request,tunnel,socks5}.rs` |
+| 9. Applications | Structure complete | `apps/{cli,desktop,mobile}/` |
+| 10. Hardening | Pending | — |
