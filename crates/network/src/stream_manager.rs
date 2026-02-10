@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use futures::AsyncReadExt;
+use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::PeerId;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
@@ -68,8 +68,9 @@ pub struct StreamManager {
 }
 
 struct PeerStream {
-    /// Writer half of the stream, protected by async mutex for concurrent sends
-    writer: Arc<Mutex<futures::io::WriteHalf<libp2p::Stream>>>,
+    /// Writer half of the stream, wrapped in BufWriter(64KB) to batch TCP writes.
+    /// Per-frame flushes are removed; the caller flushes after batch operations.
+    writer: Arc<Mutex<futures::io::BufWriter<futures::io::WriteHalf<libp2p::Stream>>>>,
     /// Monotonically increasing sequence ID
     next_seq: Arc<AtomicU64>,
     /// Pending ack channels: seq_id → oneshot sender
@@ -357,10 +358,28 @@ impl StreamManager {
         self.close_stream(peer);
     }
 
+    /// Flush the BufWriter for a specific peer, pushing buffered data to the wire.
+    pub async fn flush_peer(&mut self, peer: &PeerId) -> std::result::Result<(), std::io::Error> {
+        if let Some(ps) = self.streams.get(peer) {
+            let mut writer = ps.writer.lock().await;
+            AsyncWriteExt::flush(&mut *writer).await?;
+        }
+        Ok(())
+    }
+
+    /// Flush all peer writers after batch operations.
+    pub async fn flush_all(&mut self) {
+        let peers: Vec<PeerId> = self.streams.keys().copied().collect();
+        for peer in peers {
+            let _ = self.flush_peer(&peer).await;
+        }
+    }
+
     /// Register a raw stream: split into reader/writer, spawn reader task, insert.
     fn register_stream(&mut self, peer: PeerId, stream: libp2p::Stream, tier: u8) {
         let tier_atomic = Arc::new(AtomicU8::new(tier));
         let (reader, writer) = AsyncReadExt::split(stream);
+        let writer = futures::io::BufWriter::with_capacity(8 * 1024, writer);
         let pending_acks: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AckResult>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 

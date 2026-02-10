@@ -443,7 +443,6 @@ pub async fn write_shard_frame<T: AsyncWrite + Unpin>(
     buf.extend_from_slice(&shard_bytes);
 
     io.write_all(&buf).await?;
-    io.flush().await?;
 
     Ok(())
 }
@@ -482,7 +481,6 @@ pub async fn write_ack_frame<T: AsyncWrite + Unpin>(
     buf.extend_from_slice(&receipt_bytes);
 
     io.write_all(&buf).await?;
-    io.flush().await?;
 
     Ok(())
 }
@@ -506,7 +504,6 @@ pub async fn write_nack_frame<T: AsyncWrite + Unpin>(
     buf.extend_from_slice(&reason_bytes[..reason_len]);
 
     io.write_all(&buf).await?;
-    io.flush().await?;
 
     Ok(())
 }

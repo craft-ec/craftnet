@@ -823,6 +823,8 @@ pub struct TunnelCraftNode {
     stream_receipt_rx: Option<mpsc::Receiver<ForwardReceipt>>,
     /// Layer 2: free-tier shards deferred after onion peel
     deferred_forwards: VecDeque<(Shard, PeerId)>,
+    /// Buffered receipts pending batch disk flush (avoids per-receipt file I/O)
+    receipt_buffer: Vec<ForwardReceipt>,
 
     /// Aggregator service (collects proof messages, builds distributions)
     aggregator: Option<Aggregator>,
@@ -1024,6 +1026,7 @@ impl TunnelCraftNode {
             incoming_stream_rx: None,
             stream_receipt_rx: None,
             deferred_forwards: VecDeque::new(),
+            receipt_buffer: Vec::new(),
             aggregator: if enable_aggregator {
                 #[cfg(feature = "risc0")]
                 let agg_prover: Box<dyn tunnelcraft_prover::Prover> = Box::new(tunnelcraft_prover::Risc0Prover::new());
@@ -2155,6 +2158,13 @@ impl TunnelCraftNode {
                 }
                 send_queue = retry_queue;
 
+                // Flush buffered request shards to the wire before waiting for response.
+                // Without this, shards sit in BufWriter until drain_stream_shards runs
+                // (which is AFTER the swarm event drain — potentially seconds of gossip processing).
+                if let Some(ref mut sm) = self.stream_manager {
+                    sm.flush_all().await;
+                }
+
                 tokio::select! {
                     response = response_rx.recv() => {
                         return response.ok_or(ClientError::Timeout)?;
@@ -2263,8 +2273,8 @@ impl TunnelCraftNode {
     }
 
     /// Process shard as exit node.
-    /// `source_peer` is the peer that sent the shard — used for direct mode response routing.
-    async fn process_as_exit(&mut self, shard: Shard, source_peer: PeerId) -> ShardResponse {
+    /// `source_peer` is the peer that delivered the shard (last relay hop). Not used for routing.
+    async fn process_as_exit(&mut self, shard: Shard, _source_peer: PeerId) -> ShardResponse {
         // Take exit handler out temporarily to avoid holding lock across await
         let exit_handler = {
             let mut state = self.state.write();
@@ -2304,13 +2314,23 @@ impl TunnelCraftNode {
             let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
             let local_short = &local_id[local_id.len().saturating_sub(6)..];
 
-            // Group shards by gateway for efficient batched sending
+            // Group shards by gateway for efficient batched sending.
+            // Every response shard MUST have a designated gateway from the LeaseSet.
+            // There is no fallback — onion routing requires an explicit target.
             let mut by_gateway: HashMap<PeerId, Vec<Shard>> = HashMap::new();
+            let mut dropped = 0usize;
             for (shard, gateway_bytes) in shard_pairs {
-                let target = gateway_bytes
-                    .and_then(|gw| PeerId::from_bytes(&gw).ok())
-                    .unwrap_or(source_peer);
-                by_gateway.entry(target).or_default().push(shard);
+                if let Some(target) = gateway_bytes.and_then(|gw| PeerId::from_bytes(&gw).ok()) {
+                    by_gateway.entry(target).or_default().push(shard);
+                } else {
+                    dropped += 1;
+                }
+            }
+            if dropped > 0 {
+                warn!(
+                    "[SHARD-FLOW] node={} EXIT dropped {} response shards with no gateway",
+                    local_short, dropped,
+                );
             }
 
             for (target, shards) in by_gateway {
@@ -2469,20 +2489,8 @@ impl TunnelCraftNode {
             hex::encode(&receipt.receiver_pubkey[..8]),
         );
 
-        // Persist to disk (append JSON line)
-        if let Some(ref path) = self.receipt_file {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                Ok(mut file) => {
-                    if let Ok(json) = serde_json::to_string(&receipt) {
-                        let _ = writeln!(file, "{}", json);
-                    }
-                }
-                Err(e) => warn!("Failed to persist receipt to {}: {}", path.display(), e),
-            }
-        }
+        // Buffer for batch disk write instead of per-receipt file I/O
+        self.receipt_buffer.push(receipt.clone());
 
         // Store in forward_receipts for per-request tracking
         self.forward_receipts
@@ -2977,18 +2985,34 @@ impl TunnelCraftNode {
             return;
         };
 
+        // Flush any shard data buffered by callers (e.g., client request sends)
+        // BEFORE entering the swarm event select!, which can block for seconds
+        // processing gossipsub traffic. Without this, shards sit in BufWriter
+        // until after the swarm drain completes.
+        if let Some(ref mut sm) = self.stream_manager {
+            sm.flush_all().await;
+        }
+
         // Drain all immediately available swarm events (don't wait after the first)
         // This prevents DHT events from starving shard delivery.
         tokio::select! {
             event = swarm.select_next_some() => {
                 self.handle_swarm_event(event).await;
-                // Drain remaining ready events without blocking
+                // Drain remaining ready events without blocking.
+                // Interleave shard drain+flush every 50 events to prevent
+                // gossip traffic from starving shard delivery.
+                let mut events_since_drain = 0u32;
                 loop {
                     let Some(ref mut swarm) = self.swarm else { break };
                     tokio::select! {
                         biased;
                         event = swarm.select_next_some() => {
                             self.handle_swarm_event(event).await;
+                            events_since_drain += 1;
+                            if events_since_drain >= 50 {
+                                events_since_drain = 0;
+                                self.drain_stream_shards().await;
+                            }
                         }
                         _ = async {} => { break; }
                     }
@@ -3005,7 +3029,7 @@ impl TunnelCraftNode {
                     self.handle_tunnel_burst(burst).await;
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
         }
 
         // Accept inbound streams from the bridging task.
@@ -3038,6 +3062,9 @@ impl TunnelCraftNode {
 
         // Drain receipts from fire-and-forget stream acks
         self.drain_stream_receipts();
+
+        // Batch-flush buffered receipts to disk (one file open/close per poll cycle)
+        self.flush_receipts();
     }
 
     /// Drain inbound shards from stream channels in priority order.
@@ -3083,27 +3110,45 @@ impl TunnelCraftNode {
         }
 
         // Drain deferred forwards (relay forwards queued by relay_shard / process_as_exit).
+        // Group by target peer so we can batch writes per peer and flush once per peer.
         // send_shard returns WouldBlock if stream isn't ready (background open in flight).
         // Re-queue those shards; they'll be retried on the next poll_once cycle after
         // the background open completes and poll_open_streams() registers the stream.
         let deferred: Vec<_> = self.deferred_forwards.drain(..).collect();
+        // Group by next_hop for efficient batched writes + per-peer flush
+        let mut by_hop: HashMap<PeerId, Vec<Shard>> = HashMap::new();
         for (shard, next_hop) in deferred {
-            if let Some(ref mut sm) = self.stream_manager {
-                match sm.send_shard(next_hop, &shard, false).await {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Stream opening in background — re-queue for next cycle
-                        self.deferred_forwards.push_back((shard, next_hop));
-                    }
-                    Err(e) => {
-                        warn!("Failed to send deferred shard to {}: {}", next_hop, e);
-                        // Re-queue on connection errors (stream broke, reopen initiated)
-                        if e.kind() != std::io::ErrorKind::InvalidData {
+            by_hop.entry(next_hop).or_default().push(shard);
+        }
+        for (next_hop, shards) in by_hop {
+            for shard in shards {
+                if let Some(ref mut sm) = self.stream_manager {
+                    match sm.send_shard(next_hop, &shard, false).await {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             self.deferred_forwards.push_back((shard, next_hop));
+                        }
+                        Err(e) => {
+                            warn!("Failed to send deferred shard to {}: {}", next_hop, e);
+                            if e.kind() != std::io::ErrorKind::InvalidData {
+                                self.deferred_forwards.push_back((shard, next_hop));
+                            }
                         }
                     }
                 }
             }
+            // Flush this peer's BufWriter after all its shards are written.
+            // This pushes data to TCP immediately per-peer, avoiding cross-peer
+            // stalls while still batching multiple shards to the same peer.
+            if let Some(ref mut sm) = self.stream_manager {
+                let _ = sm.flush_peer(&next_hop).await;
+            }
+        }
+
+        // Flush all remaining peer writers (acks/nacks from inbound shard processing
+        // and any other buffered data not covered by the per-peer flush above).
+        if let Some(ref mut sm) = self.stream_manager {
+            sm.flush_all().await;
         }
     }
 
@@ -3118,6 +3163,34 @@ impl TunnelCraftNode {
         }
         for receipt in receipts {
             self.store_forward_receipt(receipt);
+        }
+    }
+
+    /// Flush buffered receipts to disk in a single file open/close.
+    /// Called at the end of poll_once() to batch all per-shard receipts.
+    fn flush_receipts(&mut self) {
+        if self.receipt_buffer.is_empty() {
+            return;
+        }
+        if let Some(ref path) = self.receipt_file {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                Ok(mut file) => {
+                    for receipt in self.receipt_buffer.drain(..) {
+                        if let Ok(json) = serde_json::to_string(&receipt) {
+                            let _ = writeln!(file, "{}", json);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to persist receipts to {}: {}", path.display(), e);
+                    self.receipt_buffer.clear();
+                }
+            }
+        } else {
+            self.receipt_buffer.clear();
         }
     }
 
@@ -3147,14 +3220,32 @@ impl TunnelCraftNode {
         self.maybe_reconnect_bootstrap();
         self.update_topology();
         self.maybe_publish_topology();
-        self.evict_expired_tunnels();
+        self.refresh_and_evict_tunnels();
     }
 
-    /// Clean up expired tunnel registrations
-    fn evict_expired_tunnels(&mut self) {
-        let mut state = self.state.write();
-        if let Some(ref mut relay_handler) = state.relay_handler {
-            relay_handler.evict_expired_tunnels();
+    /// Refresh tunnel registrations for all connected peers and evict expired ones.
+    /// Tunnels have a 5-minute TTL from ConnectionEstablished. Since connections
+    /// are persistent, we must renew them periodically to prevent expiration.
+    fn refresh_and_evict_tunnels(&mut self) {
+        if let (Some(local_pid), Some(swarm)) = (self.local_peer_id, self.swarm.as_ref()) {
+            let connected_peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+            let expires_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() + 300;
+            let mut state = self.state.write();
+            if let Some(ref mut relay_handler) = state.relay_handler {
+                for peer in connected_peers {
+                    let tunnel_id = derive_tunnel_id(&peer, &local_pid);
+                    relay_handler.register_tunnel(tunnel_id, peer.to_bytes(), expires_at);
+                }
+                relay_handler.evict_expired_tunnels();
+            }
+        } else {
+            let mut state = self.state.write();
+            if let Some(ref mut relay_handler) = state.relay_handler {
+                relay_handler.evict_expired_tunnels();
+            }
         }
     }
 
@@ -3470,16 +3561,6 @@ impl TunnelCraftNode {
     pub fn register_tunnel(&self, tunnel_id: Id, client_peer_id: Vec<u8>, expires_at: u64) {
         let mut state = self.state.write();
         if let Some(ref mut relay_handler) = state.relay_handler {
-            info!(
-                "Registering tunnel={} for peer={} (on node={:?})",
-                hex::encode(&tunnel_id[..8]),
-                if let Ok(pid) = PeerId::from_bytes(&client_peer_id) {
-                    pid.to_string()
-                } else {
-                    hex::encode(&client_peer_id[..8])
-                },
-                self.local_peer_id.map(|p| p.to_string()),
-            );
             relay_handler.register_tunnel(tunnel_id, client_peer_id, expires_at);
         } else {
             warn!("register_tunnel: no relay_handler, skipping tunnel {}", hex::encode(&tunnel_id[..8]));
@@ -3589,7 +3670,7 @@ impl TunnelCraftNode {
                 // This node acts as gateway: remote peer → us (tunnel lookup returns remote_peer_id).
                 if let Some(local_pid) = self.local_peer_id {
                     let tunnel_id = derive_tunnel_id(&peer_id, &local_pid);
-                    // 5-minute TTL — renewed on each new connection, cleaned up in maintenance
+                    // 5-minute TTL — renewed periodically in refresh_and_evict_tunnels()
                     let expires_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -3610,7 +3691,7 @@ impl TunnelCraftNode {
 
                 // Tunnel registrations are time-committed — topology gossip is
                 // the commitment. Don't unregister tunnels on connection events;
-                // let evict_expired_tunnels() handle cleanup in maintenance.
+                // let refresh_and_evict_tunnels() handle cleanup in maintenance.
                 if num_established == 0 {
                     info!("Fully disconnected from peer: {}", peer_id);
                     self.unverified_relay_peers.retain(|p| p != &peer_id);
