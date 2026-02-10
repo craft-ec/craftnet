@@ -1,18 +1,25 @@
-//! 10-Node Live Network E2E Test
+//! 15-Node Live Network E2E Test
 //!
-//! Spawns 10 real TunnelCraftNode instances connected via localhost TCP,
-//! runs HTTP requests through the onion-routed tunnel, and tracks all
-//! network activity: gossip, connections, shard forwarding, proof generation,
-//! and aggregator submissions.
+//! Spawns 15 real TunnelCraftNode instances connected via localhost TCP,
+//! runs diverse HTTP requests through the onion-routed tunnel, and tracks
+//! all network activity: gossip, connections, shard forwarding, proof
+//! generation, subscription tiers, and aggregator submissions.
 //!
 //! Node topology:
 //!   0: Bootstrap (relay)
-//!   1-4: Relays
-//!   5-6: Exit nodes
-//!   7: Aggregator (relay)
-//!   8-9: Clients (Both mode)
+//!   1-5: Relays
+//!   6-8: Exit nodes
+//!   9: Aggregator (relay)
+//!   10-14: Clients (Both mode, diverse configs)
 //!
-//! Run with: cargo test -p tunnelcraft-tests ten_node_network -- --ignored --nocapture
+//! Client diversity:
+//!   Client-1 (10): Free tier,     Single hop, small requests
+//!   Client-2 (11): Basic sub,     Double hop, medium requests
+//!   Client-3 (12): Standard sub,  Double hop, 1x 10MB + small
+//!   Client-4 (13): Premium sub,   Triple hop, mixed requests
+//!   Client-5 (14): Basic sub,     Quad hop,   medium requests
+//!
+//! Run with: cargo test -p tunnelcraft-tests ten_node_live_network -- --ignored --nocapture
 
 use std::time::Duration;
 
@@ -33,11 +40,18 @@ enum TestCmd {
     GetStats(oneshot::Sender<FullStats>),
     Fetch {
         url: String,
+        timeout_secs: u64,
         reply: oneshot::Sender<Result<tunnelcraft_client::TunnelResponse, String>>,
     },
     DiscoverExits(oneshot::Sender<usize>),
     DiscoverRelays(oneshot::Sender<usize>),
     IsReady(oneshot::Sender<bool>),
+    AnnounceSubscription {
+        tier: u8,
+        epoch: u64,
+        expires_at: u64,
+        reply: oneshot::Sender<()>,
+    },
     Stop(oneshot::Sender<()>),
 }
 
@@ -80,7 +94,8 @@ async fn start_test_server() -> (std::net::SocketAddr, oneshot::Sender<()>) {
     let app = Router::new()
         .route("/ping", get(|| async { "pong" }))
         .route("/data/{size}", get(|Path(size): Path<usize>| async move {
-            let size = size.min(1024 * 1024);
+            // Allow up to 11 MB for large-payload testing
+            let size = size.min(11 * 1024 * 1024);
             "D".repeat(size)
         }))
         .route("/echo", axum::routing::post(|body: String| async move { body }));
@@ -159,8 +174,10 @@ async fn spawn_test_node(
                                 pool_breakdown,
                             });
                         }
-                        Some(TestCmd::Fetch { url, reply }) => {
+                        Some(TestCmd::Fetch { url, timeout_secs, reply }) => {
+                            let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
                             let result = node.get(&url).await;
+                            let _ = deadline; // timeout handled by caller
                             let _ = reply.send(result.map_err(|e| e.to_string()));
                         }
                         Some(TestCmd::DiscoverExits(reply)) => {
@@ -178,6 +195,10 @@ async fn spawn_test_node(
                         Some(TestCmd::IsReady(reply)) => {
                             node.run_maintenance();
                             let _ = reply.send(node.is_ready());
+                        }
+                        Some(TestCmd::AnnounceSubscription { tier, epoch, expires_at, reply }) => {
+                            node.announce_subscription(tier, epoch, expires_at);
+                            let _ = reply.send(());
                         }
                         Some(TestCmd::Stop(reply)) => {
                             node.stop().await;
@@ -205,17 +226,29 @@ async fn get_stats(node: &TestNode) -> FullStats {
     rx.await.unwrap()
 }
 
-async fn fetch(node: &TestNode, url: &str) -> Result<tunnelcraft_client::TunnelResponse, String> {
+async fn fetch(node: &TestNode, url: &str, timeout_secs: u64) -> Result<tunnelcraft_client::TunnelResponse, String> {
     let (tx, rx) = oneshot::channel();
     let _ = node.cmd_tx.send(TestCmd::Fetch {
         url: url.to_string(),
+        timeout_secs,
         reply: tx,
     }).await;
-    match tokio::time::timeout(Duration::from_secs(30), rx).await {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err("channel closed".to_string()),
         Err(_) => Err("timeout".to_string()),
     }
+}
+
+async fn announce_subscription(node: &TestNode, tier: u8, epoch: u64, expires_at: u64) {
+    let (tx, rx) = oneshot::channel();
+    let _ = node.cmd_tx.send(TestCmd::AnnounceSubscription {
+        tier,
+        epoch,
+        expires_at,
+        reply: tx,
+    }).await;
+    let _ = rx.await;
 }
 
 async fn discover_exits(node: &TestNode) -> usize {
@@ -296,9 +329,9 @@ async fn stop_node(node: TestNode) {
 
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
-        format!("{} MB", bytes / (1024 * 1024))
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else if bytes >= 1024 {
-        format!("{} KB", bytes / 1024)
+        format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{} B", bytes)
     }
@@ -313,7 +346,7 @@ fn short_hex(bytes: &[u8; 32]) -> String {
 // =========================================================================
 
 async fn print_dashboard(nodes: &[TestNode], elapsed_secs: u64) {
-    println!("\n\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550} TunnelCraft Network Monitor (T+{}s) \u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\n", elapsed_secs);
+    println!("\n======= TunnelCraft Network Monitor (T+{}s) =======\n", elapsed_secs);
 
     let mut all_stats = Vec::new();
     for node in nodes {
@@ -397,7 +430,7 @@ async fn print_dashboard(nodes: &[TestNode], elapsed_secs: u64) {
         }
     }
 
-    println!("\n\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\n");
+    println!("\n================================================\n");
 }
 
 // =========================================================================
@@ -405,7 +438,7 @@ async fn print_dashboard(nodes: &[TestNode], elapsed_secs: u64) {
 // =========================================================================
 
 async fn print_final_report(nodes: &[TestNode], ok_count: usize, err_count: usize, total_requests: usize) {
-    println!("\n\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550} Final Report \u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\n");
+    println!("\n======= Final Report =======\n");
 
     println!(
         "{:<12} {:>5} {:>7} {:>7} {:>13} {:>9} {:>7}",
@@ -459,7 +492,7 @@ async fn print_final_report(nodes: &[TestNode], ok_count: usize, err_count: usiz
         }
     }
 
-    println!("\n\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}");
+    println!("\n=============================");
 }
 
 // =========================================================================
@@ -467,7 +500,7 @@ async fn print_final_report(nodes: &[TestNode], ok_count: usize, err_count: usiz
 // =========================================================================
 
 #[tokio::test]
-#[ignore] // Takes ~90s, binds 10 TCP ports
+#[ignore] // Takes ~3-5min, binds 15 TCP ports
 async fn ten_node_live_network() {
     // Initialize tracing
     let _ = tracing_subscriber::fmt()
@@ -484,29 +517,30 @@ async fn ten_node_live_network() {
     println!("Test HTTP server on {}", server_addr);
 
     // ── Step 2: Spawn bootstrap node ──────────────────────────────────
-    let bootstrap_port: u16 = 41000;
+    let base_port: u16 = 41000;
     let bootstrap_config = NodeConfig {
         mode: NodeMode::Node,
         node_type: NodeType::Relay,
-        listen_addr: format!("/ip4/127.0.0.1/tcp/{}", bootstrap_port).parse().unwrap(),
+        listen_addr: format!("/ip4/127.0.0.1/tcp/{}", base_port).parse().unwrap(),
         enable_exit: false,
         enable_aggregator: false,
         ..Default::default()
     };
 
-    let bootstrap = spawn_test_node(bootstrap_config, "Bootstrap", bootstrap_port).await;
-    println!("Bootstrap node started: peer_id={}, port={}", bootstrap.peer_id, bootstrap_port);
+    let bootstrap = spawn_test_node(bootstrap_config, "Bootstrap", base_port).await;
+    println!("Bootstrap node started: peer_id={}, port={}", bootstrap.peer_id, base_port);
 
     let bootstrap_peer_id = bootstrap.peer_id;
-    let bootstrap_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", bootstrap_port).parse().unwrap();
+    let bootstrap_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", base_port).parse().unwrap();
     let bootstrap_peers = vec![(bootstrap_peer_id, bootstrap_addr.clone())];
 
-    // ── Step 3: Spawn remaining 9 nodes ───────────────────────────────
+    // ── Step 3: Spawn remaining 14 nodes ──────────────────────────────
     let mut nodes = vec![bootstrap];
 
-    // Relays 1-4
-    for i in 1..=4u16 {
-        let port = 41000 + i;
+    // Relays 1-5
+    let relay_names: &[&str] = &["Relay-1", "Relay-2", "Relay-3", "Relay-4", "Relay-5"];
+    for (i, &name) in relay_names.iter().enumerate() {
+        let port = base_port + 1 + i as u16;
         let config = NodeConfig {
             mode: NodeMode::Node,
             node_type: NodeType::Relay,
@@ -516,20 +550,15 @@ async fn ten_node_live_network() {
             enable_aggregator: false,
             ..Default::default()
         };
-        let role = match i {
-            1 => "Relay-1",
-            2 => "Relay-2",
-            3 => "Relay-3",
-            _ => "Relay-4",
-        };
-        let node = spawn_test_node(config, role, port).await;
-        println!("  {} started: peer_id={}, port={}", role, node.peer_id, port);
+        let node = spawn_test_node(config, name, port).await;
+        println!("  {} started: peer_id={}, port={}", name, node.peer_id, port);
         nodes.push(node);
     }
 
-    // Exits 5-6
-    for i in 5..=6u16 {
-        let port = 41000 + i;
+    // Exits 6-8
+    let exit_names: &[&str] = &["Exit-1", "Exit-2", "Exit-3"];
+    for (i, &name) in exit_names.iter().enumerate() {
+        let port = base_port + 6 + i as u16;
         let config = NodeConfig {
             mode: NodeMode::Node,
             node_type: NodeType::Exit,
@@ -540,15 +569,14 @@ async fn ten_node_live_network() {
             exit_blocked_domains: Some(vec![]), // Allow localhost for testing
             ..Default::default()
         };
-        let role = if i == 5 { "Exit-1" } else { "Exit-2" };
-        let node = spawn_test_node(config, role, port).await;
-        println!("  {} started: peer_id={}, port={}", role, node.peer_id, port);
+        let node = spawn_test_node(config, name, port).await;
+        println!("  {} started: peer_id={}, port={}", name, node.peer_id, port);
         nodes.push(node);
     }
 
-    // Aggregator (node 7)
+    // Aggregator (node 9)
     {
-        let port: u16 = 41007;
+        let port = base_port + 9;
         let config = NodeConfig {
             mode: NodeMode::Node,
             node_type: NodeType::Relay,
@@ -563,9 +591,27 @@ async fn ten_node_live_network() {
         nodes.push(node);
     }
 
-    // Clients 8-9 (Both mode — they relay + send requests)
-    for i in 8..=9u16 {
-        let port = 41000 + i;
+    // Clients 10-14 (Both mode — they relay + send requests)
+    struct ClientSpec {
+        name: &'static str,
+        hop_mode: HopMode,
+        /// 0 = free tier, 1 = Basic, 2 = Standard, 3 = Premium
+        subscription_tier: u8,
+    }
+
+    let client_specs = [
+        ClientSpec { name: "Client-1", hop_mode: HopMode::Single,  subscription_tier: 0 },
+        ClientSpec { name: "Client-2", hop_mode: HopMode::Double,  subscription_tier: 1 },
+        ClientSpec { name: "Client-3", hop_mode: HopMode::Double,  subscription_tier: 2 },
+        ClientSpec { name: "Client-4", hop_mode: HopMode::Triple,  subscription_tier: 3 },
+        ClientSpec { name: "Client-5", hop_mode: HopMode::Quad,    subscription_tier: 1 },
+    ];
+
+    // Track which indices are clients and their tiers
+    let client_start_idx = nodes.len(); // 10
+
+    for (i, spec) in client_specs.iter().enumerate() {
+        let port = base_port + 10 + i as u16;
         let config = NodeConfig {
             mode: NodeMode::Both,
             node_type: NodeType::Full,
@@ -573,110 +619,226 @@ async fn ten_node_live_network() {
             bootstrap_peers: bootstrap_peers.clone(),
             enable_exit: false,
             enable_aggregator: false,
-            hop_mode: HopMode::Double,
+            hop_mode: spec.hop_mode,
             ..Default::default()
         };
-        let role = if i == 8 { "Client-1" } else { "Client-2" };
-        let node = spawn_test_node(config, role, port).await;
-        println!("  {} started: peer_id={}, port={}", role, node.peer_id, port);
+        let node = spawn_test_node(config, spec.name, port).await;
+        println!(
+            "  {} started: peer_id={}, port={}, hops={:?}, sub_tier={}",
+            spec.name, node.peer_id, port, spec.hop_mode, spec.subscription_tier,
+        );
         nodes.push(node);
     }
 
-    println!("\nAll 10 nodes started. Waiting for mesh formation + exit discovery...");
+    let total_nodes = nodes.len();
+    println!("\nAll {} nodes started. Waiting for mesh formation + exit discovery...", total_nodes);
 
     // ── Step 4: Wait for gossipsub mesh formation ─────────────────────
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Trigger exit discovery on all nodes (especially clients)
-    // DHT needs active querying; run maintenance + discover on each node
+    // Trigger exit discovery on all nodes
     for node in &nodes {
         discover_exits(node).await;
     }
 
-    // Wait for client nodes to discover at least 1 exit (up to 30s)
+    // Wait for all client nodes to discover at least 1 exit
     println!("Waiting for clients to discover exit nodes...");
-    let c1_exits = wait_for_exits(&nodes[8], 1, 30).await;
-    let c2_exits = wait_for_exits(&nodes[9], 1, 30).await;
-    println!("  Client-1: {} exits discovered", c1_exits);
-    println!("  Client-2: {} exits discovered", c2_exits);
+    for i in 0..client_specs.len() {
+        let idx = client_start_idx + i;
+        let exits = wait_for_exits(&nodes[idx], 1, 30).await;
+        println!("  {}: {} exits discovered", client_specs[i].name, exits);
+        assert!(exits >= 1, "{} must discover at least 1 exit node", client_specs[i].name);
+    }
 
-    assert!(c1_exits >= 1, "Client-1 must discover at least 1 exit node");
-    assert!(c2_exits >= 1, "Client-2 must discover at least 1 exit node");
-
-    // Wait for relay discovery (DHT relay queries need time)
+    // Wait for relay discovery
     println!("Waiting for clients to discover relay nodes...");
-    let c1_relays = wait_for_relays(&nodes[8], 1, 30).await;
-    let c2_relays = wait_for_relays(&nodes[9], 1, 30).await;
-    println!("  Client-1: {} relays discovered", c1_relays);
-    println!("  Client-2: {} relays discovered", c2_relays);
+    for i in 0..client_specs.len() {
+        let idx = client_start_idx + i;
+        let relays = wait_for_relays(&nodes[idx], 1, 30).await;
+        println!("  {}: {} relays discovered", client_specs[i].name, relays);
+    }
 
-    // Wait for clients to be fully ready (gateway + exit + encryption keys)
+    // Wait for clients to be fully ready
     println!("Waiting for clients to be ready...");
-    let c1_ready = wait_for_ready(&nodes[8], "Client-1", 45).await;
-    let c2_ready = wait_for_ready(&nodes[9], "Client-2", 45).await;
-    println!("  Client-1 ready: {}", c1_ready);
-    println!("  Client-2 ready: {}", c2_ready);
+    for i in 0..client_specs.len() {
+        let idx = client_start_idx + i;
+        let ready = wait_for_ready(&nodes[idx], client_specs[i].name, 45).await;
+        println!("  {} ready: {}", client_specs[i].name, ready);
+        assert!(ready, "{} must be ready before sending requests", client_specs[i].name);
+    }
 
-    assert!(c1_ready, "Client-1 must be ready before sending requests");
-    assert!(c2_ready, "Client-2 must be ready before sending requests");
+    // ── Step 5: Announce subscriptions ────────────────────────────────
+    println!("\nAnnouncing subscriptions...");
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expires_at = now_secs + 3600; // 1 hour from now
+
+    for (i, spec) in client_specs.iter().enumerate() {
+        if spec.subscription_tier > 0 {
+            let idx = client_start_idx + i;
+            announce_subscription(&nodes[idx], spec.subscription_tier, 1, expires_at).await;
+            println!(
+                "  {} announced tier={} subscription (epoch=1, expires=+1h)",
+                spec.name, spec.subscription_tier,
+            );
+        }
+    }
+
+    // Let subscription gossip propagate
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Print initial connectivity
     print_dashboard(&nodes, test_start.elapsed().as_secs()).await;
 
-    // ── Step 5: Send requests ─────────────────────────────────────────
-    let total_requests = 20;
-    let requests_per_client = 10;
+    // ── Step 6: Send requests ─────────────────────────────────────────
+    let base_url = format!("http://{}", server_addr);
     let mut ok_count = 0usize;
     let mut err_count = 0usize;
+    let mut total_requests = 0usize;
+    let mut large_payload_ok = false;
 
-    let base_url = format!("http://{}", server_addr);
-
-    // Client-1 (node index 8): HTTP mode requests
-    println!("\nClient-1: Sending {} HTTP requests...", requests_per_client);
-    for i in 0..requests_per_client {
-        let url = if i % 2 == 0 {
-            format!("{}/ping", base_url)
-        } else {
-            format!("{}/data/{}", base_url, 100 + i * 50)
-        };
-
-        match fetch(&nodes[8], &url).await {
-            Ok(resp) => {
-                ok_count += 1;
-                println!("  Client-1 request {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
-            }
-            Err(e) => {
-                err_count += 1;
-                println!("  Client-1 request {}: FAILED: {}", i + 1, e);
-            }
-        }
-    }
-
-    // Client-2 (node index 9): HTTP mode requests
-    println!("\nClient-2: Sending {} HTTP requests...", requests_per_client);
-    for i in 0..requests_per_client {
-        let url = if i % 3 == 0 {
-            format!("{}/ping", base_url)
-        } else {
-            format!("{}/data/{}", base_url, 200 + i * 100)
-        };
-
-        match fetch(&nodes[9], &url).await {
-            Ok(resp) => {
-                ok_count += 1;
-                println!("  Client-2 request {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
-            }
-            Err(e) => {
-                err_count += 1;
-                println!("  Client-2 request {}: FAILED: {}", i + 1, e);
+    // --- Client-1: Free tier, Single hop, 10x small requests ---
+    {
+        let idx = client_start_idx;
+        let count = 10;
+        println!("\nClient-1 (free, Single): Sending {} small requests...", count);
+        for i in 0..count {
+            total_requests += 1;
+            let url = if i % 2 == 0 {
+                format!("{}/ping", base_url)
+            } else {
+                format!("{}/data/{}", base_url, 500)
+            };
+            match fetch(&nodes[idx], &url, 30).await {
+                Ok(resp) => {
+                    ok_count += 1;
+                    println!("  C1 req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
+                }
+                Err(e) => {
+                    err_count += 1;
+                    println!("  C1 req {}: FAILED: {}", i + 1, e);
+                }
             }
         }
     }
 
-    println!("\nRequests complete: {}/{} OK. Waiting 30s for proof cooldown...", ok_count, total_requests);
+    // --- Client-2: Basic sub, Double hop, 5x medium requests ---
+    {
+        let idx = client_start_idx + 1;
+        let count = 5;
+        println!("\nClient-2 (Basic, Double): Sending {} medium requests...", count);
+        for i in 0..count {
+            total_requests += 1;
+            let size = 10_000 + i * 10_000; // 10KB - 50KB
+            let url = format!("{}/data/{}", base_url, size);
+            match fetch(&nodes[idx], &url, 30).await {
+                Ok(resp) => {
+                    ok_count += 1;
+                    println!("  C2 req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
+                }
+                Err(e) => {
+                    err_count += 1;
+                    println!("  C2 req {}: FAILED: {}", i + 1, e);
+                }
+            }
+        }
+    }
 
-    // ── Step 6: Proof cooldown phase ──────────────────────────────────
-    // Poll for 30s to let proof deadlines trigger + gossip propagate
+    // --- Client-3: Standard sub, Double hop, 1x 10MB + 2x small ---
+    {
+        let idx = client_start_idx + 2;
+        println!("\nClient-3 (Standard, Double): Sending 1x 10MB large request...");
+        total_requests += 1;
+        let url_10mb = format!("{}/data/{}", base_url, 10 * 1024 * 1024);
+        match fetch(&nodes[idx], &url_10mb, 180).await {
+            Ok(resp) => {
+                ok_count += 1;
+                large_payload_ok = true;
+                println!(
+                    "  C3 LARGE: {} OK ({} = {})",
+                    resp.status,
+                    resp.body.len(),
+                    format_bytes(resp.body.len() as u64),
+                );
+            }
+            Err(e) => {
+                err_count += 1;
+                println!("  C3 LARGE: FAILED: {}", e);
+            }
+        }
+
+        println!("  Client-3: Sending 2x small requests...");
+        for i in 0..2 {
+            total_requests += 1;
+            let url = format!("{}/ping", base_url);
+            match fetch(&nodes[idx], &url, 30).await {
+                Ok(resp) => {
+                    ok_count += 1;
+                    println!("  C3 req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
+                }
+                Err(e) => {
+                    err_count += 1;
+                    println!("  C3 req {}: FAILED: {}", i + 1, e);
+                }
+            }
+        }
+    }
+
+    // --- Client-4: Premium sub, Triple hop, 8x mixed requests ---
+    {
+        let idx = client_start_idx + 3;
+        let count = 8;
+        println!("\nClient-4 (Premium, Triple): Sending {} mixed requests...", count);
+        for i in 0..count {
+            total_requests += 1;
+            let url = match i % 4 {
+                0 => format!("{}/ping", base_url),
+                1 => format!("{}/data/{}", base_url, 1_000),
+                2 => format!("{}/data/{}", base_url, 50_000),
+                _ => format!("{}/data/{}", base_url, 100_000),
+            };
+            match fetch(&nodes[idx], &url, 30).await {
+                Ok(resp) => {
+                    ok_count += 1;
+                    println!("  C4 req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
+                }
+                Err(e) => {
+                    err_count += 1;
+                    println!("  C4 req {}: FAILED: {}", i + 1, e);
+                }
+            }
+        }
+    }
+
+    // --- Client-5: Basic sub, Quad hop, 3x medium requests ---
+    {
+        let idx = client_start_idx + 4;
+        let count = 3;
+        println!("\nClient-5 (Basic, Quad): Sending {} medium requests...", count);
+        for i in 0..count {
+            total_requests += 1;
+            let url = format!("{}/data/{}", base_url, 5_000 + i * 2_000);
+            match fetch(&nodes[idx], &url, 45).await {
+                Ok(resp) => {
+                    ok_count += 1;
+                    println!("  C5 req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
+                }
+                Err(e) => {
+                    err_count += 1;
+                    println!("  C5 req {}: FAILED: {}", i + 1, e);
+                }
+            }
+        }
+    }
+
+    println!(
+        "\nAll requests complete: {}/{} OK. Waiting 30s for proof cooldown...",
+        ok_count, total_requests,
+    );
+
+    // ── Step 7: Proof cooldown phase ──────────────────────────────────
     let cooldown_start = std::time::Instant::now();
     let mut last_dashboard = std::time::Instant::now();
     while cooldown_start.elapsed() < Duration::from_secs(30) {
@@ -688,18 +850,18 @@ async fn ten_node_live_network() {
         }
     }
 
-    // ── Step 7: Final dashboard + report ──────────────────────────────
+    // ── Step 8: Final dashboard + report ──────────────────────────────
     print_dashboard(&nodes, test_start.elapsed().as_secs()).await;
     print_final_report(&nodes, ok_count, err_count, total_requests).await;
 
-    // ── Step 8: Assertions ────────────────────────────────────────────
+    // ── Step 9: Assertions ────────────────────────────────────────────
     let mut all_stats = Vec::new();
     for node in &nodes {
         all_stats.push((node.role, get_stats(node).await));
     }
 
-    // HARD: All 10 nodes started successfully (implicit — we got here)
-    assert_eq!(nodes.len(), 10, "All 10 nodes should be running");
+    // HARD: All nodes started successfully
+    assert_eq!(nodes.len(), total_nodes, "All {} nodes should be running", total_nodes);
 
     // HARD: All nodes have >= 1 peer
     for (role, stats) in &all_stats {
@@ -711,7 +873,7 @@ async fn ten_node_live_network() {
         );
     }
 
-    // HARD: At least 15/20 requests succeeded (75%)
+    // HARD: At least 75% of requests succeeded
     assert!(
         ok_count >= (total_requests * 3 / 4),
         "At least 75% of requests should succeed: {} / {}",
@@ -719,28 +881,29 @@ async fn ten_node_live_network() {
         total_requests,
     );
 
-    // HARD: At least 1 exit processed a request
+    // HARD: At least 2 exits processed requests (3 available)
     let exits_with_requests: Vec<_> = all_stats
         .iter()
         .filter(|(role, stats)| role.starts_with("Exit") && stats.node_stats.requests_exited > 0)
         .collect();
     assert!(
-        !exits_with_requests.is_empty(),
-        "At least 1 exit should have processed a request",
+        exits_with_requests.len() >= 2,
+        "At least 2 exits should have processed requests, got {}",
+        exits_with_requests.len(),
     );
 
-    // HARD: At least 3 relays have shards_relayed > 0
+    // HARD: At least 5 nodes relayed shards
     let relays_with_shards: Vec<_> = all_stats
         .iter()
         .filter(|(_, stats)| stats.node_stats.shards_relayed > 0)
         .collect();
     assert!(
-        relays_with_shards.len() >= 3,
-        "At least 3 nodes should have relayed shards, got {}",
+        relays_with_shards.len() >= 5,
+        "At least 5 nodes should have relayed shards, got {}",
         relays_with_shards.len(),
     );
 
-    // HARD: At least 1 relay generated >= 1 proof
+    // HARD: At least 1 relay generated forward receipts
     let relays_with_receipts: Vec<_> = all_stats
         .iter()
         .filter(|(_, stats)| stats.receipt_count > 0)
@@ -751,7 +914,8 @@ async fn ten_node_live_network() {
     );
 
     // HARD: Aggregator pool_count >= 1 (if aggregator received proofs)
-    let aggregator_stats = &all_stats[7].1; // index 7 = Aggregator
+    let aggregator_idx = 9; // Aggregator is node index 9
+    let aggregator_stats = &all_stats[aggregator_idx].1;
     if aggregator_stats.aggregator_stats.as_ref().map_or(0, |a| a.active_pools) > 0 {
         println!("Aggregator received proofs - checking pool count");
         assert!(
@@ -762,7 +926,12 @@ async fn ten_node_live_network() {
         println!("SOFT WARNING: Aggregator did not receive any proof messages (proofs may not have fired in time)");
     }
 
-    // SOFT assertions (warnings only)
+    // SOFT: Large payload completed
+    if !large_payload_ok {
+        println!("SOFT WARNING: 10MB large payload request did not succeed");
+    }
+
+    // SOFT: All requests succeeded
     if ok_count < total_requests {
         println!(
             "SOFT WARNING: Not all requests succeeded: {}/{}",
@@ -770,22 +939,22 @@ async fn ten_node_live_network() {
         );
     }
 
-    let exits_count = all_stats.iter()
-        .filter(|(role, stats)| role.starts_with("Exit") && stats.node_stats.requests_exited > 0)
-        .count();
-    if exits_count < 2 {
-        println!("SOFT WARNING: Only {}/2 exits processed requests", exits_count);
+    // SOFT: All 3 exits processed at least 1 request
+    if exits_with_requests.len() < 3 {
+        println!("SOFT WARNING: Only {}/3 exits processed requests", exits_with_requests.len());
     }
 
+    // SOFT: >= 5 relays earned receipts
     let relay_receipt_count = all_stats.iter()
         .filter(|(role, stats)| {
             (role.starts_with("Relay") || role.starts_with("Boot")) && stats.receipt_count > 0
         })
         .count();
     if relay_receipt_count < 5 {
-        println!("SOFT WARNING: Only {}/5 relays earned receipts", relay_receipt_count);
+        println!("SOFT WARNING: Only {}/5+ relays earned receipts", relay_receipt_count);
     }
 
+    // SOFT: Aggregator stats
     if let Some(ref agg) = aggregator_stats.aggregator_stats {
         if agg.total_bytes == 0 {
             println!("SOFT WARNING: Aggregator total_bytes is 0");
@@ -795,7 +964,7 @@ async fn ten_node_live_network() {
         }
     }
 
-    // ── Step 9: Cleanup ───────────────────────────────────────────────
+    // ── Step 10: Cleanup ──────────────────────────────────────────────
     println!("\nShutting down nodes...");
     for node in nodes {
         stop_node(node).await;

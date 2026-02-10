@@ -94,7 +94,8 @@ async fn test_full_tunnel_roundtrip_direct() {
     for shard in shards {
         let result = exit_handler.process_shard(shard).await
             .expect("Exit should accept shard");
-        if let Some((resp_shards, _gateway)) = result {
+        if let Some(shard_pairs) = result {
+            let resp_shards: Vec<_> = shard_pairs.into_iter().map(|(s, _)| s).collect();
             response_shards = Some(resp_shards);
         }
     }
@@ -552,7 +553,8 @@ async fn test_client_relay_exit_integration() {
     for shard in exit_bound_shards {
         let result = exit_handler.process_shard(shard).await
             .expect("Exit should accept shard");
-        if let Some((resp, _gateway)) = result {
+        if let Some(shard_pairs) = result {
+            let resp: Vec<_> = shard_pairs.into_iter().map(|(s, _)| s).collect();
             response_shards = Some(resp);
         }
     }

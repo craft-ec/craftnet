@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::identity::Keypair;
-use libp2p::request_response::OutboundRequestId;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId};
 use parking_lot::RwLock;
@@ -29,7 +28,7 @@ use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_erasure::chunker::reassemble;
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_network::{
-    build_swarm, NetworkConfig, ShardRequest, ShardResponse, TunnelCraftBehaviour,
+    build_swarm, NetworkConfig, ShardResponse, TunnelCraftBehaviour,
     TunnelCraftBehaviourEvent, ExitStatusMessage, ExitStatusType,
     RelayStatusMessage, RelayStatusType,
     ProofMessage, PoolType,
@@ -38,6 +37,7 @@ use tunnelcraft_network::{
     EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
     RELAY_HEARTBEAT_INTERVAL, RELAY_OFFLINE_THRESHOLD,
     EXIT_STATUS_TOPIC, RELAY_STATUS_TOPIC, PROOF_TOPIC,
+    StreamManager, InboundShard, SHARD_STREAM_PROTOCOL,
 };
 use tunnelcraft_aggregator::Aggregator;
 use tunnelcraft_prover::{Prover, StubProver};
@@ -62,9 +62,6 @@ fn derive_tunnel_id(client_peer_id: &PeerId, gateway_peer_id: &PeerId) -> Id {
     id.copy_from_slice(&result);
     id
 }
-
-/// Max retry attempts for a rejected/failed outbound shard
-const MAX_SHARD_RETRIES: usize = 3;
 
 // === Proof state persistence types ===
 
@@ -137,15 +134,6 @@ struct SubscriptionEntry {
     verified: bool,
     /// Last time we saw traffic from this user
     last_seen: std::time::Instant,
-}
-
-/// A shard that was sent to a peer and is pending acknowledgment.
-/// If rejected or failed, we retry with a different peer.
-struct PendingOutbound {
-    shard: Shard,
-    source_peer: Option<PeerId>,
-    tried_peers: HashSet<PeerId>,
-    attempts: usize,
 }
 
 /// Operating mode for the node
@@ -823,8 +811,18 @@ pub struct TunnelCraftNode {
     /// Pool keys that need chain recovery (have pending receipts but no pool_roots entry).
     /// On startup, if proof state is lost, query aggregator peers for latest chain state.
     needs_chain_recovery: Vec<(PublicKey, PoolType, u64)>,
-    /// Outbound shards pending acknowledgment — retry on rejection/failure
-    pending_outbound: HashMap<OutboundRequestId, PendingOutbound>,
+    /// Persistent stream manager for shard transport
+    stream_manager: Option<StreamManager>,
+    /// High-priority inbound shard channel (subscribed peers)
+    inbound_high_rx: Option<mpsc::Receiver<InboundShard>>,
+    /// Low-priority inbound shard channel (free-tier peers)
+    inbound_low_rx: Option<mpsc::Receiver<InboundShard>>,
+    /// Incoming streams from peers (for accepting inbound stream connections)
+    incoming_streams: Option<tunnelcraft_network::IncomingStreams>,
+    /// Receipt channel from fire-and-forget stream acks
+    stream_receipt_rx: Option<mpsc::Receiver<ForwardReceipt>>,
+    /// Layer 2: free-tier shards deferred after onion peel
+    deferred_forwards: VecDeque<(Shard, PeerId)>,
 
     /// Aggregator service (collects proof messages, builds distributions)
     aggregator: Option<Aggregator>,
@@ -1020,7 +1018,12 @@ impl TunnelCraftNode {
             proof_enqueue_since_save: 0,
             proof_oldest_receipt,
             needs_chain_recovery,
-            pending_outbound: HashMap::new(),
+            stream_manager: None,
+            inbound_high_rx: None,
+            inbound_low_rx: None,
+            incoming_streams: None,
+            stream_receipt_rx: None,
+            deferred_forwards: VecDeque::new(),
             aggregator: if enable_aggregator {
                 #[cfg(feature = "risc0")]
                 let agg_prover: Box<dyn tunnelcraft_prover::Prover> = Box::new(tunnelcraft_prover::Risc0Prover::new());
@@ -1137,6 +1140,26 @@ impl TunnelCraftNode {
             .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
 
         info!("Node started with peer ID: {}", peer_id);
+
+        // Initialize persistent stream manager
+        let mut stream_control = swarm.behaviour().stream_control();
+        let (stream_mgr, high_rx, low_rx, receipt_rx) =
+            StreamManager::new(stream_control.clone(), peer_id);
+        self.stream_manager = Some(stream_mgr);
+        self.inbound_high_rx = Some(high_rx);
+        self.inbound_low_rx = Some(low_rx);
+        self.stream_receipt_rx = Some(receipt_rx);
+
+        // Register for inbound shard streams
+        match stream_control.accept(SHARD_STREAM_PROTOCOL) {
+            Ok(incoming) => {
+                self.incoming_streams = Some(incoming);
+                info!("Registered for inbound shard streams");
+            }
+            Err(e) => {
+                warn!("Failed to register for inbound shard streams: {:?}", e);
+            }
+        }
 
         self.local_peer_id = Some(peer_id);
         self.swarm = Some(swarm);
@@ -2121,22 +2144,12 @@ impl TunnelCraftNode {
         );
 
         if let Some(target_peer) = target {
-            // Direct mode: send all shards to the target (exit) peer
-            for shard in shards {
-                if let Some(ref mut swarm) = self.swarm {
-                    let shard_clone = shard.clone();
-                    let request = ShardRequest { shard };
-                    let req_id = swarm.behaviour_mut().send_shard(target_peer, request);
-                    self.pending_outbound.insert(req_id, PendingOutbound {
-                        shard: shard_clone,
-                        source_peer: None,
-                        tried_peers: {
-                            let mut s = HashSet::new();
-                            s.insert(target_peer);
-                            s
-                        },
-                        attempts: 0,
-                    });
+            // Direct mode: send all shards to the target (exit) peer via persistent stream
+            for shard in &shards {
+                if let Some(ref mut sm) = self.stream_manager {
+                    if let Err(e) = sm.send_shard(target_peer, shard, false).await {
+                        warn!("Stream send to {} failed: {}", target_peer, e);
+                    }
                 }
             }
         } else {
@@ -2145,7 +2158,7 @@ impl TunnelCraftNode {
             // shard goes to a different peer (when enough peers are available).
             let mut used_peers = HashSet::new();
             for shard in shards {
-                if let Some(selected) = self.forward_shard(shard, None, used_peers.clone()) {
+                if let Some(selected) = self.forward_shard_stream(shard, None, &used_peers).await {
                     used_peers.insert(selected);
                 }
             }
@@ -2226,7 +2239,7 @@ impl TunnelCraftNode {
 
         // Process as relay: peel one onion layer, forward to next hop
         info!("[SHARD-FLOW] node={} routing to RELAY handler (header_len={})", &local_id[local_id.len().saturating_sub(6)..], shard.header.len());
-        self.relay_shard(shard, Some(source_peer))
+        self.relay_shard(shard, Some(source_peer)).await
     }
 
     /// Process shard as exit node.
@@ -2244,21 +2257,17 @@ impl TunnelCraftNode {
 
         let result = handler.process_shard(shard).await;
 
-        // Put handler back and extract response shards + gateway
-        let response_info = {
+        // Put handler back and extract per-shard (shard, gateway) pairs
+        let shard_pairs = {
             let mut state = self.state.write();
             state.exit_handler = Some(handler);
 
             match result {
-                Ok(Some((shards, gateway_bytes))) => {
-                    state.stats.requests_exited += 1;
-                    // Determine response target: gateway from LeaseSet, or source_peer (direct mode)
-                    let target = if let Some(ref gw) = gateway_bytes {
-                        PeerId::from_bytes(gw).ok().unwrap_or(source_peer)
-                    } else {
-                        source_peer
-                    };
-                    Some((shards, target))
+                Ok(Some(pairs)) => {
+                    if !pairs.is_empty() {
+                        state.stats.requests_exited += 1;
+                    }
+                    pairs
                 }
                 Ok(None) => {
                     return ShardResponse::Accepted(None);
@@ -2270,17 +2279,31 @@ impl TunnelCraftNode {
         };
         // Lock released here
 
-        // Send response shards to target (gateway or source_peer)
-        if let Some((shards, target)) = response_info {
+        // Send each response shard to its designated gateway
+        if !shard_pairs.is_empty() {
             let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
-            info!(
-                "[SHARD-FLOW] node={} EXIT sending {} response shards to gateway={}",
-                &local_id[local_id.len().saturating_sub(6)..],
-                shards.len(),
-                &target.to_string()[target.to_string().len().saturating_sub(6)..],
-            );
-            if let Err(e) = self.send_shards(shards, Some(target)).await {
-                warn!("Failed to send response shards: {}", e);
+            let local_short = &local_id[local_id.len().saturating_sub(6)..];
+
+            // Group shards by gateway for efficient batched sending
+            let mut by_gateway: HashMap<PeerId, Vec<Shard>> = HashMap::new();
+            for (shard, gateway_bytes) in shard_pairs {
+                let target = gateway_bytes
+                    .and_then(|gw| PeerId::from_bytes(&gw).ok())
+                    .unwrap_or(source_peer);
+                by_gateway.entry(target).or_default().push(shard);
+            }
+
+            for (target, shards) in by_gateway {
+                let target_str = target.to_string();
+                info!(
+                    "[SHARD-FLOW] node={} EXIT sending {} response shards to gateway={}",
+                    local_short,
+                    shards.len(),
+                    &target_str[target_str.len().saturating_sub(6)..],
+                );
+                if let Err(e) = self.send_shards(shards, Some(target)).await {
+                    warn!("Failed to send response shards to {}: {}", target, e);
+                }
             }
         }
 
@@ -2291,7 +2314,7 @@ impl TunnelCraftNode {
     ///
     /// The relay handler returns (modified_shard, next_peer_id_bytes, receipt).
     /// We forward the modified shard to the specified next peer.
-    fn relay_shard(&mut self, shard: Shard, _source_peer: Option<PeerId>) -> ShardResponse {
+    async fn relay_shard(&mut self, shard: Shard, _source_peer: Option<PeerId>) -> ShardResponse {
         // Get sender_pubkey from libp2p connection (for ForwardReceipt anti-replay)
         let sender_pubkey = self.keypair.public_key_bytes(); // placeholder: use connection auth
 
@@ -2341,22 +2364,19 @@ impl TunnelCraftNode {
                 // Store the receipt for settlement
                 self.store_forward_receipt(receipt.clone());
 
-                // Resolve next_peer bytes to PeerId and forward
+                // Resolve next_peer bytes to PeerId and forward via persistent stream
                 if let Ok(next_peer) = PeerId::from_bytes(&next_peer_bytes) {
-                    if let Some(ref mut swarm) = self.swarm {
-                        let shard_clone = modified_shard.clone();
-                        let request = ShardRequest { shard: modified_shard };
-                        let req_id = swarm.behaviour_mut().send_shard(next_peer, request);
-                        self.pending_outbound.insert(req_id, PendingOutbound {
-                            shard: shard_clone,
-                            source_peer: None,
-                            tried_peers: {
-                                let mut s = HashSet::new();
-                                s.insert(next_peer);
-                                s
-                            },
-                            attempts: 0,
-                        });
+                    // Layer 2 subscription priority: defer free-tier shards
+                    if pool_pubkey == [0u8; 32] {
+                        // Free tier — defer forwarding until after high-priority work
+                        self.deferred_forwards.push_back((modified_shard, next_peer));
+                    } else {
+                        // Subscribed — forward immediately via stream
+                        if let Some(ref mut sm) = self.stream_manager {
+                            if let Err(e) = sm.send_shard(next_peer, &modified_shard, false).await {
+                                warn!("Stream forward to {} failed: {}", next_peer, e);
+                            }
+                        }
                     }
                 } else {
                     warn!("Could not parse next_peer PeerId from onion layer");
@@ -2373,86 +2393,33 @@ impl TunnelCraftNode {
         }
     }
 
-    /// Forward a shard to a peer using best-effort routing.
-    ///
-    /// In onion mode, the shard's header determines its full path.
-    /// The client just needs to send it to the first relay (any connected peer).
-    /// Relay-to-relay forwarding is handled by relay_shard (onion peel).
-    ///
-    /// Returns the PeerId the shard was sent to (for cross-shard exclusion),
-    /// or None if no peer available.
-    fn forward_shard(&mut self, shard: Shard, source_peer: Option<PeerId>, tried_peers: HashSet<PeerId>) -> Option<PeerId> {
-        self.forward_shard_inner(shard, source_peer, tried_peers, 0)
-    }
-
-    fn forward_shard_inner(
+    /// Forward a shard via persistent stream to any available relay peer.
+    /// Returns the selected peer if one was found.
+    async fn forward_shard_stream(
         &mut self,
         shard: Shard,
         source_peer: Option<PeerId>,
-        tried_peers: HashSet<PeerId>,
-        attempts: usize,
+        exclude: &HashSet<PeerId>,
     ) -> Option<PeerId> {
-        // In onion mode: send to any available relay peer (the onion header
-        // determines the actual routing path). Exclude source to prevent
-        // sending back to sender.
-        let mut exclude = tried_peers.clone();
+        let mut full_exclude = exclude.clone();
         if let Some(src) = source_peer {
-            exclude.insert(src);
+            full_exclude.insert(src);
         }
-        let target_peer = self.select_relay_peer_multi_exclude(&exclude);
+        let target_peer = self.select_relay_peer_multi_exclude(&full_exclude);
 
         if let Some(peer_id) = target_peer {
-            if let Some(ref mut swarm) = self.swarm {
-                debug!(
-                    "Forwarding shard to peer {}",
-                    peer_id,
-                );
-                let shard_clone = shard.clone();
-                let request = ShardRequest { shard };
-                let req_id = swarm.behaviour_mut().send_shard(peer_id, request);
-                let mut tried = tried_peers;
-                tried.insert(peer_id);
-                self.pending_outbound.insert(req_id, PendingOutbound {
-                    shard: shard_clone,
-                    source_peer,
-                    tried_peers: tried,
-                    attempts,
-                });
+            debug!("Forwarding shard to peer {} via stream", peer_id);
+            if let Some(ref mut sm) = self.stream_manager {
+                if let Err(e) = sm.send_shard(peer_id, &shard, false).await {
+                    warn!("Stream forward to {} failed: {}", peer_id, e);
+                    return None;
+                }
                 return Some(peer_id);
             }
         }
 
-        warn!("Cannot forward shard: no peers available (tried {} peers)", tried_peers.len());
+        warn!("Cannot forward shard: no peers available (tried {} peers)", exclude.len());
         None
-    }
-
-    /// Retry a shard that was rejected or failed — pick a different peer
-    fn retry_shard(&mut self, request_id: OutboundRequestId, rejected_peer: PeerId) {
-        let Some(mut pending) = self.pending_outbound.remove(&request_id) else {
-            return;
-        };
-        pending.tried_peers.insert(rejected_peer);
-        pending.attempts += 1;
-
-        if pending.attempts > MAX_SHARD_RETRIES {
-            warn!(
-                "Shard exhausted {} retries, dropping",
-                MAX_SHARD_RETRIES,
-            );
-            return;
-        }
-
-        info!(
-            "Retrying shard (attempt {}/{})",
-            pending.attempts,
-            MAX_SHARD_RETRIES,
-        );
-
-        let shard = pending.shard;
-        let source_peer = pending.source_peer;
-        let tried_peers = pending.tried_peers;
-        let attempts = pending.attempts;
-        self.forward_shard_inner(shard, source_peer, tried_peers, attempts);
     }
 
     /// Select a relay peer using load-weighted selection, excluding specific peers.
@@ -3028,6 +2995,22 @@ impl TunnelCraftNode {
                     }
                 }
             }
+            // Accept inbound streams from peers
+            incoming = async {
+                if let Some(ref mut inc) = self.incoming_streams {
+                    use futures::StreamExt;
+                    inc.next().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if let Some((peer, stream)) = incoming {
+                    let tier = self.get_peer_tier(&peer);
+                    if let Some(ref mut sm) = self.stream_manager {
+                        sm.accept_stream(peer, stream, tier);
+                    }
+                }
+            }
             burst = async {
                 if let Some(ref mut rx) = self.tunnel_burst_rx {
                     rx.recv().await
@@ -3041,6 +3024,91 @@ impl TunnelCraftNode {
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
+
+        // Priority-ordered stream shard processing:
+        // 1. Drain high-priority (subscribed peers) first
+        // 2. Then low-priority (free-tier peers)
+        // 3. Then deferred forwards (layer 2: free-tier shards after onion peel)
+        self.drain_stream_shards().await;
+
+        // Drain receipts from fire-and-forget stream acks
+        self.drain_stream_receipts();
+    }
+
+    /// Drain inbound shards from stream channels in priority order.
+    async fn drain_stream_shards(&mut self) {
+        // Collect inbound shards into a vec to avoid borrow conflicts
+        // (channel borrow vs &mut self for process_incoming_shard)
+        let mut high_batch: Vec<InboundShard> = Vec::new();
+        if let Some(ref mut rx) = self.inbound_high_rx {
+            while let Ok(inbound) = rx.try_recv() {
+                high_batch.push(inbound);
+            }
+        }
+
+        let mut low_batch: Vec<InboundShard> = Vec::new();
+        if let Some(ref mut rx) = self.inbound_low_rx {
+            while let Ok(inbound) = rx.try_recv() {
+                low_batch.push(inbound);
+            }
+        }
+
+        // Process high-priority first, then low-priority
+        for inbound in high_batch.into_iter().chain(low_batch.into_iter()) {
+            let peer = inbound.peer;
+            let seq_id = inbound.seq_id;
+            let response = self.process_incoming_shard(inbound.shard, peer).await;
+            match response {
+                ShardResponse::Accepted(receipt) => {
+                    if let Some(ref mut sm) = self.stream_manager {
+                        let _ = sm.send_ack(peer, seq_id, receipt.as_deref()).await;
+                    }
+                }
+                ShardResponse::Rejected(reason) => {
+                    if let Some(ref mut sm) = self.stream_manager {
+                        let _ = sm.send_nack(peer, seq_id, &reason).await;
+                    }
+                    if reason.contains("Not in relay mode") {
+                        info!("Removing non-relay peer {} from relay pool", peer);
+                        self.unverified_relay_peers.retain(|p| *p != peer);
+                        self.relay_nodes.retain(|_, s| s.peer_id != peer);
+                    }
+                }
+            }
+        }
+
+        // Drain deferred forwards (layer 2: free-tier shards deferred after onion peel)
+        // Collect first to avoid borrow conflicts with stream_manager
+        let deferred: Vec<_> = self.deferred_forwards.drain(..).collect();
+        for (shard, next_hop) in deferred {
+            if let Some(ref mut sm) = self.stream_manager {
+                if let Err(e) = sm.send_shard(next_hop, &shard, false).await {
+                    warn!("Failed to send deferred shard to {}: {}", next_hop, e);
+                }
+            }
+        }
+    }
+
+    /// Drain receipts arriving from stream ack frames.
+    fn drain_stream_receipts(&mut self) {
+        // Collect first to avoid borrow conflicts
+        let mut receipts = Vec::new();
+        if let Some(ref mut rx) = self.stream_receipt_rx {
+            while let Ok(receipt) = rx.try_recv() {
+                receipts.push(receipt);
+            }
+        }
+        for receipt in receipts {
+            self.store_forward_receipt(receipt);
+        }
+    }
+
+    /// Get a peer's subscription tier (0=free, 1+=subscribed).
+    fn get_peer_tier(&self, _peer: &PeerId) -> u8 {
+        // TODO: look up peer's signing pubkey and check subscription_cache
+        // For now, default to 0 (free tier) — subscription priority will work
+        // once we add peer-to-pubkey mapping
+        0
     }
 
     /// Run periodic maintenance tasks (heartbeats, DHT discovery, cleanup).
@@ -3171,11 +3239,13 @@ impl TunnelCraftNode {
             .ok_or(ClientError::NotConnected)?;
         let our_bytes = our_peer_id.to_bytes();
 
-        // Always select a gateway relay. The gateway is the first onion hop
-        // on every path. There is no direct client → exit connection.
+        // Select all eligible gateway relays. The primary gateway is the first
+        // onion hop for this request's shards. Additional gateways are included
+        // in the LeaseSet so the exit can pick any for response routing.
         //
         // Path: client → gateway → [extra_hops relays] → exit
-        let (gw_peer_id, gw_hop) = self.select_gateway_relay(&our_bytes)
+        let all_gateways = self.select_all_gateway_relays(&our_bytes);
+        let (gw_peer_id, gw_hop) = all_gateways.first().cloned()
             .ok_or(ClientError::RequestFailed(
                 "No gateway relay available (not connected to any relay)".to_string(),
             ))?;
@@ -3183,29 +3253,28 @@ impl TunnelCraftNode {
         let tunnel_id = derive_tunnel_id(&our_peer_id, &gw_peer_id);
 
         info!(
-            "Path built: client={} gateway={} tunnel_id={} enc_key={}",
+            "Path built: client={} gateway={} tunnel_id={} enc_key={} (lease_set has {} gateways)",
             our_peer_id,
             gw_peer_id,
             hex::encode(&tunnel_id[..8]),
             hex::encode(&gw_hop.encryption_pubkey[..8]),
+            all_gateways.len(),
         );
 
-        debug!(
-            "Gateway {} (connected={}, extra_hops={}) tunnel_id={}",
-            gw_peer_id,
-            self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&gw_peer_id)),
-            extra_hops,
-            hex::encode(&tunnel_id[..8]),
-        );
+        // Build LeaseSet with all available gateways
+        let leases: Vec<Lease> = all_gateways.iter().map(|(pid, hop)| {
+            let tid = derive_tunnel_id(&our_peer_id, pid);
+            Lease {
+                gateway_peer_id: pid.to_bytes(),
+                gateway_encryption_pubkey: hop.encryption_pubkey,
+                tunnel_id: tid,
+                expires_at: u64::MAX,
+            }
+        }).collect();
 
         let lease_set = LeaseSet {
             session_id: random_id(),
-            leases: vec![Lease {
-                gateway_peer_id: gw_peer_id.to_bytes(),
-                gateway_encryption_pubkey: gw_hop.encryption_pubkey,
-                tunnel_id,
-                expires_at: u64::MAX,
-            }],
+            leases,
         };
 
         // Build paths: gateway is always the first onion hop
@@ -3316,6 +3385,67 @@ impl TunnelCraftNode {
         None
     }
 
+    /// Select ALL eligible gateway relays for the LeaseSet.
+    ///
+    /// Returns a list of `(PeerId, PathHop)` sorted: topology-confirmed first,
+    /// then fallback relays. The first entry is the primary gateway for this
+    /// request. Additional entries go into the LeaseSet so the exit can pick
+    /// any for response routing.
+    fn select_all_gateway_relays(&self, our_bytes: &[u8]) -> Vec<(PeerId, PathHop)> {
+        let Some(swarm) = self.swarm.as_ref() else { return vec![] };
+
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+
+        // First pass: topology-confirmed relays (best quality)
+        for relay_status in self.relay_nodes.values() {
+            if !swarm.is_connected(&relay_status.peer_id) {
+                continue;
+            }
+            if let Some(topo_relay) = self.topology.relays_with_encryption()
+                .into_iter()
+                .find(|r| r.signing_pubkey == relay_status.info.pubkey
+                    && r.connected_peers.contains(our_bytes))
+            {
+                if seen.insert(relay_status.peer_id) {
+                    results.push((relay_status.peer_id, PathHop {
+                        peer_id: relay_status.peer_id.to_bytes(),
+                        signing_pubkey: topo_relay.signing_pubkey,
+                        encryption_pubkey: topo_relay.encryption_pubkey,
+                    }));
+                }
+            }
+        }
+
+        // Second pass: DHT relays with encryption keys (fallback)
+        for relay_status in self.relay_nodes.values() {
+            if !swarm.is_connected(&relay_status.peer_id) || seen.contains(&relay_status.peer_id) {
+                continue;
+            }
+            let enc_key = self.topology.relays_with_encryption()
+                .into_iter()
+                .find(|r| r.signing_pubkey == relay_status.info.pubkey)
+                .map(|r| r.encryption_pubkey)
+                .or(relay_status.info.encryption_pubkey)
+                .unwrap_or([0u8; 32]);
+
+            if enc_key == [0u8; 32] {
+                continue;
+            }
+
+            if seen.insert(relay_status.peer_id) {
+                results.push((relay_status.peer_id, PathHop {
+                    peer_id: relay_status.peer_id.to_bytes(),
+                    signing_pubkey: relay_status.info.pubkey,
+                    encryption_pubkey: enc_key,
+                }));
+            }
+        }
+
+        info!("Selected {} gateway relays for LeaseSet", results.len());
+        results
+    }
+
     /// Send shards to per-path first-hop targets.
     /// Each shard is sent to `first_hops[i % first_hops.len()]`.
     async fn send_shards_per_hop(&mut self, shards: Vec<Shard>, first_hops: &[PeerId]) -> Result<()> {
@@ -3329,22 +3459,12 @@ impl TunnelCraftNode {
             first_hops.len(),
         );
 
-        for (i, shard) in shards.into_iter().enumerate() {
+        for (i, shard) in shards.iter().enumerate() {
             let target = first_hops[i % first_hops.len()];
-            if let Some(ref mut swarm) = self.swarm {
-                let shard_clone = shard.clone();
-                let request = ShardRequest { shard };
-                let req_id = swarm.behaviour_mut().send_shard(target, request);
-                self.pending_outbound.insert(req_id, PendingOutbound {
-                    shard: shard_clone,
-                    source_peer: None,
-                    tried_peers: {
-                        let mut s = HashSet::new();
-                        s.insert(target);
-                        s
-                    },
-                    attempts: 0,
-                });
+            if let Some(ref mut sm) = self.stream_manager {
+                if let Err(e) = sm.send_shard(target, shard, false).await {
+                    warn!("Stream send to {} failed: {}", target, e);
+                }
             }
         }
 
@@ -3506,6 +3626,10 @@ impl TunnelCraftNode {
                             status.online = false;
                         }
                     }
+                    // Clean up persistent stream
+                    if let Some(ref mut sm) = self.stream_manager {
+                        sm.on_peer_disconnected(&peer_id);
+                    }
                     self.publish_topology();
                 }
             }
@@ -3577,69 +3701,6 @@ impl TunnelCraftNode {
                     } else {
                         debug!("Received gossipsub message on unknown topic: {:?}", message.topic);
                     }
-                }
-            }
-            TunnelCraftBehaviourEvent::Shard(shard_event) => {
-                use libp2p::request_response::{Event, Message};
-                match shard_event {
-                    Event::Message {
-                        message: Message::Request { request, channel, .. },
-                        peer, ..
-                    } => {
-                        let response = self.process_incoming_shard(request.shard, peer).await;
-                        if let Some(ref mut swarm) = self.swarm {
-                            let _ = swarm
-                                .behaviour_mut()
-                                .send_shard_response(channel, response);
-                        }
-                    }
-                    Event::Message {
-                        message: Message::Response { request_id, response },
-                        peer, ..
-                    } => {
-                        match response {
-                            ShardResponse::Accepted(Some(receipt)) => {
-                                info!(
-                                    "Received ForwardReceipt from peer: req={}, shard={}, receiver={}",
-                                    hex::encode(&receipt.request_id[..8]),
-                                    hex::encode(&receipt.shard_id[..8]),
-                                    hex::encode(&receipt.receiver_pubkey[..8]),
-                                );
-                                self.pending_outbound.remove(&request_id);
-                                self.store_forward_receipt(*receipt);
-                            }
-                            ShardResponse::Accepted(None) => {
-                                self.pending_outbound.remove(&request_id);
-                                debug!("Shard accepted by peer (no receipt)");
-                            }
-                            ShardResponse::Rejected(ref reason) => {
-                                warn!("Shard rejected by {}: {}", peer, reason);
-                                // Remove non-relay peers from relay pools
-                                if reason.contains("Not in relay mode") {
-                                    info!("Removing non-relay peer {} from relay pool", peer);
-                                    self.unverified_relay_peers.retain(|p| *p != peer);
-                                    // Also remove from DHT-verified relay nodes
-                                    self.relay_nodes.retain(|_, s| s.peer_id != peer);
-                                }
-                                // Retry with a different peer
-                                self.retry_shard(request_id, peer);
-                            }
-                        }
-                    }
-                    Event::OutboundFailure { request_id, peer, error, .. } => {
-                        let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
-                        warn!(
-                            "[SHARD-FLOW] node={} OUTBOUND FAILED to {} error={:?}",
-                            &local_id[local_id.len().saturating_sub(6)..],
-                            &peer.to_string()[peer.to_string().len().saturating_sub(6)..],
-                            error,
-                        );
-                        self.retry_shard(request_id, peer);
-                    }
-                    Event::InboundFailure { peer, error, .. } => {
-                        debug!("Inbound shard from {} failed: {:?}", peer, error);
-                    }
-                    _ => {}
                 }
             }
             TunnelCraftBehaviourEvent::AutoNat(autonat_event) => {
@@ -3797,19 +3858,13 @@ impl TunnelCraftNode {
                                             self.known_peers.insert(pubkey, peer_id);
 
                                             // Flush any shards buffered for this destination
+                                            // Queue them as deferred forwards (processed async in poll_once)
                                             if let Some(shards) = self.pending_destination.remove(&pubkey) {
                                                 let count = shards.len();
-                                                if let Some(ref mut swarm) = self.swarm {
-                                                    for shard in shards {
-                                                        debug!(
-                                                            "Flushing buffered shard to resolved destination {}",
-                                                            peer_id,
-                                                        );
-                                                        let request = ShardRequest { shard };
-                                                        swarm.behaviour_mut().send_shard(peer_id, request);
-                                                    }
-                                                    info!("Flushed {} buffered shards to peer {}", count, peer_id);
+                                                for shard in shards {
+                                                    self.deferred_forwards.push_back((shard, peer_id));
                                                 }
+                                                info!("Queued {} buffered shards for peer {} (will flush in poll_once)", count, peer_id);
                                             }
                                         }
                                     }

@@ -799,6 +799,7 @@ async fn test_unequal_receipt_distribution() {
 async fn test_direct_mode_exit_roundtrip() {
     use tunnelcraft_client::{RequestBuilder, PathHop};
     use tunnelcraft_core::lease_set::LeaseSet;
+    use tunnelcraft_core::Shard;
     use tunnelcraft_exit::{ExitConfig, ExitHandler};
 
     let user_keypair = SigningKeypair::generate();
@@ -845,11 +846,11 @@ async fn test_direct_mode_exit_roundtrip() {
     // Note: this will make a real HTTP request to httpbin.org, which may fail
     // in CI environments. We test up to reassembly and just verify the handler
     // accepts the shards without error.
-    let mut last_result = None;
+    let mut last_result: Option<Vec<Shard>> = None;
     for shard in shards {
         match exit_handler.process_shard(shard).await {
             Ok(result) => {
-                last_result = result.map(|(shards, _gateway)| shards).or(last_result);
+                last_result = result.map(|pairs| pairs.into_iter().map(|(s, _)| s).collect::<Vec<_>>()).or(last_result);
             }
             Err(e) => {
                 // HTTP request failure is acceptable in test environments

@@ -5,15 +5,12 @@
 use libp2p::{
     identity::Keypair,
     noise, tcp, yamux,
-    request_response::{InboundRequestId, OutboundRequestId, ResponseChannel},
     Multiaddr, PeerId, SwarmBuilder,
 };
 use thiserror::Error;
 use tracing::info;
-use tunnelcraft_core::Shard;
 
 use crate::behaviour::TunnelCraftBehaviour;
-use crate::protocol::{new_shard_behaviour, ShardResponse};
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
@@ -118,30 +115,6 @@ pub enum NetworkEvent {
     RendezvousPeerRegistered {
         peer: PeerId,
     },
-    /// Received a shard from a peer
-    ShardReceived {
-        peer: PeerId,
-        shard: Shard,
-        request_id: InboundRequestId,
-        channel: ResponseChannel<ShardResponse>,
-    },
-    /// Shard was sent successfully
-    ShardSent {
-        peer: PeerId,
-        request_id: OutboundRequestId,
-    },
-    /// Shard send failed
-    ShardSendFailed {
-        peer: PeerId,
-        request_id: OutboundRequestId,
-        error: String,
-    },
-    /// Received response to our shard send
-    ShardResponseReceived {
-        peer: PeerId,
-        request_id: OutboundRequestId,
-        response: ShardResponse,
-    },
 }
 
 /// Build a raw swarm and return it along with the local peer ID.
@@ -164,10 +137,18 @@ pub async fn build_swarm(
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
-            yamux::Config::default,
+            || {
+                let mut cfg = yamux::Config::default();
+                cfg.set_max_num_streams(4096);
+                cfg
+            },
         )
         .map_err(|e| NetworkError::Transport(e.to_string()))?
-        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .with_relay_client(noise::Config::new, || {
+            let mut cfg = yamux::Config::default();
+            cfg.set_max_num_streams(4096);
+            cfg
+        })
         .map_err(|e| NetworkError::Transport(e.to_string()))?
         .with_behaviour(|_key, relay_behaviour| {
             Ok(TunnelCraftBehaviour {
@@ -180,7 +161,7 @@ pub async fn build_swarm(
                 relay_client: relay_behaviour,
                 dcutr: behaviour.dcutr,
                 autonat: behaviour.autonat,
-                shard: new_shard_behaviour(),
+                stream: libp2p_stream::Behaviour::new(),
             })
         })
         .map_err(|e| NetworkError::SwarmBuild(format!("{:?}", e)))?

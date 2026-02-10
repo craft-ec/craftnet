@@ -4,13 +4,10 @@
 
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, relay, rendezvous,
-    request_response::{self, OutboundRequestId, ResponseChannel},
     swarm::NetworkBehaviour,
     Multiaddr, PeerId, StreamProtocol,
 };
 use std::time::Duration;
-
-use crate::protocol::{new_shard_behaviour, ShardBehaviour, ShardRequest, ShardResponse};
 use crate::topology::TOPOLOGY_TOPIC;
 
 /// Kademlia protocol name
@@ -112,8 +109,8 @@ pub struct TunnelCraftBehaviour {
     pub dcutr: dcutr::Behaviour,
     /// AutoNAT for NAT detection
     pub autonat: autonat::Behaviour,
-    /// Shard exchange protocol
-    pub shard: ShardBehaviour,
+    /// Persistent stream protocol for shard transport
+    pub stream: libp2p_stream::Behaviour,
 }
 
 /// Events emitted by TunnelCraft behaviour
@@ -128,7 +125,7 @@ pub enum TunnelCraftBehaviourEvent {
     RelayClient(relay::client::Event),
     Dcutr(dcutr::Event),
     AutoNat(autonat::Event),
-    Shard(request_response::Event<ShardRequest, ShardResponse>),
+    Stream(()),
 }
 
 impl From<kad::Event> for TunnelCraftBehaviourEvent {
@@ -185,9 +182,9 @@ impl From<autonat::Event> for TunnelCraftBehaviourEvent {
     }
 }
 
-impl From<request_response::Event<ShardRequest, ShardResponse>> for TunnelCraftBehaviourEvent {
-    fn from(e: request_response::Event<ShardRequest, ShardResponse>) -> Self {
-        TunnelCraftBehaviourEvent::Shard(e)
+impl From<()> for TunnelCraftBehaviourEvent {
+    fn from(_: ()) -> Self {
+        TunnelCraftBehaviourEvent::Stream(())
     }
 }
 
@@ -267,8 +264,8 @@ impl TunnelCraftBehaviour {
             },
         );
 
-        // Shard exchange protocol
-        let shard = new_shard_behaviour();
+        // Persistent stream protocol
+        let stream = libp2p_stream::Behaviour::new();
 
         let behaviour = Self {
             kademlia,
@@ -280,7 +277,7 @@ impl TunnelCraftBehaviour {
             relay_client,
             dcutr,
             autonat,
-            shard,
+            stream,
         };
 
         (behaviour, relay_transport)
@@ -516,19 +513,11 @@ impl TunnelCraftBehaviour {
         self.kademlia.bootstrap()
     }
 
-    /// Send a shard to a peer
-    pub fn send_shard(&mut self, peer_id: PeerId, request: ShardRequest) -> OutboundRequestId {
-        self.shard.send_request(&peer_id, request)
+    /// Get a Control handle for the persistent stream protocol
+    pub fn stream_control(&self) -> libp2p_stream::Control {
+        self.stream.new_control()
     }
 
-    /// Send a response to a shard request
-    pub fn send_shard_response(
-        &mut self,
-        channel: ResponseChannel<ShardResponse>,
-        response: ShardResponse,
-    ) -> Result<(), ShardResponse> {
-        self.shard.send_response(channel, response)
-    }
 }
 
 #[cfg(test)]
@@ -555,7 +544,6 @@ mod tests {
         let _ = &behaviour.rendezvous_server;
         let _ = &behaviour.relay_client;
         let _ = &behaviour.dcutr;
-        let _ = &behaviour.shard;
     }
 
     #[test]
@@ -633,12 +621,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_event_from_shard() {
-        fn _check_from(
-            e: request_response::Event<ShardRequest, ShardResponse>,
-        ) -> TunnelCraftBehaviourEvent {
-            e.into()
-        }
-    }
 }

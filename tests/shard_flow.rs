@@ -826,7 +826,8 @@ async fn test_complete_direct_mode_flow_client_to_exit() {
     for shard in shards {
         // In direct mode, shards go straight to exit
         match exit_handler.process_shard(shard).await {
-            Ok(Some((resp, _gateway))) => {
+            Ok(Some(shard_pairs)) => {
+                let resp: Vec<_> = shard_pairs.into_iter().map(|(s, _)| s).collect();
                 response_shards = Some(resp);
             }
             Ok(None) => {

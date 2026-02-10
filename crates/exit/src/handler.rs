@@ -231,9 +231,11 @@ impl ExitHandler {
     /// 2. Group by assembly_id
     /// 3. When all chunks ready: reconstruct → decrypt → process
     /// 4. Create response shards using LeaseSet
-    /// Returns `(response_shards, gateway_peer_id_bytes)` where gateway is from the LeaseSet.
+    ///
+    /// Returns per-shard `(shard, gateway_peer_id_bytes)` pairs.
+    /// Each shard may target a different gateway (round-robin across LeaseSet).
     /// If no LeaseSet gateway, gateway is None (direct mode — caller should use source_peer).
-    pub async fn process_shard(&mut self, shard: Shard) -> Result<Option<(Vec<Shard>, Option<Vec<u8>>)>> {
+    pub async fn process_shard(&mut self, shard: Shard) -> Result<Option<Vec<(Shard, Option<Vec<u8>>)>>> {
         // Decrypt routing_tag to get assembly_id + shard/chunk metadata
         let tag = decrypt_routing_tag(
             &self.encryption_keypair.secret_key_bytes(),
@@ -356,27 +358,26 @@ impl ExitHandler {
             response_data.len(),
         );
 
-        let gateway = exit_payload.lease_set.leases.first().map(|l| l.gateway_peer_id.clone());
-        let response_shards = self.create_response_shards(
+        let shard_pairs = self.create_response_shards(
             &exit_payload,
             &response_data,
         )?;
 
         debug!(
-            "Created {} response shards for request={} gateway={:?}",
-            response_shards.len(),
+            "Created {} response shards for request={} (leases={})",
+            shard_pairs.len(),
             hex::encode(&exit_payload.request_id[..8]),
-            gateway.as_ref().map(|g| hex::encode(&g[..8])),
+            exit_payload.lease_set.leases.len(),
         );
 
-        Ok(Some((response_shards, gateway)))
+        Ok(Some(shard_pairs))
     }
 
     /// Process a tunnel-mode payload
     async fn process_tunnel_payload(
         &mut self,
         exit_payload: &ExitPayload,
-    ) -> Result<Option<(Vec<Shard>, Option<Vec<u8>>)>> {
+    ) -> Result<Option<Vec<(Shard, Option<Vec<u8>>)>>> {
         let request_data = &exit_payload.data;
         if request_data.len() < 4 {
             return Err(ExitError::InvalidRequest("Tunnel payload too short".to_string()));
@@ -410,16 +411,15 @@ impl ExitHandler {
         ).await?;
 
         if response_bytes.is_empty() {
-            return Ok(Some((Vec::new(), None)));
+            return Ok(Some(vec![]));
         }
 
-        let gateway = exit_payload.lease_set.leases.first().map(|l| l.gateway_peer_id.clone());
-        let response_shards = self.create_response_shards(
+        let shard_pairs = self.create_response_shards(
             exit_payload,
             &response_bytes,
         )?;
 
-        Ok(Some((response_shards, gateway)))
+        Ok(Some(shard_pairs))
     }
 
     /// Check if all chunks for an assembly have enough shards
@@ -531,16 +531,16 @@ impl ExitHandler {
         Ok(HttpResponse::new(status, headers, body))
     }
 
-    /// Create response shards with onion routing via LeaseSet
+    /// Create response shards with onion routing via LeaseSet.
     ///
-    /// For now, creates simple shards encrypted for the client.
-    /// Full onion response routing (via topology graph + lease set gateways)
-    /// will be completed when TopologyGraph is integrated into exit.
+    /// Round-robins each shard across gateways in the LeaseSet. Each shard's
+    /// onion header targets its assigned gateway, and the returned pairs tell
+    /// the caller which gateway to send each shard to.
     fn create_response_shards(
         &self,
         exit_payload: &ExitPayload,
         response_data: &[u8],
-    ) -> Result<Vec<Shard>> {
+    ) -> Result<Vec<(Shard, Option<Vec<u8>>)>> {
         // Encrypt response for the client using their X25519 encryption pubkey.
         // Falls back to user_pubkey for pre-response_enc_pubkey payloads.
         let recipient_pubkey = if exit_payload.response_enc_pubkey != [0u8; 32] {
@@ -569,7 +569,9 @@ impl ExitHandler {
         // response shards to its pending request map.
         let assembly_id = exit_payload.request_id;
 
-        let mut shards = Vec::with_capacity(chunks.len() * tunnelcraft_erasure::TOTAL_SHARDS);
+        let leases = &exit_payload.lease_set.leases;
+        let mut shard_pairs = Vec::with_capacity(chunks.len() * tunnelcraft_erasure::TOTAL_SHARDS);
+        let mut shard_counter: usize = 0;
 
         for (chunk_index, shard_payloads) in chunks {
             let total_shards_in_chunk = shard_payloads.len() as u8;
@@ -587,18 +589,16 @@ impl ExitHandler {
                     format!("routing_tag encrypt failed: {}", e),
                 ))?;
 
-                // Build onion header for response path
-                // For now, use empty header (direct to gateway/client)
-                // Full onion path via lease set gateways requires TopologyGraph integration
-                let lease = exit_payload.lease_set.leases.first();
+                // Round-robin this shard's gateway across all leases
+                let lease = if !leases.is_empty() {
+                    Some(&leases[shard_counter % leases.len()])
+                } else {
+                    None
+                };
+                shard_counter += 1;
 
-                let (header, ephemeral) = if let Some(lease) = lease {
-                    // Build per-hop settlement: derive unique shard_id and blind_token for the gateway
-                    let gateway_pubkey = {
-                        // Use gateway_encryption_pubkey as a stand-in for signing_pubkey
-                        // (gateway identity for settlement derivation)
-                        lease.gateway_encryption_pubkey
-                    };
+                let (header, ephemeral, gateway) = if let Some(lease) = lease {
+                    let gateway_pubkey = lease.gateway_encryption_pubkey;
                     let shard_id = {
                         let mut hasher = Sha256::new();
                         hasher.update(exit_payload.request_id);
@@ -621,37 +621,37 @@ impl ExitHandler {
                         pool_pubkey: [0u8; 32],
                     }];
 
-                    // Single-hop onion to gateway with tunnel_id
-                    build_onion_header(
+                    // Single-hop onion to this shard's gateway with tunnel_id
+                    let (h, e) = build_onion_header(
                         &[(&lease.gateway_peer_id, &lease.gateway_encryption_pubkey)],
                         (&lease.gateway_peer_id, &lease.gateway_encryption_pubkey),
                         &settlement,
                         Some(&lease.tunnel_id),
                     ).map_err(|e| ExitError::InvalidRequest(
                         format!("Onion header build failed: {}", e),
-                    ))?
+                    ))?;
+                    (h, e, Some(lease.gateway_peer_id.clone()))
                 } else {
                     // No lease set — direct mode (empty header)
-                    (vec![], [0u8; 32])
+                    (vec![], [0u8; 32], None)
                 };
 
-                shards.push(Shard::new(
-                    ephemeral,
-                    header,
-                    payload,
-                    routing_tag,
+                shard_pairs.push((
+                    Shard::new(ephemeral, header, payload, routing_tag),
+                    gateway,
                 ));
             }
         }
 
         debug!(
-            "Created {} response shards ({} chunks) for request {}",
-            shards.len(),
+            "Created {} response shards ({} chunks) for request {} across {} gateways",
+            shard_pairs.len(),
             total_chunks,
-            hex::encode(&exit_payload.request_id[..8])
+            hex::encode(&exit_payload.request_id[..8]),
+            leases.len(),
         );
 
-        Ok(shards)
+        Ok(shard_pairs)
     }
 
     /// Get the number of pending assemblies

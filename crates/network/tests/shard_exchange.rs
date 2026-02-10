@@ -1,6 +1,7 @@
 //! Integration tests for shard exchange between network nodes
 //!
-//! These tests verify that two nodes can connect and exchange shards.
+//! These tests verify that two nodes can connect and exchange shards
+//! using the persistent stream protocol (libp2p-stream).
 
 use std::time::Duration;
 
@@ -11,8 +12,8 @@ use futures::StreamExt;
 
 use tunnelcraft_core::Shard;
 use tunnelcraft_network::{
-    ShardResponse, ShardRequest,
-    TunnelCraftBehaviour, TunnelCraftBehaviourEvent, PeerId,
+    TunnelCraftBehaviour, PeerId,
+    SHARD_STREAM_PROTOCOL,
 };
 
 /// Create a test shard using the new onion format
@@ -25,10 +26,9 @@ fn create_test_shard() -> Shard {
     )
 }
 
-/// Create a test swarm
+/// Create a test swarm with stream protocol support
 async fn create_test_swarm() -> (libp2p::Swarm<TunnelCraftBehaviour>, PeerId) {
     use libp2p::{noise, tcp, yamux, SwarmBuilder};
-    use tunnelcraft_network::new_shard_behaviour;
 
     let keypair = Keypair::generate_ed25519();
     let peer_id = PeerId::from(keypair.public());
@@ -56,7 +56,7 @@ async fn create_test_swarm() -> (libp2p::Swarm<TunnelCraftBehaviour>, PeerId) {
                 relay_client: relay_behaviour,
                 dcutr: behaviour.dcutr,
                 autonat: behaviour.autonat,
-                shard: new_shard_behaviour(),
+                stream: libp2p_stream::Behaviour::new(),
             })
         })
         .unwrap()
@@ -65,52 +65,52 @@ async fn create_test_swarm() -> (libp2p::Swarm<TunnelCraftBehaviour>, PeerId) {
     (swarm, peer_id)
 }
 
-#[tokio::test]
-async fn test_two_nodes_can_connect() {
+/// Helper: connect two swarms and return them
+async fn connect_swarms(
+) -> (
+    libp2p::Swarm<TunnelCraftBehaviour>,
+    PeerId,
+    libp2p::Swarm<TunnelCraftBehaviour>,
+    PeerId,
+) {
     let (mut swarm1, peer1) = create_test_swarm().await;
     let (mut swarm2, peer2) = create_test_swarm().await;
 
-    // Start listening
     swarm1.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
     swarm2.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
 
-    // Get listen address from swarm1
     let addr1 = loop {
         if let SwarmEvent::NewListenAddr { address, .. } = swarm1.select_next_some().await {
             break address;
         }
     };
 
-    // Get listen address from swarm2
     let addr2 = loop {
         if let SwarmEvent::NewListenAddr { address, .. } = swarm2.select_next_some().await {
             break address;
         }
     };
 
-    // Add addresses to each other
     swarm1.behaviour_mut().add_address(&peer2, addr2);
     swarm2.behaviour_mut().add_address(&peer1, addr1);
-
-    // Dial from swarm1 to swarm2
     swarm1.dial(peer2).unwrap();
 
-    // Run both swarms until connected
-    let connected = timeout(Duration::from_secs(10), async {
+    // Wait for connection on BOTH sides
+    timeout(Duration::from_secs(10), async {
+        let mut s1 = false;
+        let mut s2 = false;
         loop {
             tokio::select! {
                 event = swarm1.select_next_some() => {
-                    if let SwarmEvent::ConnectionEstablished { peer_id, .. } = event {
-                        if peer_id == peer2 {
-                            return true;
-                        }
+                    if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                        s1 = true;
+                        if s2 { return; }
                     }
                 }
                 event = swarm2.select_next_some() => {
-                    if let SwarmEvent::ConnectionEstablished { peer_id, .. } = event {
-                        if peer_id == peer1 {
-                            return true;
-                        }
+                    if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                        s2 = true;
+                        if s1 { return; }
                     }
                 }
             }
@@ -119,282 +119,221 @@ async fn test_two_nodes_can_connect() {
     .await
     .expect("Should connect within timeout");
 
-    assert!(connected);
+    (swarm1, peer1, swarm2, peer2)
 }
 
 #[tokio::test]
-async fn test_shard_send_and_receive() {
-    let (mut swarm1, peer1) = create_test_swarm().await;
-    let (mut swarm2, peer2) = create_test_swarm().await;
+async fn test_two_nodes_can_connect() {
+    let (_swarm1, _peer1, _swarm2, _peer2) = connect_swarms().await;
+    // If we get here, connection succeeded
+}
 
-    // Start listening
-    swarm1.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-    swarm2.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-
-    // Get addresses
-    let addr1 = loop {
-        if let SwarmEvent::NewListenAddr { address, .. } = swarm1.select_next_some().await {
-            break address;
-        }
+#[tokio::test]
+async fn test_stream_shard_exchange_direct() {
+    // Test the stream frame protocol directly using connected libp2p streams
+    use tunnelcraft_network::{
+        read_frame, write_shard_frame, write_ack_frame, StreamFrame,
     };
+    use futures::io::AsyncReadExt;
 
-    let addr2 = loop {
-        if let SwarmEvent::NewListenAddr { address, .. } = swarm2.select_next_some().await {
-            break address;
-        }
-    };
-
-    // Connect
-    swarm1.behaviour_mut().add_address(&peer2, addr2);
-    swarm2.behaviour_mut().add_address(&peer1, addr1);
-    swarm1.dial(peer2).unwrap();
-
-    // Wait for connection on BOTH sides
-    timeout(Duration::from_secs(10), async {
-        let mut swarm1_connected = false;
-        let mut swarm2_connected = false;
-        loop {
-            tokio::select! {
-                event = swarm1.select_next_some() => {
-                    if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
-                        swarm1_connected = true;
-                        if swarm2_connected { return; }
-                    }
-                }
-                event = swarm2.select_next_some() => {
-                    if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
-                        swarm2_connected = true;
-                        if swarm1_connected { return; }
-                    }
-                }
-            }
-        }
-    })
-    .await
-    .expect("Should connect");
-
-    // Give protocols time to negotiate after connection
+    let (mut swarm1, peer1, mut swarm2, peer2) = connect_swarms().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Send a shard from node1 to node2
-    let shard = create_test_shard();
-    let request = ShardRequest { shard: shard.clone() };
-    let _request_id = swarm1.behaviour_mut().send_shard(peer2, request);
+    // Set up stream acceptance on node2
+    let mut incoming2 = swarm2.behaviour().stream_control().accept(SHARD_STREAM_PROTOCOL).unwrap();
 
-    // Process events until shard is received and response is sent
+    // Open a stream from node1 to node2
+    let mut control1 = swarm1.behaviour().stream_control();
+
+    // Run swarms in background
+    let s1 = tokio::spawn(async move {
+        loop { let _ = swarm1.select_next_some().await; }
+    });
+    let s2 = tokio::spawn(async move {
+        loop { let _ = swarm2.select_next_some().await; }
+    });
+
+    // Open stream and exchange shards
     let result = timeout(Duration::from_secs(10), async {
-        let mut received_shard: Option<Shard> = None;
-        let mut got_response = false;
+        // Open stream from node1 → node2
+        let stream = control1.open_stream(peer2, SHARD_STREAM_PROTOCOL).await.unwrap();
+        let (mut reader1, mut writer1) = AsyncReadExt::split(stream);
 
-        loop {
-            tokio::select! {
-                event = swarm1.select_next_some() => {
-                    if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
-                        use libp2p::request_response::Event;
-                        if let Event::Message { message: libp2p::request_response::Message::Response { response, .. }, .. } = shard_event {
-                            assert!(matches!(response, ShardResponse::Accepted(_)));
-                            got_response = true;
-                            if let Some(shard) = received_shard.take() {
-                                return (shard, true);
-                            }
-                        }
-                    }
-                }
-                event = swarm2.select_next_some() => {
-                    if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
-                        use libp2p::request_response::Event;
-                        if let Event::Message { message: libp2p::request_response::Message::Request { request, channel, .. }, .. } = shard_event {
-                            received_shard = Some(request.shard);
-                            // Accept the shard
-                            swarm2.behaviour_mut().send_shard_response(channel, ShardResponse::Accepted(None)).ok();
-                            if got_response {
-                                return (received_shard.unwrap(), true);
-                            }
-                        }
-                    }
-                }
+        // Accept stream on node2
+        let (incoming_peer, stream2) = incoming2.next().await.unwrap();
+        assert_eq!(incoming_peer, peer1);
+        let (mut reader2, mut writer2) = AsyncReadExt::split(stream2);
+
+        // Send shard from node1 → node2
+        let shard = create_test_shard();
+        write_shard_frame(&mut writer1, &shard, 1).await.unwrap();
+
+        // Read shard on node2
+        let frame = read_frame(&mut reader2).await.unwrap();
+        let received_shard = match frame {
+            StreamFrame::Shard { seq_id, shard: s } => {
+                assert_eq!(seq_id, 1);
+                s
             }
+            _ => panic!("Expected Shard frame"),
+        };
+
+        assert_eq!(received_shard.ephemeral_pubkey, shard.ephemeral_pubkey);
+        assert_eq!(received_shard.payload, shard.payload);
+        assert_eq!(received_shard.routing_tag, shard.routing_tag);
+
+        // Send ack from node2 → node1
+        write_ack_frame(&mut writer2, 1, None).await.unwrap();
+
+        // Read ack on node1
+        let ack_frame = read_frame(&mut reader1).await.unwrap();
+        match ack_frame {
+            StreamFrame::Ack { seq_id, receipt } => {
+                assert_eq!(seq_id, 1);
+                assert!(receipt.is_none());
+            }
+            _ => panic!("Expected Ack frame"),
         }
+
+        true
     })
     .await
-    .expect("Should exchange shard");
+    .expect("Should exchange shard via stream");
 
-    let (received, success) = result;
-    assert!(success);
-    assert_eq!(received.ephemeral_pubkey, shard.ephemeral_pubkey);
-    assert_eq!(received.payload, shard.payload);
-    assert_eq!(received.routing_tag, shard.routing_tag);
+    assert!(result);
+    s1.abort();
+    s2.abort();
 }
 
 #[tokio::test]
-async fn test_shard_rejection() {
-    let (mut swarm1, peer1) = create_test_swarm().await;
-    let (mut swarm2, peer2) = create_test_swarm().await;
-
-    // Start listening and connect
-    swarm1.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-    swarm2.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-
-    let addr1 = loop {
-        if let SwarmEvent::NewListenAddr { address, .. } = swarm1.select_next_some().await {
-            break address;
-        }
+async fn test_stream_shard_rejection() {
+    use tunnelcraft_network::{
+        read_frame, write_shard_frame, write_nack_frame, StreamFrame,
     };
+    use futures::io::AsyncReadExt;
 
-    let addr2 = loop {
-        if let SwarmEvent::NewListenAddr { address, .. } = swarm2.select_next_some().await {
-            break address;
-        }
-    };
+    let (mut swarm1, peer1, mut swarm2, peer2) = connect_swarms().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    swarm1.behaviour_mut().add_address(&peer2, addr2);
-    swarm2.behaviour_mut().add_address(&peer1, addr1);
-    swarm1.dial(peer2).unwrap();
+    let mut incoming2 = swarm2.behaviour().stream_control().accept(SHARD_STREAM_PROTOCOL).unwrap();
+    let mut control1 = swarm1.behaviour().stream_control();
 
-    // Wait for connection
-    timeout(Duration::from_secs(10), async {
-        loop {
-            tokio::select! {
-                event = swarm1.select_next_some() => {
-                    if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
-                        return;
-                    }
-                }
-                _ = swarm2.select_next_some() => {}
-            }
-        }
-    })
-    .await
-    .unwrap();
+    let s1 = tokio::spawn(async move {
+        loop { let _ = swarm1.select_next_some().await; }
+    });
+    let s2 = tokio::spawn(async move {
+        loop { let _ = swarm2.select_next_some().await; }
+    });
 
-    // Send shard
-    let shard = create_test_shard();
-    let request = ShardRequest { shard };
-    swarm1.behaviour_mut().send_shard(peer2, request);
-
-    // Node2 rejects, node1 receives rejection
     let rejection_reason = timeout(Duration::from_secs(10), async {
-        loop {
-            tokio::select! {
-                event = swarm1.select_next_some() => {
-                    if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
-                        use libp2p::request_response::Event;
-                        if let Event::Message { message: libp2p::request_response::Message::Response { response: ShardResponse::Rejected(reason), .. }, .. } = shard_event {
-                            return reason;
-                        }
-                    }
-                }
-                event = swarm2.select_next_some() => {
-                    if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
-                        use libp2p::request_response::Event;
-                        if let Event::Message { message: libp2p::request_response::Message::Request { channel, .. }, .. } = shard_event {
-                            // Reject with reason
-                            swarm2.behaviour_mut().send_shard_response(
-                                channel,
-                                ShardResponse::Rejected("Invalid destination".to_string())
-                            ).ok();
-                        }
-                    }
-                }
+        let stream = control1.open_stream(peer2, SHARD_STREAM_PROTOCOL).await.unwrap();
+        let (mut reader1, mut writer1) = AsyncReadExt::split(stream);
+
+        let (incoming_peer, stream2) = incoming2.next().await.unwrap();
+        assert_eq!(incoming_peer, peer1);
+        let (mut reader2, mut writer2) = AsyncReadExt::split(stream2);
+
+        // Send shard
+        let shard = create_test_shard();
+        write_shard_frame(&mut writer1, &shard, 42).await.unwrap();
+
+        // Read on node2
+        let frame = read_frame(&mut reader2).await.unwrap();
+        let seq_id = match frame {
+            StreamFrame::Shard { seq_id, .. } => seq_id,
+            _ => panic!("Expected Shard frame"),
+        };
+        assert_eq!(seq_id, 42);
+
+        // Reject with nack
+        write_nack_frame(&mut writer2, 42, "Invalid destination").await.unwrap();
+
+        // Read nack on node1
+        let nack_frame = read_frame(&mut reader1).await.unwrap();
+        match nack_frame {
+            StreamFrame::Nack { seq_id, reason } => {
+                assert_eq!(seq_id, 42);
+                reason
             }
+            _ => panic!("Expected Nack frame"),
         }
     })
     .await
     .expect("Should receive rejection");
 
     assert_eq!(rejection_reason, "Invalid destination");
+    s1.abort();
+    s2.abort();
 }
 
 #[tokio::test]
-async fn test_multiple_shards_erasure_coding() {
-    let (mut swarm1, peer1) = create_test_swarm().await;
-    let (mut swarm2, peer2) = create_test_swarm().await;
-
-    // Setup and connect
-    swarm1.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-    swarm2.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-
-    let addr1 = loop {
-        if let SwarmEvent::NewListenAddr { address, .. } = swarm1.select_next_some().await {
-            break address;
-        }
+async fn test_multiple_shards_via_stream() {
+    use tunnelcraft_network::{
+        read_frame, write_shard_frame, write_ack_frame, StreamFrame,
     };
+    use futures::io::AsyncReadExt;
 
-    let addr2 = loop {
-        if let SwarmEvent::NewListenAddr { address, .. } = swarm2.select_next_some().await {
-            break address;
-        }
-    };
+    let (mut swarm1, peer1, mut swarm2, peer2) = connect_swarms().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    swarm1.behaviour_mut().add_address(&peer2, addr2);
-    swarm2.behaviour_mut().add_address(&peer1, addr1);
-    swarm1.dial(peer2).unwrap();
+    let mut incoming2 = swarm2.behaviour().stream_control().accept(SHARD_STREAM_PROTOCOL).unwrap();
+    let mut control1 = swarm1.behaviour().stream_control();
 
-    timeout(Duration::from_secs(10), async {
-        loop {
-            tokio::select! {
-                event = swarm1.select_next_some() => {
-                    if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
-                        return;
-                    }
-                }
-                _ = swarm2.select_next_some() => {}
-            }
-        }
-    })
-    .await
-    .unwrap();
-
-    // Send 5 shards (simulating 5/3 erasure coding)
-    for i in 0..5u8 {
-        let shard = Shard::new(
-            [1u8; 32],
-            vec![2u8; 64],
-            format!("payload_{}", i).into_bytes(),
-            vec![3u8; 92],
-        );
-        let request = ShardRequest { shard };
-        swarm1.behaviour_mut().send_shard(peer2, request);
-    }
-
-    // Receive all 5 shards and respond
-    let mut received_count = 0;
-    let mut response_count = 0;
+    let s1 = tokio::spawn(async move {
+        loop { let _ = swarm1.select_next_some().await; }
+    });
+    let s2 = tokio::spawn(async move {
+        loop { let _ = swarm2.select_next_some().await; }
+    });
 
     timeout(Duration::from_secs(15), async {
-        loop {
-            tokio::select! {
-                event = swarm1.select_next_some() => {
-                    if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
-                        use libp2p::request_response::Event;
-                        if let Event::Message { message: libp2p::request_response::Message::Response { response, .. }, .. } = shard_event {
-                            if matches!(response, ShardResponse::Accepted(_)) {
-                                response_count += 1;
-                                if response_count >= 5 && received_count >= 5 {
-                                    return;
-                                }
-                            }
-                        }
-                    }
+        let stream = control1.open_stream(peer2, SHARD_STREAM_PROTOCOL).await.unwrap();
+        let (mut reader1, mut writer1) = AsyncReadExt::split(stream);
+
+        let (incoming_peer, stream2) = incoming2.next().await.unwrap();
+        assert_eq!(incoming_peer, peer1);
+        let (mut reader2, mut writer2) = AsyncReadExt::split(stream2);
+
+        // Send 5 shards on the same stream (simulating 5/3 erasure coding)
+        for i in 0..5u64 {
+            let shard = Shard::new(
+                [1u8; 32],
+                vec![2u8; 64],
+                format!("payload_{}", i).into_bytes(),
+                vec![3u8; 92],
+            );
+            write_shard_frame(&mut writer1, &shard, i + 1).await.unwrap();
+        }
+
+        // Receive all 5 on node2 and ack each
+        for i in 0..5u64 {
+            let frame = read_frame(&mut reader2).await.unwrap();
+            match frame {
+                StreamFrame::Shard { seq_id, shard } => {
+                    assert_eq!(seq_id, i + 1);
+                    let expected_payload = format!("payload_{}", i).into_bytes();
+                    assert_eq!(shard.payload, expected_payload);
+                    write_ack_frame(&mut writer2, seq_id, None).await.unwrap();
                 }
-                event = swarm2.select_next_some() => {
-                    if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
-                        use libp2p::request_response::Event;
-                        if let Event::Message { message: libp2p::request_response::Message::Request { channel, request: _, .. }, .. } = shard_event {
-                            received_count += 1;
-                            swarm2.behaviour_mut().send_shard_response(channel, ShardResponse::Accepted(None)).ok();
-                            if response_count >= 5 && received_count >= 5 {
-                                return;
-                            }
-                        }
-                    }
+                _ => panic!("Expected Shard frame for seq_id={}", i + 1),
+            }
+        }
+
+        // Receive all 5 acks on node1
+        for i in 0..5u64 {
+            let frame = read_frame(&mut reader1).await.unwrap();
+            match frame {
+                StreamFrame::Ack { seq_id, receipt } => {
+                    assert_eq!(seq_id, i + 1);
+                    assert!(receipt.is_none());
                 }
+                _ => panic!("Expected Ack frame for seq_id={}", i + 1),
             }
         }
     })
     .await
-    .expect("Should exchange all 5 shards");
+    .expect("Should exchange all 5 shards via stream");
 
-    assert_eq!(received_count, 5);
-    assert_eq!(response_count, 5);
+    s1.abort();
+    s2.abort();
 }

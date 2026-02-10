@@ -240,7 +240,8 @@ async fn test_full_tunnel_small_request() {
     for shard in shards {
         let result = exit_handler.process_shard(shard).await
             .expect("Exit failed to process shard");
-        if let Some((resp, _gateway)) = result {
+        if let Some(shard_pairs) = result {
+            let resp: Vec<_> = shard_pairs.into_iter().map(|(s, _)| s).collect();
             response_shards = Some(resp);
         }
     }
@@ -322,7 +323,8 @@ async fn test_full_tunnel_large_response() {
     for shard in shards {
         let result = exit_handler.process_shard(shard).await
             .expect("Exit failed to process shard");
-        if let Some((resp, _gateway)) = result {
+        if let Some(shard_pairs) = result {
+            let resp: Vec<_> = shard_pairs.into_iter().map(|(s, _)| s).collect();
             response_shards = Some(resp);
         }
     }
@@ -399,7 +401,8 @@ async fn test_full_tunnel_json_api() {
     let mut response_shards = None;
     for shard in shards {
         let result = exit_handler.process_shard(shard).await.unwrap();
-        if let Some((resp, _gateway)) = result {
+        if let Some(shard_pairs) = result {
+            let resp: Vec<_> = shard_pairs.into_iter().map(|(s, _)| s).collect();
             response_shards = Some(resp);
         }
     }
@@ -480,7 +483,8 @@ async fn test_full_tunnel_variable_sizes() {
         let mut response_shards = None;
         for shard in shards {
             let result = exit_handler.process_shard(shard).await.unwrap();
-            if let Some((resp, _gateway)) = result {
+            if let Some(shard_pairs) = result {
+                let resp: Vec<_> = shard_pairs.into_iter().map(|(s, _)| s).collect();
                 response_shards = Some(resp);
             }
         }

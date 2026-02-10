@@ -18,6 +18,7 @@ mod proof_message;
 mod protocol;
 mod relay_status;
 mod status;
+pub mod stream_manager;
 mod subscription;
 mod topology;
 
@@ -44,10 +45,12 @@ pub use bootstrap::{
 };
 pub use node::{build_swarm, NetworkConfig, NetworkEvent, NetworkError};
 pub use protocol::{
-    ShardProtocol, ShardCodec, ShardRequest, ShardResponse, ShardBehaviour,
-    new_shard_behaviour, SHARD_PROTOCOL_ID, MAX_SHARD_SIZE,
+    ShardResponse, SHARD_PROTOCOL_ID, MAX_SHARD_SIZE,
+    StreamFrame, SHARD_STREAM_PROTOCOL,
+    read_frame, write_shard_frame, write_ack_frame, write_nack_frame,
 };
+pub use stream_manager::{StreamManager, InboundShard, AckResult};
+pub use libp2p_stream::IncomingStreams;
 
 // Re-export commonly used libp2p types
 pub use libp2p::{Multiaddr, PeerId};
-pub use libp2p::request_response::{OutboundRequestId, ResponseChannel, InboundRequestId};
