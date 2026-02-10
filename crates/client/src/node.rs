@@ -1151,8 +1151,9 @@ impl TunnelCraftNode {
         // Create network config
         let mut net_config = NetworkConfig::default();
         net_config.listen_addrs.push(self.config.listen_addr.clone());
-        for (peer_id, addr) in &self.config.bootstrap_peers {
-            net_config.bootstrap_peers.push((*peer_id, addr.clone()));
+        // If explicit bootstrap peers are configured, replace defaults
+        if !self.config.bootstrap_peers.is_empty() {
+            net_config.bootstrap_peers = self.config.bootstrap_peers.clone();
         }
 
         // Build swarm directly (no intermediate wrapper).
