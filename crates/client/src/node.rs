@@ -1148,13 +1148,18 @@ impl TunnelCraftNode {
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting TunnelCraftNode in {:?} mode", self.mode);
 
-        // Create network config
-        let mut net_config = NetworkConfig::default();
-        net_config.listen_addrs.push(self.config.listen_addr.clone());
-        // If explicit bootstrap peers are configured, replace defaults
-        if !self.config.bootstrap_peers.is_empty() {
-            net_config.bootstrap_peers = self.config.bootstrap_peers.clone();
-        }
+        // Create network config — use explicit bootstrap peers from config,
+        // fall back to hardcoded defaults only when none are configured.
+        // listen_addrs is empty here; start() calls listen_on below.
+        let bootstrap = if !self.config.bootstrap_peers.is_empty() {
+            self.config.bootstrap_peers.clone()
+        } else {
+            tunnelcraft_network::default_bootstrap_peers()
+        };
+        let net_config = NetworkConfig {
+            listen_addrs: vec![],
+            bootstrap_peers: bootstrap,
+        };
 
         // Build swarm directly (no intermediate wrapper).
         // build_swarm() registers the shard stream protocol BEFORE listening,
