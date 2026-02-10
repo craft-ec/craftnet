@@ -1167,7 +1167,7 @@ impl TunnelCraftNode {
         // Initialize persistent stream manager
         let stream_control = swarm.behaviour().stream_control();
         let (stream_mgr, high_rx, low_rx, receipt_rx, outbound_tx) =
-            StreamManager::new(stream_control, peer_id);
+            StreamManager::new(stream_control);
         self.stream_manager = Some(stream_mgr);
         self.inbound_high_rx = Some(high_rx);
         self.inbound_low_rx = Some(low_rx);
