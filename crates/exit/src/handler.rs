@@ -235,7 +235,12 @@ impl ExitHandler {
     /// Returns per-shard `(shard, gateway_peer_id_bytes)` pairs.
     /// Each shard may target a different gateway (round-robin across LeaseSet).
     /// If no LeaseSet gateway, gateway is None (direct mode — caller should use source_peer).
-    pub async fn process_shard(&mut self, shard: Shard) -> Result<Option<Vec<(Shard, Option<Vec<u8>>)>>> {
+    /// Collect a shard into its pending assembly (fast, no I/O).
+    ///
+    /// Returns `Ok(Some(assembly_id))` when the assembly is complete and ready
+    /// for processing via [`process_complete_assembly`]. Returns `Ok(None)` if
+    /// still collecting shards.
+    pub fn collect_shard(&mut self, shard: Shard) -> Result<Option<Id>> {
         // Decrypt routing_tag to get assembly_id + shard/chunk metadata
         let tag = decrypt_routing_tag(
             &self.encryption_keypair.secret_key_bytes(),
@@ -246,7 +251,6 @@ impl ExitHandler {
         let chunk_index = tag.chunk_index;
         let shard_index = tag.shard_index;
         let total_chunks = tag.total_chunks;
-        let total_shards = tag.total_shards;
 
         // Add shard payload to pending assembly
         {
@@ -254,7 +258,7 @@ impl ExitHandler {
                 PendingAssembly {
                     shards: HashMap::new(),
                     total_chunks,
-                    total_shards,
+                    total_shards: tag.total_shards,
                     created_at: Instant::now(),
                 }
             });
@@ -277,10 +281,21 @@ impl ExitHandler {
         }
 
         info!(
-            "[SHARD-FLOW] EXIT assembly={} COMPLETE — all shards collected, reconstructing",
+            "[SHARD-FLOW] EXIT assembly={} COMPLETE — all shards collected, ready for processing",
             hex::encode(&assembly_id[..8]),
         );
 
+        Ok(Some(assembly_id))
+    }
+
+    /// Process a complete assembly: reconstruct, HTTP fetch, create response shards.
+    ///
+    /// This is the slow path — it performs network I/O (HTTP request). Call this
+    /// only after [`collect_shard`] returns `Some(assembly_id)`.
+    pub async fn process_complete_assembly(
+        &mut self,
+        assembly_id: Id,
+    ) -> Result<Option<Vec<(Shard, Option<Vec<u8>>)>>> {
         // Extract and reconstruct
         let Some(pending) = self.pending.remove(&assembly_id) else {
             debug!("Assembly {} already processed", hex::encode(&assembly_id[..8]));
@@ -371,6 +386,14 @@ impl ExitHandler {
         );
 
         Ok(Some(shard_pairs))
+    }
+
+    /// Combined collect + process (convenience method, blocks during I/O).
+    pub async fn process_shard(&mut self, shard: Shard) -> Result<Option<Vec<(Shard, Option<Vec<u8>>)>>> {
+        match self.collect_shard(shard)? {
+            Some(assembly_id) => self.process_complete_assembly(assembly_id).await,
+            None => Ok(None),
+        }
     }
 
     /// Process a tunnel-mode payload
@@ -548,6 +571,13 @@ impl ExitHandler {
         } else {
             &exit_payload.user_pubkey
         };
+        warn!(
+            "[TRACE] EXIT_RESPONSE_KEYS request={} recipient_enc_key={} is_response_enc={} leases={}",
+            hex::encode(&exit_payload.request_id[..8]),
+            hex::encode(&recipient_pubkey[..8]),
+            exit_payload.response_enc_pubkey != [0u8; 32],
+            exit_payload.lease_set.leases.len(),
+        );
         let encrypted_response = tunnelcraft_crypto::encrypt_for_recipient(
             recipient_pubkey,
             &self.encryption_keypair.secret_key_bytes(),

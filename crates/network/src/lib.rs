@@ -49,7 +49,7 @@ pub use protocol::{
     StreamFrame, SHARD_STREAM_PROTOCOL,
     read_frame, write_shard_frame, write_ack_frame, write_nack_frame,
 };
-pub use stream_manager::{StreamManager, InboundShard, AckResult};
+pub use stream_manager::{StreamManager, InboundShard, OutboundShard, AckResult};
 pub use libp2p_stream::IncomingStreams;
 
 // Re-export commonly used libp2p types

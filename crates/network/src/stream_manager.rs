@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use futures::{AsyncReadExt, AsyncWriteExt};
+use futures::AsyncReadExt;
 use libp2p::PeerId;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
@@ -29,6 +29,26 @@ use crate::protocol::{
     read_frame, write_ack_frame, write_nack_frame, write_shard_frame, StreamFrame,
     SHARD_STREAM_PROTOCOL,
 };
+
+/// Outbound shard queued for writing by the writer task.
+pub struct OutboundShard {
+    pub peer: PeerId,
+    pub shard: Shard,
+}
+
+/// Raw writer type: writes go directly to TCP, no buffering layer.
+type StreamWriter = futures::io::WriteHalf<libp2p::Stream>;
+
+/// Per-peer writer handle: cloneable Arcs for the writer task to use.
+struct PeerWriterHandle {
+    writer: Arc<Mutex<StreamWriter>>,
+    next_seq: Arc<AtomicU64>,
+}
+
+/// Registry mapping peers to their writer handles.
+/// The writer task briefly holds a read lock to clone Arcs, then releases
+/// before any async work. poll_once's register/close use write lock (sync).
+type WriterRegistry = Arc<std::sync::RwLock<HashMap<PeerId, PeerWriterHandle>>>;
 
 /// Result of an ack/nack for a sent shard
 #[derive(Debug)]
@@ -50,6 +70,7 @@ pub struct InboundShard {
 /// Manages one persistent stream per peer.
 pub struct StreamManager {
     control: libp2p_stream::Control,
+    local_peer_id: PeerId,
     streams: HashMap<PeerId, PeerStream>,
     /// High-priority inbound channel sender (subscribed peers)
     inbound_high_tx: mpsc::Sender<InboundShard>,
@@ -57,20 +78,20 @@ pub struct StreamManager {
     inbound_low_tx: mpsc::Sender<InboundShard>,
     /// Channel for receipts from ack frames that arrive for fire-and-forget sends
     receipt_tx: mpsc::Sender<ForwardReceipt>,
-    /// Our own PeerId for duplicate stream tiebreaking
-    local_peer_id: PeerId,
     /// Channel for receiving streams opened by background tasks
     open_result_rx: mpsc::UnboundedReceiver<(PeerId, Result<libp2p::Stream, std::io::Error>)>,
     /// Sender clone given to background tasks
     open_result_tx: mpsc::UnboundedSender<(PeerId, Result<libp2p::Stream, std::io::Error>)>,
     /// Peers with a background open in flight (prevents duplicate spawns)
     opening: HashSet<PeerId>,
+    /// Peers whose stream open failed (protocol unsupported, etc.) — skip future opens
+    failed_peers: HashSet<PeerId>,
+    /// Shared registry of peer writers (accessible from the outbound writer task)
+    writer_registry: WriterRegistry,
 }
 
 struct PeerStream {
-    /// Writer half of the stream, wrapped in BufWriter(64KB) to batch TCP writes.
-    /// Per-frame flushes are removed; the caller flushes after batch operations.
-    writer: Arc<Mutex<futures::io::BufWriter<futures::io::WriteHalf<libp2p::Stream>>>>,
+    writer: Arc<Mutex<StreamWriter>>,
     /// Monotonically increasing sequence ID
     next_seq: Arc<AtomicU64>,
     /// Pending ack channels: seq_id → oneshot sender
@@ -84,7 +105,9 @@ struct PeerStream {
 impl StreamManager {
     /// Create a new stream manager.
     ///
-    /// Returns (StreamManager, high_priority_rx, low_priority_rx, receipt_rx).
+    /// Returns (StreamManager, high_priority_rx, low_priority_rx, receipt_rx, outbound_tx).
+    /// The outbound_tx channel is the data plane: all shard writes go through it
+    /// to a background writer task, keeping poll_once non-blocking.
     pub fn new(
         control: libp2p_stream::Control,
         local_peer_id: PeerId,
@@ -93,25 +116,38 @@ impl StreamManager {
         mpsc::Receiver<InboundShard>,
         mpsc::Receiver<InboundShard>,
         mpsc::Receiver<ForwardReceipt>,
+        mpsc::Sender<OutboundShard>,
     ) {
-        let (inbound_high_tx, inbound_high_rx) = mpsc::channel(4096);
-        let (inbound_low_tx, inbound_low_rx) = mpsc::channel(2048);
-        let (receipt_tx, receipt_rx) = mpsc::channel(4096);
+        let (inbound_high_tx, inbound_high_rx) = mpsc::channel(16384);
+        let (inbound_low_tx, inbound_low_rx) = mpsc::channel(8192);
+        let (receipt_tx, receipt_rx) = mpsc::channel(8192);
         let (open_result_tx, open_result_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundShard>(8192);
+
+        let writer_registry: WriterRegistry = Arc::new(std::sync::RwLock::new(HashMap::new()));
+
+        // Spawn the background writer task — owns the outbound_rx and writer registry.
+        // This task is the data plane: it writes shards to TCP without blocking poll_once.
+        tokio::spawn(Self::outbound_writer_loop(
+            writer_registry.clone(),
+            outbound_rx,
+        ));
 
         let mgr = Self {
             control,
+            local_peer_id,
             streams: HashMap::new(),
             inbound_high_tx,
             inbound_low_tx,
             receipt_tx,
-            local_peer_id,
             open_result_rx,
             open_result_tx,
             opening: HashSet::new(),
+            failed_peers: HashSet::new(),
+            writer_registry,
         };
 
-        (mgr, inbound_high_rx, inbound_low_rx, receipt_rx)
+        (mgr, inbound_high_rx, inbound_low_rx, receipt_rx, outbound_tx)
     }
 
     /// Send a shard to a peer on an existing stream.
@@ -149,7 +185,7 @@ impl StreamManager {
             None
         };
 
-        // Write the shard frame
+        // Write the shard frame directly to TCP
         let write_result = {
             let mut writer = ps.writer.lock().await;
             write_shard_frame(&mut *writer, shard, seq_id).await
@@ -228,51 +264,59 @@ impl StreamManager {
     }
 
     /// Accept an inbound stream from a peer.
+    ///
+    /// Accept an inbound stream from a peer, replacing any existing stream.
+    ///
+    /// Unconditional replacement is necessary when both sides race to open:
+    /// the inbound stream is the remote's outbound — it's the correct one
+    /// to read from. The old outbound (if any) is a dead-end that nobody
+    /// writes to, so replacing it fixes the data path.
     pub fn accept_stream(&mut self, peer: PeerId, stream: libp2p::Stream, tier: u8) {
         // Cancel any in-flight background open since we now have a stream
         self.opening.remove(&peer);
+        // Also clear failed status — peer is clearly alive
+        self.failed_peers.remove(&peer);
 
-        // Duplicate stream tiebreak: lower PeerId keeps outbound (its opened stream),
-        // higher PeerId accepts inbound.
         if self.streams.contains_key(&peer) {
-            if self.local_peer_id < peer {
-                // We have lower PeerId: keep our outbound, reject this inbound
-                debug!(
-                    "Duplicate stream tiebreak: keeping outbound to {} (we have lower PeerId)",
-                    peer
-                );
-                return;
-            } else {
-                // We have higher PeerId: accept inbound, close outbound
-                debug!(
-                    "Duplicate stream tiebreak: accepting inbound from {} (we have higher PeerId)",
-                    peer
-                );
-                self.close_stream(&peer);
-            }
+            debug!("Replacing existing stream from {} with new inbound", peer);
+            self.close_stream(&peer);
         }
 
         self.register_stream(peer, stream, tier);
-        info!("Accepted inbound stream from peer {} (tier={})", peer, tier);
+        warn!("Accepted inbound stream from peer {} (tier={})", peer, tier);
     }
 
-    /// Ensure a background stream-open task is running for this peer.
+    /// Ensure a stream open is in flight for this peer.
     ///
-    /// If we already have a stream or a background open in flight, this is a no-op.
-    /// The spawned task calls `control.open_stream()` which requires the swarm's
-    /// Handler to be polled — since this runs as a separate tokio task, it naturally
-    /// completes once `swarm.poll()` processes the request in the main event loop.
+    /// Only the lower PeerId opens streams (higher waits for inbound via accept_stream).
+    /// If we already have a stream, an open in flight, or the peer is blacklisted,
+    /// this is a no-op. Opens are spawned immediately as background tasks.
     pub fn ensure_opening(&mut self, peer: PeerId) {
-        if self.streams.contains_key(&peer) || self.opening.contains(&peer) {
+        // Only lower PeerId opens streams to avoid bidirectional races.
+        // Higher PeerId waits for inbound via accept_stream.
+        if self.local_peer_id > peer {
             return;
         }
+        if self.streams.contains_key(&peer)
+            || self.opening.contains(&peer)
+            || self.failed_peers.contains(&peer)
+        {
+            return;
+        }
+        // Spawn immediately — no queue delay. The PeerId guard already limits
+        // concurrency (only lower PeerId opens), so at most N/2 opens in flight.
+        self.spawn_open(peer);
+    }
+
+    /// Spawn a background open_stream task for a peer.
+    fn spawn_open(&mut self, peer: PeerId) {
         self.opening.insert(peer);
         let mut control = self.control.clone();
         let tx = self.open_result_tx.clone();
         tokio::spawn(async move {
             debug!("Background: opening stream to {} ...", peer);
             match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
                 control.open_stream(peer, SHARD_STREAM_PROTOCOL),
             )
             .await
@@ -291,7 +335,7 @@ impl StreamManager {
                     ));
                 }
                 Err(_) => {
-                    warn!("Background: stream open to {} timed out (5s)", peer);
+                    warn!("Background: stream open to {} timed out (10s)", peer);
                     let _ = tx.send((
                         peer,
                         Err(std::io::Error::new(
@@ -302,19 +346,19 @@ impl StreamManager {
                 }
             }
         });
-        debug!("Initiated background stream open to {}", peer);
     }
 
     /// Collect completed background stream opens.
     ///
     /// Call this after every `swarm.poll()` cycle to register newly opened streams.
-    pub fn poll_open_streams(&mut self) {
+    /// Returns the number of newly registered streams.
+    pub fn poll_open_streams(&mut self) -> usize {
+        let mut opened = 0;
         while let Ok((peer, result)) = self.open_result_rx.try_recv() {
             self.opening.remove(&peer);
             match result {
                 Ok(stream) => {
                     if self.streams.contains_key(&peer) {
-                        // Stream already exists (e.g., accepted inbound in the meantime)
                         debug!(
                             "Background stream to {} ready but stream already exists, dropping",
                             peer
@@ -322,13 +366,32 @@ impl StreamManager {
                         continue;
                     }
                     self.register_stream(peer, stream, 0);
-                    info!("Opened outbound stream to peer {}", peer);
+                    warn!("Opened outbound stream to peer {}", peer);
+                    opened += 1;
                 }
                 Err(e) => {
+                    let msg = e.to_string();
+                    // Only blacklist permanent failures (protocol not supported).
+                    // "receiver is gone" = connection closed (transient), will retry on reconnect.
+                    if msg.contains("does not support") {
+                        warn!("Blacklisting peer {} — protocol unsupported", peer);
+                        self.failed_peers.insert(peer);
+                    }
                     debug!("Background stream open to {} failed: {}", peer, e);
                 }
             }
         }
+        opened
+    }
+
+    /// Number of streams established.
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Number of opens in flight.
+    pub fn pending_count(&self) -> usize {
+        self.opening.len()
     }
 
     /// Update a peer's subscription tier.
@@ -344,34 +407,50 @@ impl StreamManager {
         self.streams.contains_key(peer)
     }
 
+    /// Return all peers with active streams.
+    pub fn stream_peers(&self) -> Vec<PeerId> {
+        self.streams.keys().copied().collect()
+    }
+
     /// Close and remove a stream to a peer.
     fn close_stream(&mut self, peer: &PeerId) {
         if let Some(ps) = self.streams.remove(peer) {
             ps.reader_handle.abort();
+            // Remove from writer registry (writer task will stop writing to this peer)
+            self.writer_registry.write().unwrap().remove(peer);
             debug!("Closed stream to peer {}", peer);
         }
     }
 
     /// Remove a disconnected peer's stream.
+    ///
+    /// Does NOT clear failed_peers — if a peer was blacklisted (e.g. protocol
+    /// unsupported), it stays blacklisted across reconnects. Only accept_stream
+    /// clears the blacklist (proving the peer now supports the protocol).
     pub fn on_peer_disconnected(&mut self, peer: &PeerId) {
         self.opening.remove(peer);
         self.close_stream(peer);
     }
 
-    /// Flush the BufWriter for a specific peer, pushing buffered data to the wire.
-    pub async fn flush_peer(&mut self, peer: &PeerId) -> std::result::Result<(), std::io::Error> {
-        if let Some(ps) = self.streams.get(peer) {
-            let mut writer = ps.writer.lock().await;
-            AsyncWriteExt::flush(&mut *writer).await?;
-        }
-        Ok(())
-    }
+    /// Remove streams whose reader task has terminated (EOF or error).
+    ///
+    /// When a reader_loop exits, the stream is half-dead: writes go to TCP but
+    /// the peer has disconnected. This detects dead readers and cleans up, but
+    /// does NOT auto-reopen to avoid churn storms during bootstrap.
+    /// The next send_shard() call will trigger ensure_opening() lazily.
+    pub fn cleanup_dead_streams(&mut self) {
+        let dead_peers: Vec<PeerId> = self
+            .streams
+            .iter()
+            .filter(|(_, ps)| ps.reader_handle.is_finished())
+            .map(|(peer, _)| *peer)
+            .collect();
 
-    /// Flush all peer writers after batch operations.
-    pub async fn flush_all(&mut self) {
-        let peers: Vec<PeerId> = self.streams.keys().copied().collect();
-        for peer in peers {
-            let _ = self.flush_peer(&peer).await;
+        for peer in dead_peers {
+            warn!("Stream to {} has dead reader — removing and re-opening", peer);
+            self.close_stream(&peer);
+            // Proactively re-establish the stream (respects PeerId guard + failed_peers)
+            self.ensure_opening(peer);
         }
     }
 
@@ -379,7 +458,6 @@ impl StreamManager {
     fn register_stream(&mut self, peer: PeerId, stream: libp2p::Stream, tier: u8) {
         let tier_atomic = Arc::new(AtomicU8::new(tier));
         let (reader, writer) = AsyncReadExt::split(stream);
-        let writer = futures::io::BufWriter::with_capacity(8 * 1024, writer);
         let pending_acks: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AckResult>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -393,16 +471,55 @@ impl StreamManager {
             tier_atomic.clone(),
         ));
 
+        let writer_arc = Arc::new(Mutex::new(writer));
+        let seq_arc = Arc::new(AtomicU64::new(0));
+
+        // Register writer in the shared registry (accessible by the writer task)
+        self.writer_registry.write().unwrap().insert(peer, PeerWriterHandle {
+            writer: writer_arc.clone(),
+            next_seq: seq_arc.clone(),
+        });
+
         self.streams.insert(
             peer,
             PeerStream {
-                writer: Arc::new(Mutex::new(writer)),
-                next_seq: Arc::new(AtomicU64::new(0)),
+                writer: writer_arc,
+                next_seq: seq_arc,
                 pending_acks,
                 reader_handle,
                 tier: tier_atomic,
             },
         );
+    }
+
+    /// Background writer task: reads outbound shards from the channel and writes
+    /// directly to peer streams. Runs as a separate tokio task so data writes
+    /// never block poll_once (the control plane).
+    async fn outbound_writer_loop(
+        registry: WriterRegistry,
+        mut rx: mpsc::Receiver<OutboundShard>,
+    ) {
+        loop {
+            let Some(outbound) = rx.recv().await else {
+                debug!("Outbound writer channel closed, exiting");
+                break;
+            };
+
+            // Briefly hold std RwLock to clone Arcs — released before any async work
+            let handle = {
+                let reg = registry.read().unwrap();
+                reg.get(&outbound.peer).map(|h| (h.writer.clone(), h.next_seq.clone()))
+            };
+            if let Some((writer, next_seq)) = handle {
+                let seq_id = next_seq.fetch_add(1, Ordering::Relaxed);
+                let mut w = writer.lock().await;
+                if let Err(e) = write_shard_frame(&mut *w, &outbound.shard, seq_id).await {
+                    warn!("Outbound write to {} failed: {}", outbound.peer, e);
+                }
+            } else {
+                warn!("No stream in writer_registry for peer {} — dropping outbound shard", outbound.peer);
+            }
+        }
     }
 
     /// Reader loop for a single peer stream.
@@ -426,15 +543,34 @@ impl StreamManager {
                         seq_id,
                         shard,
                     };
-                    // Route to high or low priority based on peer tier
+                    // Route to high or low priority based on peer tier.
+                    // Use try_send to avoid blocking the reader loop when the
+                    // channel is full (backpressure from slow drain). Blocking
+                    // here would stall TCP reads, causing upstream writers to
+                    // block on TCP send, cascading into a full pipeline stall.
+                    // Dropped shards are recoverable via erasure coding (3-of-5).
                     if tier.load(Ordering::Relaxed) > 0 {
-                        if inbound_high_tx.send(inbound).await.is_err() {
-                            debug!("High-priority inbound channel closed for {}", peer);
-                            break;
+                        match inbound_high_tx.try_send(inbound) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!("High-priority inbound channel full for {} — dropping shard to prevent backpressure stall", peer);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                debug!("High-priority inbound channel closed for {}", peer);
+                                break;
+                            }
                         }
-                    } else if inbound_low_tx.send(inbound).await.is_err() {
-                        debug!("Low-priority inbound channel closed for {}", peer);
-                        break;
+                    } else {
+                        match inbound_low_tx.try_send(inbound) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!("Low-priority inbound channel full for {} — dropping shard to prevent backpressure stall", peer);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                debug!("Low-priority inbound channel closed for {}", peer);
+                                break;
+                            }
+                        }
                     }
                 }
                 Ok(StreamFrame::Ack { seq_id, receipt }) => {
@@ -443,9 +579,10 @@ impl StreamManager {
                     if let Some(tx) = sender {
                         let _ = tx.send(AckResult::Accepted(receipt.clone().map(Box::new)));
                     }
-                    // Also forward receipt to the receipt channel for fire-and-forget sends
+                    // Also forward receipt to the receipt channel for fire-and-forget sends.
+                    // Use try_send to avoid blocking the reader loop.
                     if let Some(r) = receipt {
-                        let _ = receipt_tx.send(r).await;
+                        let _ = receipt_tx.try_send(r);
                     }
                 }
                 Ok(StreamFrame::Nack { seq_id, reason }) => {

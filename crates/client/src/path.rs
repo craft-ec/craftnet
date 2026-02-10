@@ -140,6 +140,9 @@ impl PathSelector {
             .relays_with_encryption()
             .into_iter()
             .filter(|r| !exclude.contains(&r.peer_id))
+            // Exclude the exit itself — it cannot relay for its own circuit
+            // (shard would arrive with non-empty header, get relayed to self, and dropped)
+            .filter(|r| r.peer_id != exit.peer_id)
             .collect();
 
         if eligible.len() < hop_count {
@@ -442,5 +445,103 @@ mod tests {
         let id1 = random_id();
         let id2 = random_id();
         assert_ne!(id1, id2);
+    }
+
+    /// Simulate the E2E topology: 5 relays + 3 exits (exits added as relays).
+    /// Prove that exits can be selected as intermediate relay hops when
+    /// the exit's peer_id is NOT excluded from eligible relays.
+    #[test]
+    fn test_exit_in_topology_can_be_selected_as_relay_hop() {
+        let mut graph = TopologyGraph::new();
+
+        // 5 relays: ids 1..=5, fully connected to each other + exits
+        for i in 1u8..=5 {
+            let mut relay = make_relay(i);
+            for j in 1u8..=5 {
+                if i != j { relay.connected_peers.insert(vec![j]); }
+            }
+            // Relays connected to exits
+            for e in 10u8..=12 {
+                relay.connected_peers.insert(vec![e]);
+            }
+            graph.update_relay(relay);
+        }
+
+        // 3 exits: ids 10, 11, 12 — added as "relays" in topology (the bug)
+        for e in 10u8..=12 {
+            let mut exit_relay = make_relay(e);
+            // Exits connected to all relays + other exits
+            for i in 1u8..=5 { exit_relay.connected_peers.insert(vec![i]); }
+            for j in 10u8..=12 {
+                if e != j { exit_relay.connected_peers.insert(vec![j]); }
+            }
+            graph.update_relay(exit_relay);
+        }
+
+        // Exit 10 is the destination
+        let exit = make_exit(10);
+        let gateway_bytes = vec![1u8]; // relay 1 is gateway
+
+        // With 8 relays in topology (5 real + 3 exits), selecting 1 extra hop
+        // has a significant chance of picking exit 10 as the relay hop.
+        // Run 200 trials to detect the problem statistically.
+        let mut exit_selected_as_relay = 0;
+        for _ in 0..200 {
+            if let Ok(path) = PathSelector::select_path(&graph, 1, &exit, &HashSet::new(), Some(&gateway_bytes)) {
+                if path.hops.iter().any(|h| h.peer_id == exit.peer_id) {
+                    exit_selected_as_relay += 1;
+                }
+            }
+        }
+
+        // Before the fix: exit_selected_as_relay > 0 (exit can appear as relay hop)
+        // After the fix: exit_selected_as_relay == 0 (exit excluded from relay pool)
+        assert_eq!(
+            exit_selected_as_relay, 0,
+            "Exit was selected as a relay hop {exit_selected_as_relay} out of 200 times! \
+             This causes shards to arrive at exit with non-empty header, \
+             get relayed to self, and silently dropped.",
+        );
+    }
+
+    /// Verify that excluding exit from relays still allows valid paths.
+    #[test]
+    fn test_path_selection_works_after_exit_exclusion() {
+        let mut graph = TopologyGraph::new();
+
+        // 5 relays fully connected
+        for i in 1u8..=5 {
+            let mut relay = make_relay(i);
+            for j in 1u8..=5 {
+                if i != j { relay.connected_peers.insert(vec![j]); }
+            }
+            relay.connected_peers.insert(vec![10]); // connected to exit
+            graph.update_relay(relay);
+        }
+
+        // Exit NOT in topology (correct behavior)
+        let exit = make_exit(10);
+        let gateway = vec![1u8];
+
+        // Single extra hop
+        let path = PathSelector::select_path(&graph, 1, &exit, &HashSet::new(), Some(&gateway)).unwrap();
+        assert_eq!(path.hops.len(), 1);
+        assert_ne!(path.hops[0].peer_id, exit.peer_id);
+
+        // Double extra hop
+        let path = PathSelector::select_path(&graph, 2, &exit, &HashSet::new(), Some(&gateway)).unwrap();
+        assert_eq!(path.hops.len(), 2);
+        for hop in &path.hops {
+            assert_ne!(hop.peer_id, exit.peer_id);
+        }
+
+        // Diverse paths
+        let paths = PathSelector::select_diverse_paths(&graph, 2, &exit, 5, Some(&gateway)).unwrap();
+        assert_eq!(paths.len(), 5);
+        for p in &paths {
+            for hop in &p.hops {
+                assert_ne!(hop.peer_id, exit.peer_id, "Exit must never appear as relay hop");
+            }
+        }
     }
 }

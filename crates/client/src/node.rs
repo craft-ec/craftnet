@@ -37,7 +37,7 @@ use tunnelcraft_network::{
     EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
     RELAY_HEARTBEAT_INTERVAL, RELAY_OFFLINE_THRESHOLD,
     EXIT_STATUS_TOPIC, RELAY_STATUS_TOPIC, PROOF_TOPIC,
-    StreamManager, InboundShard,
+    StreamManager, InboundShard, OutboundShard,
 };
 use tunnelcraft_aggregator::Aggregator;
 use tunnelcraft_prover::{Prover, StubProver};
@@ -232,7 +232,7 @@ impl Default for NodeConfig {
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
             bootstrap_peers: Vec::new(),
             hop_mode: HopMode::Triple,
-            request_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(5),
             allow_last_hop: true,
             enable_exit: false,
             exit_region: ExitRegion::Auto,
@@ -653,6 +653,14 @@ enum NatStatus {
     Private,
 }
 
+/// Result from a spawned exit processing task.
+#[allow(dead_code)]
+struct ExitTaskResult {
+    handler: ExitHandler,
+    shard_pairs: Vec<(Shard, Option<Vec<u8>>)>,
+    process_ms: u128,
+}
+
 /// Internal state that needs synchronization
 struct NodeState {
     stats: NodeStats,
@@ -821,10 +829,15 @@ pub struct TunnelCraftNode {
     incoming_stream_rx: Option<mpsc::Receiver<(PeerId, libp2p::Stream)>>,
     /// Receipt channel from fire-and-forget stream acks
     stream_receipt_rx: Option<mpsc::Receiver<ForwardReceipt>>,
-    /// Layer 2: free-tier shards deferred after onion peel
-    deferred_forwards: VecDeque<(Shard, PeerId, u8)>,  // (shard, next_hop, retry_count)
+    /// Data plane channel: outbound shards written by background writer task
+    outbound_tx: Option<mpsc::Sender<OutboundShard>>,
     /// Buffered receipts pending batch disk flush (avoids per-receipt file I/O)
     receipt_buffer: Vec<ForwardReceipt>,
+    /// Channel for receiving results from spawned exit processing tasks
+    exit_task_tx: mpsc::Sender<ExitTaskResult>,
+    exit_task_rx: mpsc::Receiver<ExitTaskResult>,
+    /// Shards queued for exit processing while handler is busy (async HTTP fetch)
+    exit_shard_queue: VecDeque<Shard>,
 
     /// Aggregator service (collects proof messages, builds distributions)
     aggregator: Option<Aggregator>,
@@ -874,6 +887,8 @@ impl TunnelCraftNode {
             relay_handler: None,
             exit_handler: None,
         }));
+
+        let (exit_task_tx, exit_task_rx) = mpsc::channel(4);
 
         // Set up receipt and proof state persistence (unique files per peer ID)
         let peer_id = PeerId::from(libp2p_keypair.public());
@@ -1025,8 +1040,11 @@ impl TunnelCraftNode {
             inbound_low_rx: None,
             incoming_stream_rx: None,
             stream_receipt_rx: None,
-            deferred_forwards: VecDeque::new(),
+            outbound_tx: None,
             receipt_buffer: Vec::new(),
+            exit_task_tx,
+            exit_task_rx,
+            exit_shard_queue: VecDeque::new(),
             aggregator: if enable_aggregator {
                 #[cfg(feature = "risc0")]
                 let agg_prover: Box<dyn tunnelcraft_prover::Prover> = Box::new(tunnelcraft_prover::Risc0Prover::new());
@@ -1148,12 +1166,13 @@ impl TunnelCraftNode {
 
         // Initialize persistent stream manager
         let stream_control = swarm.behaviour().stream_control();
-        let (stream_mgr, high_rx, low_rx, receipt_rx) =
+        let (stream_mgr, high_rx, low_rx, receipt_rx, outbound_tx) =
             StreamManager::new(stream_control, peer_id);
         self.stream_manager = Some(stream_mgr);
         self.inbound_high_rx = Some(high_rx);
         self.inbound_low_rx = Some(low_rx);
         self.stream_receipt_rx = Some(receipt_rx);
+        self.outbound_tx = Some(outbound_tx);
 
         // Bridge IncomingStreams (0-buffer futures channel) into a buffered tokio
         // mpsc channel. The bridging task continuously polls IncomingStreams::next()
@@ -1656,16 +1675,21 @@ impl TunnelCraftNode {
                 true
             });
 
-        // Collect all candidates with the best (lowest) score, then pick randomly
-        // to distribute load across exits when scores are equal.
+        // Collect all candidates with the best (lowest) score, then pick one
+        // based on local_peer_id hash so different clients spread across exits.
         let mut all: Vec<_> = candidates.collect();
-        if !all.is_empty() {
-            let best_score = all.iter().map(|s| s.score).min().unwrap();
-            all.retain(|s| s.score == best_score);
+        if let Some(min_score) = all.iter().map(|s| s.score).min() {
+            all.retain(|s| s.score == min_score);
         }
         let best = if all.len() > 1 {
-            use rand::Rng;
-            let idx = rand::thread_rng().gen_range(0..all.len());
+            // Deterministic but peer-specific pick: hash local_peer_id bytes
+            let seed = self.local_peer_id
+                .map(|p| {
+                    let b = p.to_bytes();
+                    b.iter().fold(0usize, |acc, &x| acc.wrapping_mul(31).wrapping_add(x as usize))
+                })
+                .unwrap_or(0);
+            let idx = seed % all.len();
             Some(all[idx].info.clone())
         } else {
             all.first().map(|s| s.info.clone())
@@ -1974,16 +1998,24 @@ impl TunnelCraftNode {
             );
             return false;
         }
-        // Must have a gateway relay we're connected to
+        // Must have a gateway relay we're connected to AND have a stream to it
         let our_bytes = match self.local_peer_id {
             Some(pid) => pid.to_bytes(),
             None => return false,
         };
-        let has_gateway = self.select_gateway_relay(&our_bytes).is_some();
-        if !has_gateway {
+        let gateway = self.select_gateway_relay(&our_bytes);
+        if gateway.is_none() {
             debug!("is_ready: no gateway relay available");
+            return false;
         }
-        has_gateway
+        let (gw_peer_id, _) = gateway.unwrap();
+        let has_stream = self.stream_manager.as_ref()
+            .map(|sm| sm.has_stream(&gw_peer_id))
+            .unwrap_or(false);
+        if !has_stream {
+            debug!("is_ready: gateway {} found but no shard-stream yet", gw_peer_id);
+        }
+        has_stream
     }
 
     /// Make an HTTP GET request through the tunnel (Client/Both mode)
@@ -2132,81 +2164,111 @@ impl TunnelCraftNode {
         let req_id_hex = hex::encode(&request_id[..8]);
         let send_count = send_queue.len();
         let mut sent = 0usize;
-        info!(
-            "[SHARD-FLOW] CLIENT sending {} shards and waiting for response request={} timeout={:?}",
-            send_count, req_id_hex, self.config.request_timeout,
+        let send_start = std::time::Instant::now();
+        let has_stream_to_gw = first_hops.first().map_or(false, |gw| {
+            self.stream_manager.as_ref().map_or(false, |sm| sm.has_stream(gw))
+        });
+        warn!(
+            "[TRACE] CLIENT SEND_START request={} shards={} gateway={:?} has_stream={} timeout={:?}",
+            req_id_hex,
+            send_count,
+            first_hops.first().map(|p| { let s = p.to_string(); s[s.len().saturating_sub(6)..].to_string() }),
+            has_stream_to_gw,
+            self.config.request_timeout,
         );
 
-        let response = tokio::time::timeout(self.config.request_timeout, async {
-            loop {
-                // Collect any streams that finished opening in the background
-                if let Some(ref mut sm) = self.stream_manager {
-                    sm.poll_open_streams();
+        // Progress-based timeout: resets every time a new response shard arrives.
+        // This allows large transfers (1GB+) to complete as long as the pipeline
+        // keeps making progress. Only triggers when NO shards arrive for the full
+        // timeout window (idle stall = real failure).
+        let mut last_progress = Instant::now();
+        let mut last_shard_count = 0usize;
+        let response = loop {
+            // Check for idle timeout (no new shards received within window)
+            let current_shard_count = self.pending.get(&request_id)
+                .map(|p| p.shards.len())
+                .unwrap_or(0);
+            if current_shard_count > last_shard_count {
+                last_progress = Instant::now();
+                last_shard_count = current_shard_count;
+            }
+            if last_progress.elapsed() > self.config.request_timeout {
+                // Idle timeout — no progress
+                let elapsed_ms = send_start.elapsed().as_millis();
+                if let Some(pending) = self.pending.get(&request_id) {
+                    let mut chunk_coverage: HashMap<u16, usize> = HashMap::new();
+                    for &(chunk_idx, _) in pending.shards.keys() {
+                        *chunk_coverage.entry(chunk_idx).or_default() += 1;
+                    }
+                    let coverage_str: String = (0..pending.total_chunks.max(1))
+                        .map(|c| format!("c{}={}", c, chunk_coverage.get(&c).unwrap_or(&0)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    warn!(
+                        "[TRACE] CLIENT TIMEOUT request={} elapsed={}ms idle={}ms sent={}/{} collected={}/{} chunks={} coverage=[{}]",
+                        req_id_hex, elapsed_ms, self.config.request_timeout.as_millis(),
+                        sent, send_count,
+                        pending.shards.len(),
+                        if pending.total_chunks > 0 { pending.total_chunks as usize * DATA_SHARDS } else { 0 },
+                        pending.total_chunks,
+                        coverage_str,
+                    );
+                } else {
+                    warn!("[TRACE] CLIENT TIMEOUT request={} elapsed={}ms (no pending entry)", req_id_hex, elapsed_ms);
                 }
+                self.pending.remove(&request_id);
+                return Err(ClientError::Timeout);
+            }
 
-                // Try to send all queued shards that have ready streams.
-                // Shards to peers without streams are re-queued (ensure_opening
-                // is called inside send_shard, which returns WouldBlock).
-                let mut retry_queue: VecDeque<(Shard, PeerId)> = VecDeque::new();
-                while let Some((shard, target)) = send_queue.pop_front() {
-                    if let Some(ref mut sm) = self.stream_manager {
-                        match sm.send_shard(target, &shard, false).await {
-                            Ok(_) => {
-                                sent += 1;
-                                debug!("[SHARD-FLOW] CLIENT sent shard {}/{} to {}", sent, send_count, target);
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                // Stream opening in background — re-queue
-                                retry_queue.push_back((shard, target));
-                            }
-                            Err(e) => {
-                                warn!("[SHARD-FLOW] CLIENT send shard to {} failed: {}", target, e);
-                                // Re-queue on connection errors (stream broke, background reopen initiated)
-                                if e.kind() != std::io::ErrorKind::InvalidData {
-                                    retry_queue.push_back((shard, target));
-                                }
-                            }
-                        }
+            // Collect any streams that finished opening in the background
+            if let Some(ref mut sm) = self.stream_manager {
+                sm.poll_open_streams();
+            }
+
+            // Push request shards to outbound channel (data plane).
+            // Ensure stream exists first so writer task can send them.
+            while let Some((shard, target)) = send_queue.pop_front() {
+                if let Some(ref mut sm) = self.stream_manager {
+                    if !sm.has_stream(&target) {
+                        sm.ensure_opening(target);
+                        // Re-queue — stream opening in background, will retry next cycle
+                        send_queue.push_back((shard, target));
+                        break;
                     }
                 }
-                send_queue = retry_queue;
-
-                // Flush buffered request shards to the wire before waiting for response.
-                // Without this, shards sit in BufWriter until drain_stream_shards runs
-                // (which is AFTER the swarm event drain — potentially seconds of gossip processing).
-                if let Some(ref mut sm) = self.stream_manager {
-                    sm.flush_all().await;
-                }
-
-                tokio::select! {
-                    response = response_rx.recv() => {
-                        return response.ok_or(ClientError::Timeout)?;
-                    }
-                    _ = self.poll_once() => {}
+                if let Some(ref tx) = self.outbound_tx {
+                    let payload_len = shard.payload.len();
+                    let _ = tx.try_send(OutboundShard { peer: target, shard });
+                    sent += 1;
+                    let target_str = target.to_string();
+                    warn!(
+                        "[TRACE] CLIENT SHARD_SENT request={} shard={}/{} target={} elapsed={}ms payload={}B",
+                        req_id_hex, sent, send_count,
+                        &target_str[target_str.len().saturating_sub(6)..],
+                        send_start.elapsed().as_millis(),
+                        payload_len,
+                    );
                 }
             }
-        })
-        .await
-        .map_err(|_| {
-            // Log pending state at timeout
-            if let Some(pending) = self.pending.get(&request_id) {
-                warn!(
-                    "[SHARD-FLOW] CLIENT TIMEOUT request={} (sent {}/{} shards, collected {}/{} response shards, total_chunks={})",
-                    req_id_hex,
-                    sent, send_count,
-                    pending.shards.len(),
-                    if pending.total_chunks > 0 { pending.total_chunks as usize * DATA_SHARDS } else { 0 },
-                    pending.total_chunks,
+            if sent == send_count && sent > 0 {
+                info!(
+                    "[TRACE] CLIENT ALL_SENT request={} shards={} elapsed={}ms — waiting for response",
+                    req_id_hex, sent, send_start.elapsed().as_millis(),
                 );
-            } else {
-                warn!("[SHARD-FLOW] CLIENT TIMEOUT request={} (no pending entry — already completed?)", req_id_hex);
             }
-            // Clean up the pending request on timeout
-            self.pending.remove(&request_id);
-            ClientError::Timeout
-        })??;
 
-        Ok(response)
+            tokio::select! {
+                response = response_rx.recv() => {
+                    match response {
+                        Some(r) => break r,
+                        None => return Err(ClientError::Timeout),
+                    }
+                }
+                _ = self.poll_once() => {}
+            }
+        };
+
+        Ok(response?)
     }
 
     /// Send shards to peers.
@@ -2224,13 +2286,18 @@ impl TunnelCraftNode {
     /// to decrypt the routing_tag with our encryption key.
     async fn process_incoming_shard(&mut self, shard: Shard, source_peer: PeerId) -> ShardResponse {
         let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
-        info!(
-            "[SHARD-FLOW] node={} received shard from {} (header_len={} payload_len={} routing_tag_len={})",
-            &local_id[local_id.len().saturating_sub(6)..],
-            &source_peer.to_string()[source_peer.to_string().len().saturating_sub(6)..],
-            shard.header.len(),
-            shard.payload.len(),
-            shard.routing_tag.len(),
+        let local_short = &local_id[local_id.len().saturating_sub(6)..];
+        let source_str = source_peer.to_string();
+        let source_short = &source_str[source_str.len().saturating_sub(6)..];
+        // Shard fingerprint: stable across hops (payload doesn't change during relay)
+        let fp = if shard.payload.len() >= 4 {
+            format!("{:02x}{:02x}{:02x}{:02x}", shard.payload[0], shard.payload[1], shard.payload[2], shard.payload[3])
+        } else {
+            "short".to_string()
+        };
+        warn!(
+            "[TRACE] node={} RECV fp={} from={} header={}B payload={}B",
+            local_short, fp, source_short, shard.header.len(), shard.payload.len(),
         );
 
         // Try to decrypt routing_tag with our own encryption key.
@@ -2238,30 +2305,17 @@ impl TunnelCraftNode {
         // Important: exit nodes can also decrypt routing_tags on REQUEST shards (since
         // the client encrypted them with the exit's key). We distinguish by checking
         // whether the assembly_id matches something we're waiting for.
-        if let Ok(tag) = tunnelcraft_crypto::decrypt_routing_tag(
+        let tag_result = tunnelcraft_crypto::decrypt_routing_tag(
             &self.encryption_keypair.secret_key_bytes(),
             &shard.routing_tag,
-        ) {
+        );
+        let tag_ok = tag_result.is_ok();
+        if let Ok(tag) = tag_result {
             let assembly_id = tag.assembly_id;
             let has_pending_request = self.pending.contains_key(&assembly_id);
             let has_pending_tunnel = self.pending_tunnel.contains_key(&assembly_id);
 
-            info!(
-                "[SHARD-FLOW] node={} routing_tag decrypted: assembly={} chunk={}/{} shard={} pending_req={} pending_tunnel={}",
-                &local_id[local_id.len().saturating_sub(6)..],
-                hex::encode(&assembly_id[..8]),
-                tag.chunk_index, tag.total_chunks,
-                tag.shard_index,
-                has_pending_request, has_pending_tunnel,
-            );
-
             if has_pending_request || has_pending_tunnel {
-                // This is a response shard for us (client mode)
-                info!(
-                    "[SHARD-FLOW] node={} RESPONSE shard for us! assembly={}",
-                    &local_id[local_id.len().saturating_sub(6)..],
-                    hex::encode(&assembly_id[..8]),
-                );
                 self.handle_response_shard(shard);
                 return ShardResponse::Accepted(None);
             }
@@ -2270,100 +2324,186 @@ impl TunnelCraftNode {
 
         // Not for us — process as relay or exit
         if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            info!("[SHARD-FLOW] node={} REJECTED: not in relay mode", &local_id[local_id.len().saturating_sub(6)..]);
             return ShardResponse::Rejected("Not in relay mode".to_string());
         }
 
-        // Check if this shard has an empty header — if so, process as exit
         if shard.header.is_empty() {
-            info!("[SHARD-FLOW] node={} routing to EXIT handler (empty header)", &local_id[local_id.len().saturating_sub(6)..]);
+            // CRITICAL: empty header = exit processing. If tag decryption failed,
+            // this shard is NOT a response for us and will hit the exit handler.
+            // Log this since it's the path that causes EXIT_REJECTED on non-exit nodes.
+            if !tag_ok {
+                warn!(
+                    "[TRACE] node={} EMPTY_HEADER_NO_TAG fp={} from={} routing_tag_len={} pending_count={} enable_exit={} — shard with empty header but routing_tag decrypt failed, will try exit processing",
+                    local_short, fp, source_short, shard.routing_tag.len(), self.pending.len(), self.config.enable_exit,
+                );
+            }
             return self.process_as_exit(shard, source_peer).await;
         }
 
-        // Process as relay: peel one onion layer, forward to next hop
-        info!("[SHARD-FLOW] node={} routing to RELAY handler (header_len={})", &local_id[local_id.len().saturating_sub(6)..], shard.header.len());
         self.relay_shard(shard, Some(source_peer)).await
     }
 
-    /// Process shard as exit node.
-    /// `source_peer` is the peer that delivered the shard (last relay hop). Not used for routing.
+    /// Process shard as exit node (non-blocking).
+    ///
+    /// Shard collection is synchronous (microseconds). When an assembly completes,
+    /// the slow HTTP fetch + response creation is spawned as a background task so
+    /// poll_once() keeps running and swarm connections stay healthy.
     async fn process_as_exit(&mut self, shard: Shard, _source_peer: PeerId) -> ShardResponse {
-        // Take exit handler out temporarily to avoid holding lock across await
+        let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+        let local_short = local_id[local_id.len().saturating_sub(6)..].to_string();
+
         let exit_handler = {
             let mut state = self.state.write();
             state.exit_handler.take()
         };
 
         let Some(mut handler) = exit_handler else {
-            return ShardResponse::Rejected("Not an exit node".to_string());
+            // Handler is busy in a spawned task — queue shard for later
+            self.exit_shard_queue.push_back(shard);
+            return ShardResponse::Accepted(None);
         };
 
-        let result = handler.process_shard(shard).await;
+        // Fast path: collect shard into assembly (no I/O, microseconds)
+        let collect_result = handler.collect_shard(shard);
 
-        // Put handler back and extract per-shard (shard, gateway) pairs
-        let shard_pairs = {
-            let mut state = self.state.write();
-            state.exit_handler = Some(handler);
-
-            match result {
-                Ok(Some(pairs)) => {
-                    if !pairs.is_empty() {
-                        state.stats.requests_exited += 1;
-                    }
-                    pairs
-                }
-                Ok(None) => {
-                    return ShardResponse::Accepted(None);
-                }
-                Err(e) => {
-                    return ShardResponse::Rejected(e.to_string());
-                }
+        match collect_result {
+            Ok(None) => {
+                // Still collecting — restore handler immediately
+                let mut state = self.state.write();
+                state.exit_handler = Some(handler);
+                return ShardResponse::Accepted(None);
             }
-        };
-        // Lock released here
+            Ok(Some(assembly_id)) => {
+                // Assembly complete — spawn slow processing as background task.
+                // Handler is moved into the task and returned via channel when done.
+                // This prevents blocking poll_once during HTTP fetch.
+                let tx = self.exit_task_tx.clone();
+                let ls = local_short.clone();
+                tokio::spawn(async move {
+                    let start = std::time::Instant::now();
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        handler.process_complete_assembly(assembly_id),
+                    ).await;
+                    let process_ms = start.elapsed().as_millis();
 
-        // Send each response shard to its designated gateway
-        if !shard_pairs.is_empty() {
+                    let shard_pairs = match result {
+                        Ok(Ok(Some(pairs))) => {
+                            warn!(
+                                "[TRACE] node={} EXIT_COMPLETE response_shards={} process_ms={}",
+                                ls, pairs.len(), process_ms,
+                            );
+                            pairs
+                        }
+                        Ok(Ok(None)) => vec![],
+                        Ok(Err(e)) => {
+                            warn!("[TRACE] node={} EXIT_ERROR err={} process_ms={}", ls, e, process_ms);
+                            vec![]
+                        }
+                        Err(_) => {
+                            warn!("[TRACE] node={} EXIT_TIMEOUT process_ms={} — handler returned", ls, process_ms);
+                            vec![]
+                        }
+                    };
+
+                    let _ = tx.send(ExitTaskResult { handler, shard_pairs, process_ms }).await;
+                });
+                return ShardResponse::Accepted(None);
+            }
+            Err(e) => {
+                // Collection failed (e.g., bad routing_tag) — restore handler
+                let mut state = self.state.write();
+                state.exit_handler = Some(handler);
+                warn!("[TRACE] node={} EXIT_ERROR err={}", local_short, e);
+                return ShardResponse::Rejected(e.to_string());
+            }
+        }
+    }
+
+    /// Queue completed exit task results: restore handler, enqueue response shards.
+    fn drain_exit_task_results(&mut self) {
+        while let Ok(result) = self.exit_task_rx.try_recv() {
+            // Restore exit handler
+            {
+                let mut state = self.state.write();
+                if !result.shard_pairs.is_empty() {
+                    state.stats.requests_exited += 1;
+                }
+                state.exit_handler = Some(result.handler);
+            }
+
+            // Push response shards to outbound channel (data plane).
+            // The background writer task writes them to TCP without blocking poll_once.
             let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
             let local_short = &local_id[local_id.len().saturating_sub(6)..];
-
-            // Group shards by gateway for efficient batched sending.
-            // Every response shard MUST have a designated gateway from the LeaseSet.
-            // There is no fallback — onion routing requires an explicit target.
-            let mut by_gateway: HashMap<PeerId, Vec<Shard>> = HashMap::new();
-            let mut dropped = 0usize;
-            for (shard, gateway_bytes) in shard_pairs {
+            let mut queued = 0u32;
+            for (shard, gateway_bytes) in result.shard_pairs {
                 if let Some(target) = gateway_bytes.and_then(|gw| PeerId::from_bytes(&gw).ok()) {
-                    by_gateway.entry(target).or_default().push(shard);
+                    if let Some(ref tx) = self.outbound_tx {
+                        match tx.try_send(OutboundShard { peer: target, shard }) {
+                            Ok(()) => { queued += 1; }
+                            Err(e) => {
+                                warn!("[TRACE] node={} EXIT_RESPONSE_DROP target={} err={}", local_short, &target.to_string()[target.to_string().len().saturating_sub(6)..], e);
+                            }
+                        }
+                    }
                 } else {
-                    dropped += 1;
+                    warn!("[TRACE] node={} EXIT_RESPONSE_NO_GATEWAY", local_short);
                 }
             }
-            if dropped > 0 {
+            if queued > 0 {
                 warn!(
-                    "[SHARD-FLOW] node={} EXIT dropped {} response shards with no gateway",
-                    local_short, dropped,
+                    "[TRACE] node={} EXIT_RESPONSE queued={} process_ms={}",
+                    local_short, queued, result.process_ms,
                 );
-            }
-
-            for (target, shards) in by_gateway {
-                let target_str = target.to_string();
-                info!(
-                    "[SHARD-FLOW] node={} EXIT sending {} response shards to gateway={}",
-                    local_short,
-                    shards.len(),
-                    &target_str[target_str.len().saturating_sub(6)..],
-                );
-                // Queue response shards for deferred sending.
-                // Sending here directly may block (open_stream needs swarm polling).
-                // deferred_forwards are drained after the next swarm poll cycle.
-                for shard in shards {
-                    self.deferred_forwards.push_back((shard, target, 0));
-                }
             }
         }
 
-        ShardResponse::Accepted(None)
+        // Process queued exit shards now that handler may be available
+        while self.state.read().exit_handler.is_some() && !self.exit_shard_queue.is_empty() {
+            let shard = self.exit_shard_queue.pop_front().unwrap();
+            // Fast path only: collect_shard is sync, won't block.
+            // If assembly completes, it spawns a new task (handler taken again → loop breaks).
+            let exit_handler = {
+                let mut state = self.state.write();
+                state.exit_handler.take()
+            };
+            let Some(mut handler) = exit_handler else { break; };
+
+            match handler.collect_shard(shard) {
+                Ok(None) => {
+                    self.state.write().exit_handler = Some(handler);
+                }
+                Ok(Some(assembly_id)) => {
+                    let tx = self.exit_task_tx.clone();
+                    let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+                    let ls = local_id[local_id.len().saturating_sub(6)..].to_string();
+                    tokio::spawn(async move {
+                        let start = std::time::Instant::now();
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(15),
+                            handler.process_complete_assembly(assembly_id),
+                        ).await;
+                        let process_ms = start.elapsed().as_millis();
+                        let shard_pairs = match result {
+                            Ok(Ok(Some(pairs))) => {
+                                warn!("[TRACE] node={} EXIT_COMPLETE response_shards={} process_ms={}", ls, pairs.len(), process_ms);
+                                pairs
+                            }
+                            Ok(Ok(None)) => vec![],
+                            Ok(Err(e)) => { warn!("[TRACE] node={} EXIT_ERROR err={} process_ms={}", ls, e, process_ms); vec![] }
+                            Err(_) => { warn!("[TRACE] node={} EXIT_TIMEOUT process_ms={}", ls, process_ms); vec![] }
+                        };
+                        let _ = tx.send(ExitTaskResult { handler, shard_pairs, process_ms }).await;
+                    });
+                    break; // handler is in task, stop draining queue
+                }
+                Err(e) => {
+                    warn!("[TRACE] EXIT_QUEUE_ERROR err={}", e);
+                    self.state.write().exit_handler = Some(handler);
+                }
+            }
+        }
     }
 
     /// Relay a shard by peeling one onion layer and forwarding to the next hop.
@@ -2390,22 +2530,22 @@ impl TunnelCraftNode {
             Ok((modified_shard, next_peer_bytes, receipt, pool_pubkey, epoch)) => {
                 let has_tunnel = modified_shard.header.is_empty();
                 let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+                let local_short = &local_id[local_id.len().saturating_sub(6)..];
+                let fp = if modified_shard.payload.len() >= 4 {
+                    format!("{:02x}{:02x}{:02x}{:02x}", modified_shard.payload[0], modified_shard.payload[1], modified_shard.payload[2], modified_shard.payload[3])
+                } else { "short".to_string() };
                 if let Ok(next_pid) = PeerId::from_bytes(&next_peer_bytes) {
                     let connected = self.swarm.as_ref().is_some_and(|s| s.is_connected(&next_pid));
-                    info!(
-                        "[SHARD-FLOW] node={} RELAY peeled onion → next_hop={} is_gateway={} connected={} remaining_header={}",
-                        &local_id[local_id.len().saturating_sub(6)..],
-                        &next_pid.to_string()[next_pid.to_string().len().saturating_sub(6)..],
-                        has_tunnel,
-                        connected,
-                        modified_shard.header.len(),
+                    let has_stream = self.stream_manager.as_ref().map_or(false, |sm| sm.has_stream(&next_pid));
+                    let next_str = next_pid.to_string();
+                    warn!(
+                        "[TRACE] node={} RELAY_FWD fp={} next={} gateway={} connected={} stream={}",
+                        local_short, fp,
+                        &next_str[next_str.len().saturating_sub(6)..],
+                        has_tunnel, connected, has_stream,
                     );
                 } else {
-                    info!(
-                        "[SHARD-FLOW] node={} RELAY peeled onion → next_hop=INVALID_PEER is_gateway={}",
-                        &local_id[local_id.len().saturating_sub(6)..],
-                        has_tunnel,
-                    );
+                    warn!("[TRACE] node={} RELAY_FWD fp={} next=INVALID gateway={}", local_short, fp, has_tunnel);
                 }
                 {
                     let mut state = self.state.write();
@@ -2420,13 +2560,26 @@ impl TunnelCraftNode {
                 // Store the receipt for settlement
                 self.store_forward_receipt(receipt.clone());
 
-                // Resolve next_peer bytes to PeerId and queue for forwarding.
-                // All relay forwards are deferred to avoid blocking poll_once()
-                // while waiting for stream opens (which need swarm polling).
-                // Deferred forwards are drained at the end of drain_stream_shards()
-                // after a swarm poll cycle, so open_stream can succeed.
+                // Data plane: push to outbound channel for background writer task.
+                // Never blocks poll_once — writer task handles TCP at its own pace.
                 if let Ok(next_peer) = PeerId::from_bytes(&next_peer_bytes) {
-                    self.deferred_forwards.push_back((modified_shard, next_peer, 0));
+                    // Safety net: if the relay peeled to find next_peer == ourselves,
+                    // process as exit locally instead of forwarding (no stream to self).
+                    // This can happen if the exit was selected as relay for its own circuit.
+                    if Some(next_peer) == self.local_peer_id {
+                        warn!(
+                            "[TRACE] node={} RELAY_SELF_DELIVERY fp={} header={}B — processing as exit locally",
+                            local_short, fp, modified_shard.header.len(),
+                        );
+                        return self.process_as_exit(modified_shard, next_peer).await;
+                    }
+                    // Ensure stream exists (triggers background open if needed)
+                    if let Some(ref mut sm) = self.stream_manager {
+                        sm.ensure_opening(next_peer);
+                    }
+                    if let Some(ref tx) = self.outbound_tx {
+                        let _ = tx.try_send(OutboundShard { peer: next_peer, shard: modified_shard });
+                    }
                 } else {
                     warn!("Could not parse next_peer PeerId from onion layer");
                 }
@@ -2830,20 +2983,21 @@ impl TunnelCraftNode {
             },
         );
 
-        // Queue shards for deferred sending (same as relay/exit forwards).
-        // Stream opens happen asynchronously in background tasks —
-        // shards will be sent from drain_stream_shards() on subsequent
-        // poll_once() cycles as streams become ready.
+        // Push shards to outbound channel (data plane).
         if first_hops.is_empty() {
             if let Some(exit_pid) = exit_peer_id {
-                for shard in shards {
-                    self.deferred_forwards.push_back((shard, exit_pid, 0));
+                if let Some(ref tx) = self.outbound_tx {
+                    for shard in shards {
+                        let _ = tx.try_send(OutboundShard { peer: exit_pid, shard });
+                    }
                 }
             }
         } else {
-            for (i, shard) in shards.into_iter().enumerate() {
-                let target = first_hops[i % first_hops.len()];
-                self.deferred_forwards.push_back((shard, target, 0));
+            if let Some(ref tx) = self.outbound_tx {
+                for (i, shard) in shards.into_iter().enumerate() {
+                    let target = first_hops[i % first_hops.len()];
+                    let _ = tx.try_send(OutboundShard { peer: target, shard });
+                }
             }
         }
         // Pre-warm stream opens for target peers
@@ -2998,14 +3152,6 @@ impl TunnelCraftNode {
             return;
         };
 
-        // Flush any shard data buffered by callers (e.g., client request sends)
-        // BEFORE entering the swarm event select!, which can block for seconds
-        // processing gossipsub traffic. Without this, shards sit in BufWriter
-        // until after the swarm drain completes.
-        if let Some(ref mut sm) = self.stream_manager {
-            sm.flush_all().await;
-        }
-
         // Drain all immediately available swarm events (don't wait after the first)
         // This prevents DHT events from starving shard delivery.
         tokio::select! {
@@ -3062,10 +3208,22 @@ impl TunnelCraftNode {
             }
         }
 
-        // Collect completed background stream opens before processing shards
+        // Collect completed background stream opens before processing shards,
+        // and clean up streams whose reader task has terminated (half-dead streams).
         if let Some(ref mut sm) = self.stream_manager {
-            sm.poll_open_streams();
+            let newly_opened = sm.poll_open_streams();
+            sm.cleanup_dead_streams();
+            // When new streams are established, re-publish topology so the network
+            // knows we can route through these peers. Debounce to avoid flooding.
+            if newly_opened > 0 {
+                if self.last_topology_publish.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) {
+                    self.publish_topology();
+                }
+            }
         }
+
+        // Collect completed exit task results (restore handler, push response shards to outbound channel).
+        self.drain_exit_task_results();
 
         // Priority-ordered stream shard processing:
         // 1. Drain high-priority (subscribed peers) first
@@ -3122,56 +3280,9 @@ impl TunnelCraftNode {
             }
         }
 
-        // Drain deferred forwards (relay forwards queued by relay_shard / process_as_exit).
-        // Group by target peer so we can batch writes per peer and flush once per peer.
-        // send_shard returns WouldBlock if stream isn't ready (background open in flight).
-        // Re-queue those shards; they'll be retried on the next poll_once cycle after
-        // the background open completes and poll_open_streams() registers the stream.
-        // Max 3 retries per shard — after that, the connection is likely permanently dead.
-        const MAX_FORWARD_RETRIES: u8 = 3;
-        let deferred: Vec<_> = self.deferred_forwards.drain(..).collect();
-        // Group by next_hop for efficient batched writes + per-peer flush
-        let mut by_hop: HashMap<PeerId, Vec<(Shard, u8)>> = HashMap::new();
-        for (shard, next_hop, retries) in deferred {
-            by_hop.entry(next_hop).or_default().push((shard, retries));
-        }
-        for (next_hop, shards) in by_hop {
-            for (shard, retries) in shards {
-                if let Some(ref mut sm) = self.stream_manager {
-                    match sm.send_shard(next_hop, &shard, false).await {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // Stream opening — retry with same count (not a failure)
-                            self.deferred_forwards.push_back((shard, next_hop, retries));
-                        }
-                        Err(e) => {
-                            let new_retries = retries + 1;
-                            if e.kind() == std::io::ErrorKind::InvalidData || new_retries > MAX_FORWARD_RETRIES {
-                                warn!(
-                                    "Dropping shard to {} after {} retries: {}",
-                                    next_hop, new_retries, e,
-                                );
-                            } else {
-                                warn!("Failed to send deferred shard to {} (retry {}/{}): {}", next_hop, new_retries, MAX_FORWARD_RETRIES, e);
-                                self.deferred_forwards.push_back((shard, next_hop, new_retries));
-                            }
-                        }
-                    }
-                }
-            }
-            // Flush this peer's BufWriter after all its shards are written.
-            // This pushes data to TCP immediately per-peer, avoiding cross-peer
-            // stalls while still batching multiple shards to the same peer.
-            if let Some(ref mut sm) = self.stream_manager {
-                let _ = sm.flush_peer(&next_hop).await;
-            }
-        }
-
-        // Flush all remaining peer writers (acks/nacks from inbound shard processing
-        // and any other buffered data not covered by the per-peer flush above).
-        if let Some(ref mut sm) = self.stream_manager {
-            sm.flush_all().await;
-        }
+        // No deferred drain needed — all outbound shards go through the data plane
+        // channel (outbound_tx → writer task). Acks/nacks written above go
+        // directly to TCP via the writer mutex.
     }
 
     /// Drain receipts arriving from stream ack frames.
@@ -3292,20 +3403,11 @@ impl TunnelCraftNode {
             }
         }
 
-        // Same for exit nodes
-        for status in self.exit_nodes.values().filter(|s| s.online) {
-            let Some(pid) = status.peer_id else { continue };
-            let peer_bytes = pid.to_bytes();
-            if self.topology.get_relay(&peer_bytes).is_none() {
-                self.topology.update_relay(TopologyRelay {
-                    peer_id: peer_bytes,
-                    signing_pubkey: status.info.pubkey,
-                    encryption_pubkey: status.info.encryption_pubkey.unwrap_or([0u8; 32]),
-                    connected_peers: HashSet::new(), // Will be filled by topology gossip
-                    last_seen: std::time::Instant::now(),
-                });
-            }
-        }
+        // Exit nodes are NOT added to the topology graph. They are tracked
+        // separately in self.exit_nodes and used directly as OnionPath.exit.
+        // Adding exits to the relay topology would allow them to be selected
+        // as intermediate relay hops, causing shards to arrive at the exit
+        // with non-empty headers (relayed instead of exit-processed).
 
         // Prune stale entries not seen in 5 minutes
         self.topology.prune_stale(Duration::from_secs(300));
@@ -3320,9 +3422,27 @@ impl TunnelCraftNode {
         }
         let Some(local_pid) = self.local_peer_id else { return };
 
-        let connected_peers: Vec<String> = self.swarm.as_ref()
-            .map(|s| s.connected_peers().map(|p| p.to_string()).collect())
-            .unwrap_or_default();
+        // Only advertise peers we have active streams to (not just connections).
+        // This ensures path selection only routes through nodes with working
+        // shard transport. During bootstrap, streams are opened gradually
+        // (queued with concurrency limit), so topology grows as streams establish.
+        let connected_peers: Vec<String> = if let Some(ref sm) = self.stream_manager {
+            let stream_peers: HashSet<PeerId> = sm.stream_peers().into_iter().collect();
+            // Also include peers with pending opens (they'll have streams soon)
+            self.swarm.as_ref()
+                .map(|s| s.connected_peers()
+                    .filter(|p| stream_peers.contains(p))
+                    .map(|p| p.to_string())
+                    .collect())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        // Don't gossip empty topology — wait until we have at least one stream
+        if connected_peers.is_empty() {
+            return;
+        }
 
         let mut msg = TopologyMessage::new(
             self.keypair.public_key_bytes(),
@@ -3454,22 +3574,28 @@ impl TunnelCraftNode {
     /// Returns `(PeerId, PathHop)` with full info needed for onion layer.
     fn select_gateway_relay(&self, our_bytes: &[u8]) -> Option<(PeerId, PathHop)> {
         let swarm = self.swarm.as_ref()?;
+        let sm = self.stream_manager.as_ref();
 
         info!("Selecting gateway relay from {} known relay nodes", self.relay_nodes.len());
 
         for relay_status in self.relay_nodes.values() {
             let connected = swarm.is_connected(&relay_status.peer_id);
+            let has_stream = sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false);
             let has_enc_key = relay_status.info.encryption_pubkey.is_some()
                 && relay_status.info.encryption_pubkey != Some([0u8; 32]);
             info!(
-                "  relay {} connected={} has_encryption_key={}",
-                relay_status.peer_id, connected, has_enc_key
+                "  relay {} connected={} stream={} has_encryption_key={}",
+                relay_status.peer_id, connected, has_stream, has_enc_key
             );
         }
 
         // Best: DHT relay that also appears in topology with our bytes in connected_peers
+        // AND has an established shard-stream
         for relay_status in self.relay_nodes.values() {
             if !swarm.is_connected(&relay_status.peer_id) {
+                continue;
+            }
+            if !sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false) {
                 continue;
             }
             // Check if topology confirms this relay sees us
@@ -3478,7 +3604,7 @@ impl TunnelCraftNode {
                 .find(|r| r.signing_pubkey == relay_status.info.pubkey
                     && r.connected_peers.contains(our_bytes))
             {
-                info!("Selected gateway relay {} (topology-confirmed)", relay_status.peer_id);
+                info!("Selected gateway relay {} (topology-confirmed, stream=true)", relay_status.peer_id);
                 return Some((relay_status.peer_id, PathHop {
                     peer_id: relay_status.peer_id.to_bytes(),
                     signing_pubkey: topo_relay.signing_pubkey,
@@ -3487,9 +3613,12 @@ impl TunnelCraftNode {
             }
         }
 
-        // Fallback: any DHT relay connected via swarm (use topology enc key if available)
+        // Fallback: any DHT relay connected via swarm with stream (use topology enc key if available)
         for relay_status in self.relay_nodes.values() {
             if !swarm.is_connected(&relay_status.peer_id) {
+                continue;
+            }
+            if !sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false) {
                 continue;
             }
             // Try to get encryption key from topology
@@ -3504,7 +3633,7 @@ impl TunnelCraftNode {
                 continue; // Skip relays with no encryption key
             }
 
-            info!("Selected gateway relay {} (fallback, DHT-connected)", relay_status.peer_id);
+            info!("Selected gateway relay {} (fallback, stream=true)", relay_status.peer_id);
             return Some((relay_status.peer_id, PathHop {
                 peer_id: relay_status.peer_id.to_bytes(),
                 signing_pubkey: relay_status.info.pubkey,
@@ -3524,13 +3653,17 @@ impl TunnelCraftNode {
     /// any for response routing.
     fn select_all_gateway_relays(&self, our_bytes: &[u8]) -> Vec<(PeerId, PathHop)> {
         let Some(swarm) = self.swarm.as_ref() else { return vec![] };
+        let sm = self.stream_manager.as_ref();
 
         let mut results = Vec::new();
         let mut seen = HashSet::new();
 
-        // First pass: topology-confirmed relays (best quality)
+        // First pass: topology-confirmed relays with stream (best quality)
         for relay_status in self.relay_nodes.values() {
             if !swarm.is_connected(&relay_status.peer_id) {
+                continue;
+            }
+            if !sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false) {
                 continue;
             }
             if let Some(topo_relay) = self.topology.relays_with_encryption()
@@ -3548,9 +3681,12 @@ impl TunnelCraftNode {
             }
         }
 
-        // Second pass: DHT relays with encryption keys (fallback)
+        // Second pass: DHT relays with encryption keys + stream (fallback)
         for relay_status in self.relay_nodes.values() {
             if !swarm.is_connected(&relay_status.peer_id) || seen.contains(&relay_status.peer_id) {
+                continue;
+            }
+            if !sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false) {
                 continue;
             }
             let enc_key = self.topology.relays_with_encryption()
@@ -3712,8 +3848,19 @@ impl TunnelCraftNode {
                 let mut state = self.state.write();
                 state.stats.peers_connected += 1;
                 drop(state);
-                // Publish updated topology (new peer connected)
-                self.publish_topology();
+                // Queue a stream open to the new peer. ensure_opening adds to a
+                // pending queue; poll_open_streams drains it with a concurrency limit
+                // (MAX_CONCURRENT_OPENS) to avoid substream contention with Kademlia.
+                if let Some(ref mut sm) = self.stream_manager {
+                    sm.ensure_opening(peer_id);
+                }
+                // Debounced topology publish: during connection burst (bootstrap),
+                // dozens of ConnectionEstablished fire in quick succession. Publishing
+                // on each one floods gossipsub and chokes the event loop. Debounce
+                // to at most once per 2 seconds; periodic maintenance (60s) catches up.
+                if self.last_topology_publish.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) {
+                    self.publish_topology();
+                }
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                 debug!("Connection closed to peer: {} (remaining={})", peer_id, num_established);
@@ -3911,14 +4058,14 @@ impl TunnelCraftNode {
         use tunnelcraft_network::{EXIT_DHT_KEY_PREFIX, RELAY_DHT_KEY_PREFIX, PEER_DHT_KEY_PREFIX};
 
         match event {
-            // When Kademlia discovers a new peer in the routing table, dial it
-            // so it gets added to unverified_relay_peers for shard forwarding
+            // Kademlia discovered a new peer in the routing table.
+            // Do NOT auto-dial: relay/exit peers are discovered via targeted
+            // DHT queries (GET_PROVIDERS). Auto-dialing RoutingUpdated peers
+            // pulls in global network nodes that pollute topology and waste
+            // connections (causes gossipsub queue overflow in test networks).
             Event::RoutingUpdated { peer, is_new_peer, .. } => {
-                if is_new_peer && !self.unverified_relay_peers.contains(&peer) {
-                    debug!("DHT discovered new peer {}, dialing", peer);
-                    if let Some(ref mut swarm) = self.swarm {
-                        let _ = swarm.dial(peer);
-                    }
+                if is_new_peer {
+                    debug!("DHT routing updated: new peer {} (not auto-dialing)", peer);
                 }
             }
             Event::OutboundQueryProgressed { id, result, .. } => {
@@ -3963,14 +4110,15 @@ impl TunnelCraftNode {
                                             info!("Resolved peer record: {} → {}", pubkey_hex, peer_id);
                                             self.known_peers.insert(pubkey, peer_id);
 
-                                            // Flush any shards buffered for this destination
-                                            // Queue them as deferred forwards (processed async in poll_once)
+                                            // Flush any shards buffered for this destination via outbound channel
                                             if let Some(shards) = self.pending_destination.remove(&pubkey) {
                                                 let count = shards.len();
-                                                for shard in shards {
-                                                    self.deferred_forwards.push_back((shard, peer_id, 0));
+                                                if let Some(ref tx) = self.outbound_tx {
+                                                    for shard in shards {
+                                                        let _ = tx.try_send(OutboundShard { peer: peer_id, shard });
+                                                    }
                                                 }
-                                                info!("Queued {} buffered shards for peer {} (will flush in poll_once)", count, peer_id);
+                                                info!("Queued {} buffered shards for peer {} via outbound channel", count, peer_id);
                                             }
                                         }
                                     }
