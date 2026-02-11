@@ -2448,8 +2448,13 @@ impl TunnelCraftNode {
                         sm.ensure_opening(target);
                     }
                     if let Some(ref tx) = self.outbound_tx {
+                        let shard_bytes = shard.payload.len() as u64;
                         match tx.try_send(OutboundShard { peer: target, shard }) {
-                            Ok(()) => { queued += 1; }
+                            Ok(()) => {
+                                queued += 1;
+                                let mut state = self.state.write();
+                                state.stats.bytes_relayed += shard_bytes;
+                            }
                             Err(e) => {
                                 warn!("[TRACE] node={} EXIT_RESPONSE_DROP target={} err={}", local_short, &target.to_string()[target.to_string().len().saturating_sub(6)..], e);
                             }
