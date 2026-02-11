@@ -71,7 +71,7 @@ impl Prover for Risc0Prover {
             .map_err(|e| ProverError::ProofFailed(format!("failed to build executor env: {}", e)))?;
 
         let receipt = default_prover()
-            .prove(env, GUEST_ELF)
+            .prove(env, TUNNELCRAFT_PROVER_GUEST_ELF)
             .map_err(|e| ProverError::ProofFailed(format!("risc0 prove failed: {}", e)))?
             .receipt;
 
@@ -100,7 +100,7 @@ impl Prover for Risc0Prover {
         let receipt: risc0_zkvm::Receipt = bincode::deserialize(proof)
             .map_err(|e| ProverError::VerificationFailed(format!("failed to deserialize receipt: {}", e)))?;
 
-        if let Err(e) = receipt.verify(GUEST_ID) {
+        if let Err(e) = receipt.verify(TUNNELCRAFT_PROVER_GUEST_ID) {
             warn!("risc0 verification failed: {}", e);
             return Ok(false);
         }

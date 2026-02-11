@@ -3379,9 +3379,9 @@ impl TunnelCraftNode {
 
     /// Get a peer's subscription tier (0=free, 1+=subscribed).
     fn get_peer_tier(&self, _peer: &PeerId) -> u8 {
-        // TODO: look up peer's signing pubkey and check subscription_cache
-        // For now, default to 0 (free tier) — subscription priority will work
-        // once we add peer-to-pubkey mapping
+        // Both inbound channels are fully drained each poll_once() cycle,
+        // so priority only matters under backpressure (channel full).
+        // Until load-based throttling is added, tier lookup has no effect.
         0
     }
 

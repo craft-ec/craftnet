@@ -217,7 +217,7 @@ fn test_proof_message_chain_integrity() {
     assert_eq!(usage[0].1, 350);
 }
 
-/// Chain break (wrong prev_root) is rejected
+/// Chain break (wrong prev_root) is buffered, not applied
 #[test]
 fn test_proof_chain_break_detected() {
     let mut agg = Aggregator::new(Box::new(StubProver::new()));
@@ -228,11 +228,14 @@ fn test_proof_chain_break_detected() {
     let msg1 = signed_proof(&kp, pool, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32], 1000);
     agg.handle_proof(msg1).unwrap();
 
-    // Wrong prev_root — chain break
+    // Wrong prev_root — chain break, buffered for out-of-order replay
     let msg_bad = signed_proof(&kp, pool, PoolType::Subscribed, 50, 150, [0xFF; 32], [0xBB; 32], 2000);
+    agg.handle_proof(msg_bad).unwrap();
 
-    let result = agg.handle_proof(msg_bad);
-    assert!(result.is_err(), "Chain break should be rejected");
+    // Pool state should still reflect only batch 1 (chain break was buffered, not applied)
+    let usage = agg.get_pool_usage(&(pool, PoolType::Subscribed, 0));
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1, 100, "Cumulative should still be 100 from batch 1");
 }
 
 /// Non-increasing cumulative count is rejected
