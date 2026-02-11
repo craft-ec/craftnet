@@ -3393,6 +3393,13 @@ impl TunnelCraftNode {
         self.refresh_and_evict_tunnels();
     }
 
+    /// Run async maintenance tasks (subscription verification, distribution posting).
+    /// Call this periodically alongside `run_maintenance()` when not using `run()`.
+    pub async fn run_async_maintenance(&mut self) {
+        self.maybe_verify_subscriptions().await;
+        self.maybe_post_distributions().await;
+    }
+
     /// Refresh tunnel registrations for all connected peers and evict expired ones.
     /// Tunnels have a 5-minute TTL from ConnectionEstablished. Since connections
     /// are persistent, we must renew them periodically to prevent expiration.

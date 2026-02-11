@@ -27,7 +27,10 @@ use libp2p::{Multiaddr, PeerId};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::{Keypair as SolanaKeypair, Signer as _};
+use solana_sdk::system_instruction;
+use solana_sdk::transaction::Transaction;
 use tunnelcraft_client::{NodeConfig, NodeMode, NodeType, TunnelCraftNode, NodeStats};
 use tunnelcraft_core::HopMode;
 use tunnelcraft_aggregator::NetworkStats;
@@ -81,6 +84,8 @@ struct TestNode {
     cmd_tx: mpsc::Sender<TestCmd>,
     handle: JoinHandle<()>,
     peer_id: PeerId,
+    /// Node's signing/settlement pubkey (ed25519, 32 bytes)
+    pubkey: [u8; 32],
     role: &'static str,
     port: u16,
 }
@@ -136,7 +141,8 @@ async fn spawn_test_node(
         node.set_proof_batch_size(5);
         node.set_proof_deadline(Duration::from_secs(30));
         let peer_id = node.peer_id().unwrap();
-        let _ = init_tx.send(peer_id);
+        let pubkey = node.pubkey();
+        let _ = init_tx.send((peer_id, pubkey));
 
         let mut maintenance = tokio::time::interval(Duration::from_secs(15));
 
@@ -145,6 +151,7 @@ async fn spawn_test_node(
                 _ = node.poll_once() => {}
                 _ = maintenance.tick() => {
                     node.run_maintenance();
+                    node.run_async_maintenance().await;
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
@@ -215,8 +222,8 @@ async fn spawn_test_node(
         }
     });
 
-    let peer_id = init_rx.await.unwrap();
-    TestNode { cmd_tx, handle, peer_id, role, port }
+    let (peer_id, pubkey) = init_rx.await.unwrap();
+    TestNode { cmd_tx, handle, peer_id, pubkey, role, port }
 }
 
 // =========================================================================
@@ -599,10 +606,22 @@ async fn ten_node_live_network() {
         nodes.push(node);
     }
 
+    // Load devnet keypair from default Solana CLI path, env override, or skip
+    let devnet_keypair = {
+        let raw = std::env::var("DEVNET_KEYPAIR")
+            .unwrap_or_else(|_| "~/.config/solana/id.json".to_string());
+        let expanded = if raw.starts_with('~') {
+            format!("{}{}", std::env::var("HOME").unwrap_or_default(), &raw[1..])
+        } else {
+            raw
+        };
+        load_keypair(&expanded)
+    };
+
     // Aggregator (node 9)
     {
         let port = base_port + 9;
-        let config = NodeConfig {
+        let mut config = NodeConfig {
             mode: NodeMode::Node,
             node_type: NodeType::Relay,
             listen_addr: format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap(),
@@ -611,6 +630,14 @@ async fn ten_node_live_network() {
             enable_aggregator: true,
             ..Default::default()
         };
+
+        // Wire Helius API key for on-chain settlement (distribution posting)
+        if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
+            if !api_key.is_empty() {
+                config.settlement_config.helius_api_key = Some(api_key);
+            }
+        }
+
         let node = spawn_test_node(config, "Aggregator", port).await;
         println!("  Aggregator started: peer_id={}, port={}", node.peer_id, port);
         nodes.push(node);
@@ -634,12 +661,6 @@ async fn ten_node_live_network() {
 
     // Track which indices are clients and their tiers
     let client_start_idx = nodes.len(); // 10
-
-    // Load devnet keypair if available — Client-2 will use it as signing identity
-    let devnet_keypair = std::env::var("DEVNET_KEYPAIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .and_then(|raw| load_keypair(&raw));
 
     if devnet_keypair.is_some() {
         println!("DEVNET_KEYPAIR loaded — Client-2 will use devnet signing identity");
@@ -766,6 +787,38 @@ async fn ten_node_live_network() {
             }
         }
         println!("=== End Devnet Settlement ===\n");
+
+        // Fund aggregator wallet with SOL for distribution posting tx fees
+        let aggregator_pubkey = nodes[9].pubkey;
+        let aggregator_sol_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(aggregator_pubkey);
+        println!("=== Funding Aggregator for Distribution Posting ===");
+        println!("  Aggregator wallet: {}", aggregator_sol_pubkey);
+
+        let kp_bytes2 = kp.to_bytes();
+        let funder_kp = SolanaKeypair::from_bytes(&kp_bytes2).unwrap();
+        let rpc = RpcClient::new("https://api.devnet.solana.com".to_string());
+        let transfer_amount = 10_000_000; // 0.01 SOL for tx fees
+        let transfer_ix = system_instruction::transfer(
+            &funder_kp.pubkey(),
+            &aggregator_sol_pubkey,
+            transfer_amount,
+        );
+        match rpc.get_latest_blockhash().await {
+            Ok(blockhash) => {
+                let tx = Transaction::new_signed_with_payer(
+                    &[transfer_ix],
+                    Some(&funder_kp.pubkey()),
+                    &[&funder_kp],
+                    blockhash,
+                );
+                match rpc.send_and_confirm_transaction(&tx).await {
+                    Ok(sig) => println!("  Transferred 0.01 SOL to aggregator: {}", sig),
+                    Err(e) => println!("  SOL transfer failed (non-fatal): {}", e),
+                }
+            }
+            Err(e) => println!("  Failed to get blockhash (non-fatal): {}", e),
+        }
+        println!("=== End Funding ===\n");
     }
 
     // ── Step 6: Announce subscriptions ────────────────────────────────
