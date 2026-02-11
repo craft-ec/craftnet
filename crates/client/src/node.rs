@@ -2097,7 +2097,7 @@ impl TunnelCraftNode {
             &lease_set,
             0, // epoch
             self.encryption_keypair.public_key_bytes(), // response encryption key
-            [0u8; 32], // pool_pubkey (free tier default)
+            self.keypair.public_key_bytes(), // pool_pubkey — always user pubkey (tracks subscription or free usage)
         )?;
 
         // Calculate request size for throughput measurement
@@ -2574,8 +2574,15 @@ impl TunnelCraftNode {
                     state.stats.bytes_relayed += modified_shard.payload.len() as u64;
                 }
 
-                // Route receipt to the correct pool using pool_pubkey from onion layer
-                let pool_type = if pool_pubkey == [0u8; 32] { PoolType::Free } else { PoolType::Subscribed };
+                // Route receipt to the correct pool using pool_pubkey from onion layer.
+                // Check subscription_cache to determine if this user has an active subscription.
+                let pool_type = if self.subscription_cache.get(&pool_pubkey)
+                    .map_or(false, |e| e.tier != 255)
+                {
+                    PoolType::Subscribed
+                } else {
+                    PoolType::Free
+                };
                 self.request_user.insert(receipt.shard_id, (pool_pubkey, pool_type, epoch));
 
                 // Store the receipt for settlement
@@ -2979,7 +2986,7 @@ impl TunnelCraftNode {
             &paths,
             &lease_set,
             0, // epoch
-            [0u8; 32], // pool_pubkey (free tier default)
+            self.keypair.public_key_bytes(), // pool_pubkey — always user pubkey (tracks subscription or free usage)
         );
 
         let (request_id, shards) = match result {

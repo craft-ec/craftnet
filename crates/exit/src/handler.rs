@@ -648,7 +648,7 @@ impl ExitHandler {
                         shard_id,
                         payload_size: payload.len() as u32,
                         epoch: 0,
-                        pool_pubkey: [0u8; 32],
+                        pool_pubkey: exit_payload.user_pubkey,
                     }];
 
                     // Single-hop onion to this shard's gateway with tunnel_id
