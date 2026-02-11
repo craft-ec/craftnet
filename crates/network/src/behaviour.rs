@@ -8,7 +8,6 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
 };
 use std::time::Duration;
-use crate::topology::TOPOLOGY_TOPIC;
 
 /// Kademlia protocol name
 pub const KADEMLIA_PROTOCOL: StreamProtocol = StreamProtocol::new("/tunnelcraft/kad/1.0.0");
@@ -476,28 +475,6 @@ impl TunnelCraftBehaviour {
     pub fn get_relay_providers(&mut self) -> kad::QueryId {
         let key = kad::RecordKey::new(&RELAY_REGISTRY_KEY);
         self.kademlia.get_providers(key)
-    }
-
-    // =========================================================================
-    // Topology gossip methods
-    // =========================================================================
-
-    /// Subscribe to the topology topic
-    pub fn subscribe_topology(&mut self) -> Result<bool, gossipsub::SubscriptionError> {
-        let topic = gossipsub::IdentTopic::new(TOPOLOGY_TOPIC);
-        self.gossipsub.subscribe(&topic)
-    }
-
-    /// Unsubscribe from the topology topic
-    pub fn unsubscribe_topology(&mut self) -> bool {
-        let topic = gossipsub::IdentTopic::new(TOPOLOGY_TOPIC);
-        self.gossipsub.unsubscribe(&topic)
-    }
-
-    /// Publish a topology message
-    pub fn publish_topology(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, gossipsub::PublishError> {
-        let topic = gossipsub::IdentTopic::new(TOPOLOGY_TOPIC);
-        self.gossipsub.publish(topic, data)
     }
 
     // =========================================================================

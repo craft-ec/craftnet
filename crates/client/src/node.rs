@@ -33,7 +33,7 @@ use tunnelcraft_network::{
     RelayStatusMessage, RelayStatusType,
     ProofMessage, PoolType,
     SubscriptionAnnouncement, SUBSCRIPTION_TOPIC,
-    TopologyMessage, TOPOLOGY_TOPIC,
+
     EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
     RELAY_HEARTBEAT_INTERVAL, RELAY_OFFLINE_THRESHOLD,
     EXIT_STATUS_TOPIC, RELAY_STATUS_TOPIC, PROOF_TOPIC,
@@ -882,8 +882,6 @@ pub struct TunnelCraftNode {
 
     /// Topology graph for onion path selection (populated from relay/exit discovery)
     topology: crate::path::TopologyGraph,
-    /// Last time we published our topology message (throttle to every 60s)
-    last_topology_publish: Option<std::time::Instant>,
 }
 
 impl TunnelCraftNode {
@@ -1123,7 +1121,6 @@ impl TunnelCraftNode {
             pending_tunnel: HashMap::new(),
             tunnel_burst_rx: None,
             topology: crate::path::TopologyGraph::new(),
-            last_topology_publish: None,
         })
     }
 
@@ -1309,14 +1306,8 @@ impl TunnelCraftNode {
             }
         }
 
-        // Subscribe to topology gossipsub topic (relay connectivity advertisements)
-        if let Some(ref mut swarm) = self.swarm {
-            if let Err(e) = swarm.behaviour_mut().subscribe_topology() {
-                warn!("Failed to subscribe to topology topic: {:?}", e);
-            } else {
-                debug!("Subscribed to topology topic");
-            }
-        }
+        // Topology data is now carried in relay/exit heartbeats (connected_peers field),
+        // so no separate topology topic subscription is needed.
 
         // Subscribe to aggregator sync topic (history sync for new aggregators)
         if self.aggregator.is_some() {
@@ -1525,9 +1516,10 @@ impl TunnelCraftNode {
             _ => Some(self.config.exit_region.code().to_string()),
         };
 
+        let connected_peers = self.connected_stream_peers();
         if let Some(ref mut swarm) = self.swarm {
             let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
-            let msg = ExitStatusMessage::heartbeat(
+            let mut msg = ExitStatusMessage::heartbeat(
                 self.keypair.public_key_bytes(),
                 &peer_id_str,
                 load_percent,
@@ -1536,14 +1528,16 @@ impl TunnelCraftNode {
                 self.exit_downlink_kbps,
                 uptime_secs,
                 region,
+                connected_peers,
             );
+            msg.encryption_pubkey = Some(hex::encode(self.encryption_keypair.public_key_bytes()));
             if let Err(e) = swarm.behaviour_mut().publish_exit_status(msg.to_bytes()) {
                 // Don't warn on InsufficientPeers - normal during startup
                 debug!("Failed to publish heartbeat: {:?}", e);
             } else {
                 debug!(
-                    "Published heartbeat (load: {}%, uplink: {}KB/s, downlink: {}KB/s, uptime: {}s)",
-                    load_percent, self.exit_uplink_kbps, self.exit_downlink_kbps, uptime_secs
+                    "Published heartbeat (load: {}%, uplink: {}KB/s, downlink: {}KB/s, uptime: {}s, peers: {})",
+                    load_percent, self.exit_uplink_kbps, self.exit_downlink_kbps, uptime_secs, msg.connected_peers.len()
                 );
             }
         }
@@ -1583,67 +1577,6 @@ impl TunnelCraftNode {
         if should_send {
             self.publish_heartbeat();
         }
-    }
-
-    /// Handle incoming topology message from gossipsub.
-    /// Verifies signature, then updates the topology graph with the relay's connected peers.
-    fn handle_topology_message(&mut self, data: &[u8], _source: Option<PeerId>) {
-        use crate::path::TopologyRelay;
-
-        let Some(msg) = TopologyMessage::from_bytes(data) else {
-            debug!("Failed to parse topology message");
-            return;
-        };
-        let Some(pubkey) = msg.pubkey_bytes() else {
-            debug!("Invalid pubkey in topology message from {}", msg.peer_id);
-            return;
-        };
-        let Some(enc_pubkey) = msg.encryption_pubkey_bytes() else {
-            debug!("Invalid encryption pubkey in topology message from {}", msg.peer_id);
-            return;
-        };
-
-        // Verify signature if present
-        if msg.signature.len() == 64 {
-            let signable = msg.signable_data();
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(&msg.signature);
-            if !tunnelcraft_crypto::verify_signature(&pubkey, &signable, &sig) {
-                debug!("Invalid topology signature from {}", msg.peer_id);
-                return;
-            }
-        } else if !msg.signature.is_empty() {
-            debug!("Topology message from {} has invalid signature length {}", msg.peer_id, msg.signature.len());
-            return;
-        }
-
-        // Parse connected peers from PeerId strings to bytes
-        let connected_peers: HashSet<Vec<u8>> = msg.connected_peers.iter()
-            .filter_map(|s| s.parse::<PeerId>().ok().map(|p| p.to_bytes()))
-            .collect();
-
-        let peer_id_bytes = msg.peer_id.parse::<PeerId>()
-            .map(|p| p.to_bytes())
-            .unwrap_or_default();
-
-        if peer_id_bytes.is_empty() {
-            debug!("Invalid peer_id in topology message: {}", msg.peer_id);
-            return;
-        }
-
-        debug!(
-            "Topology update from {}: {} connected peers",
-            msg.peer_id,
-            connected_peers.len(),
-        );
-
-        self.topology.update_relay(TopologyRelay {
-            peer_id: peer_id_bytes,
-            signing_pubkey: pubkey,
-            encryption_pubkey: enc_pubkey,
-            connected_peers,
-            last_seen: std::time::Instant::now(),
-        });
     }
 
     /// Handle incoming exit status message from gossipsub
@@ -1688,6 +1621,34 @@ impl TunnelCraftNode {
                         "Received heartbeat from unknown exit: {} (from {:?})",
                         msg.peer_id, source
                     );
+                }
+
+                // Update topology from heartbeat's connected_peers
+                if !msg.connected_peers.is_empty() {
+                    if let Some(enc_hex) = &msg.encryption_pubkey {
+                        if let Ok(enc_bytes) = hex::decode(enc_hex) {
+                            if enc_bytes.len() == 32 {
+                                use crate::path::TopologyRelay;
+                                let mut enc_key = [0u8; 32];
+                                enc_key.copy_from_slice(&enc_bytes);
+                                let connected: HashSet<Vec<u8>> = msg.connected_peers.iter()
+                                    .filter_map(|s| s.parse::<PeerId>().ok().map(|p| p.to_bytes()))
+                                    .collect();
+                                let peer_id_bytes = msg.peer_id.parse::<PeerId>()
+                                    .map(|p| p.to_bytes())
+                                    .unwrap_or_default();
+                                if !peer_id_bytes.is_empty() {
+                                    self.topology.update_relay(TopologyRelay {
+                                        peer_id: peer_id_bytes,
+                                        signing_pubkey: pubkey,
+                                        encryption_pubkey: enc_key,
+                                        connected_peers: connected,
+                                        last_seen: std::time::Instant::now(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
             ExitStatusType::Offline => {
@@ -3306,13 +3267,9 @@ impl TunnelCraftNode {
         if let Some(ref mut sm) = self.stream_manager {
             let newly_opened = sm.poll_open_streams();
             sm.cleanup_dead_streams();
-            // When new streams are established, re-publish topology so the network
-            // knows we can route through these peers. Debounce to avoid flooding.
-            if newly_opened > 0 {
-                if self.last_topology_publish.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) {
-                    self.publish_topology();
-                }
-            }
+            // Topology is now carried in heartbeats (30s interval), so new
+            // stream connections will be picked up at the next heartbeat cycle.
+            let _ = newly_opened;
         }
 
         // Collect completed exit task results (restore handler, push response shards to outbound channel).
@@ -3445,7 +3402,6 @@ impl TunnelCraftNode {
         self.cleanup_stale_relays();
         self.maybe_reconnect_bootstrap();
         self.update_topology();
-        self.maybe_publish_topology();
         self.refresh_and_evict_tunnels();
     }
 
@@ -3519,22 +3475,12 @@ impl TunnelCraftNode {
         self.topology.prune_stale(Duration::from_secs(300));
     }
 
-    /// Publish our topology message via gossipsub.
-    /// Only relay/exit/full nodes in Node/Both mode publish topology.
-    fn publish_topology(&mut self) {
-        if !matches!(self.config.node_type, NodeType::Relay | NodeType::Full | NodeType::Exit) ||
-           !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            return;
-        }
-        let Some(local_pid) = self.local_peer_id else { return };
-
-        // Only advertise peers we have active streams to (not just connections).
-        // This ensures path selection only routes through nodes with working
-        // shard transport. During bootstrap, streams are opened gradually
-        // (queued with concurrency limit), so topology grows as streams establish.
-        let connected_peers: Vec<String> = if let Some(ref sm) = self.stream_manager {
+    /// Collect peer IDs that have active streams (intersection of swarm
+    /// connected peers and stream-manager peers). Used to populate the
+    /// `connected_peers` field in heartbeat messages.
+    fn connected_stream_peers(&self) -> Vec<String> {
+        if let Some(ref sm) = self.stream_manager {
             let stream_peers: HashSet<PeerId> = sm.stream_peers().into_iter().collect();
-            // Also include peers with pending opens (they'll have streams soon)
             self.swarm.as_ref()
                 .map(|s| s.connected_peers()
                     .filter(|p| stream_peers.contains(p))
@@ -3543,42 +3489,7 @@ impl TunnelCraftNode {
                 .unwrap_or_default()
         } else {
             vec![]
-        };
-
-        // Don't gossip empty topology — wait until we have at least one stream
-        if connected_peers.is_empty() {
-            return;
         }
-
-        let mut msg = TopologyMessage::new(
-            self.keypair.public_key_bytes(),
-            &local_pid.to_string(),
-            self.encryption_keypair.public_key_bytes(),
-            connected_peers,
-        );
-
-        // Sign the message
-        let signable = msg.signable_data();
-        let sig = tunnelcraft_crypto::sign_data(&self.keypair, &signable);
-        msg.signature = sig.to_vec();
-
-        if let Some(ref mut swarm) = self.swarm {
-            match swarm.behaviour_mut().publish_topology(msg.to_bytes()) {
-                Ok(_) => debug!("Published topology with {} connected peers", msg.connected_peers.len()),
-                Err(e) => debug!("Failed to publish topology: {:?}", e),
-            }
-        }
-        self.last_topology_publish = Some(Instant::now());
-    }
-
-    /// Publish topology periodically (every 60s) in maintenance cycle
-    fn maybe_publish_topology(&mut self) {
-        if let Some(last) = self.last_topology_publish {
-            if last.elapsed() < Duration::from_secs(60) {
-                return;
-            }
-        }
-        self.publish_topology();
     }
 
     /// Build topology-based onion paths and LeaseSet for a request.
@@ -3964,13 +3875,8 @@ impl TunnelCraftNode {
                     sm.clear_open_cooldown(&peer_id);
                     sm.ensure_opening(peer_id);
                 }
-                // Debounced topology publish: during connection burst (bootstrap),
-                // dozens of ConnectionEstablished fire in quick succession. Publishing
-                // on each one floods gossipsub and chokes the event loop. Debounce
-                // to at most once per 2 seconds; periodic maintenance (60s) catches up.
-                if self.last_topology_publish.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) {
-                    self.publish_topology();
-                }
+                // Topology is now carried in heartbeats (30s interval), so new
+                // connections will be picked up at the next heartbeat cycle.
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                 debug!("Connection closed to peer: {} (remaining={})", peer_id, num_established);
@@ -3993,7 +3899,8 @@ impl TunnelCraftNode {
                     if let Some(ref mut sm) = self.stream_manager {
                         sm.on_peer_disconnected(&peer_id);
                     }
-                    self.publish_topology();
+                    // Topology is now carried in heartbeats — disconnection will be
+                    // reflected at the next 30s heartbeat cycle.
                 }
             }
             SwarmEvent::Behaviour(behaviour_event) => {
@@ -4049,7 +3956,6 @@ impl TunnelCraftNode {
                     let relay_hash = IdentTopic::new(RELAY_STATUS_TOPIC).hash();
                     let proof_hash = IdentTopic::new(PROOF_TOPIC).hash();
                     let sub_hash = IdentTopic::new(SUBSCRIPTION_TOPIC).hash();
-                    let topology_hash = IdentTopic::new(TOPOLOGY_TOPIC).hash();
                     let agg_sync_hash = IdentTopic::new(AGGREGATOR_SYNC_TOPIC).hash();
 
                     if message.topic == exit_hash {
@@ -4060,8 +3966,6 @@ impl TunnelCraftNode {
                         self.handle_proof_message(&message.data, Some(propagation_source));
                     } else if message.topic == sub_hash {
                         self.handle_subscription_announcement(&message.data);
-                    } else if message.topic == topology_hash {
-                        self.handle_topology_message(&message.data, Some(propagation_source));
                     } else if message.topic == agg_sync_hash {
                         self.handle_aggregator_sync(&message.data);
                     } else {
@@ -4508,10 +4412,11 @@ impl TunnelCraftNode {
         let load_percent = (self.active_requests.min(100) as u8).min(100);
         let uptime_secs = self.start_time.elapsed().as_secs();
         let queue_depth = self.proof_queue_depth() as u32;
+        let connected_peers = self.connected_stream_peers();
 
         if let Some(ref mut swarm) = self.swarm {
             let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
-            let msg = RelayStatusMessage::heartbeat(
+            let mut msg = RelayStatusMessage::heartbeat(
                 self.keypair.public_key_bytes(),
                 &peer_id_str,
                 load_percent,
@@ -4519,7 +4424,9 @@ impl TunnelCraftNode {
                 queue_depth,
                 self.exit_downlink_kbps, // reuse throughput measurement
                 uptime_secs,
+                connected_peers,
             );
+            msg.encryption_pubkey = Some(hex::encode(self.encryption_keypair.public_key_bytes()));
             if let Err(e) = swarm.behaviour_mut().publish_relay_status(msg.to_bytes()) {
                 debug!("Failed to publish relay heartbeat: {:?}", e);
             }
@@ -4576,6 +4483,34 @@ impl TunnelCraftNode {
                 } else {
                     // Unknown relay — trigger DHT lookup
                     debug!("Heartbeat from unknown relay: {} (from {:?})", msg.peer_id, source);
+                }
+
+                // Update topology from heartbeat's connected_peers
+                if !msg.connected_peers.is_empty() {
+                    if let Some(enc_hex) = &msg.encryption_pubkey {
+                        if let Ok(enc_bytes) = hex::decode(enc_hex) {
+                            if enc_bytes.len() == 32 {
+                                use crate::path::TopologyRelay;
+                                let mut enc_key = [0u8; 32];
+                                enc_key.copy_from_slice(&enc_bytes);
+                                let connected: HashSet<Vec<u8>> = msg.connected_peers.iter()
+                                    .filter_map(|s| s.parse::<PeerId>().ok().map(|p| p.to_bytes()))
+                                    .collect();
+                                let peer_id_bytes = msg.peer_id.parse::<PeerId>()
+                                    .map(|p| p.to_bytes())
+                                    .unwrap_or_default();
+                                if !peer_id_bytes.is_empty() {
+                                    self.topology.update_relay(TopologyRelay {
+                                        peer_id: peer_id_bytes,
+                                        signing_pubkey: pubkey,
+                                        encryption_pubkey: enc_key,
+                                        connected_peers: connected,
+                                        last_seen: std::time::Instant::now(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
             RelayStatusType::Offline => {

@@ -42,12 +42,17 @@ pub struct RelayStatusMessage {
     pub uptime_secs: u64,
     /// X25519 encryption pubkey (hex-encoded, for onion routing)
     pub encryption_pubkey: Option<String>,
+    /// Connected peers with active streams (peer ID strings).
+    /// Carries topology data so the separate topology topic is not needed.
+    #[serde(default)]
+    pub connected_peers: Vec<String>,
     /// Unix timestamp (seconds)
     pub timestamp: u64,
 }
 
 impl RelayStatusMessage {
     /// Create a heartbeat message
+    #[allow(clippy::too_many_arguments)]
     pub fn heartbeat(
         pubkey: [u8; 32],
         peer_id: &str,
@@ -56,6 +61,7 @@ impl RelayStatusMessage {
         queue_depth: u32,
         bandwidth_available_kbps: u32,
         uptime_secs: u64,
+        connected_peers: Vec<String>,
     ) -> Self {
         Self {
             status: RelayStatusType::Heartbeat,
@@ -67,6 +73,7 @@ impl RelayStatusMessage {
             bandwidth_available_kbps,
             uptime_secs,
             encryption_pubkey: None,
+            connected_peers,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -86,6 +93,7 @@ impl RelayStatusMessage {
             bandwidth_available_kbps: 0,
             uptime_secs: 0,
             encryption_pubkey: None,
+            connected_peers: vec![],
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -129,6 +137,7 @@ mod tests {
             100,
             50000,
             3600,
+            vec!["peer1".to_string()],
         );
 
         assert_eq!(msg.status, RelayStatusType::Heartbeat);
@@ -158,6 +167,7 @@ mod tests {
             25,
             25000,
             86400,
+            vec![],
         );
         let bytes = msg.to_bytes();
         let parsed = RelayStatusMessage::from_bytes(&bytes).unwrap();
@@ -173,14 +183,14 @@ mod tests {
 
     #[test]
     fn test_load_clamped_to_100() {
-        let msg = RelayStatusMessage::heartbeat([4u8; 32], "peer", 150, 0, 0, 0, 0);
+        let msg = RelayStatusMessage::heartbeat([4u8; 32], "peer", 150, 0, 0, 0, 0, vec![]);
         assert_eq!(msg.load_percent, 100);
     }
 
     #[test]
     fn test_pubkey_bytes() {
         let pubkey = [5u8; 32];
-        let msg = RelayStatusMessage::heartbeat(pubkey, "peer", 0, 0, 0, 0, 0);
+        let msg = RelayStatusMessage::heartbeat(pubkey, "peer", 0, 0, 0, 0, 0, vec![]);
         assert_eq!(msg.pubkey_bytes(), Some(pubkey));
     }
 }

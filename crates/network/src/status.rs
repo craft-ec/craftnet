@@ -45,6 +45,10 @@ pub struct ExitStatusMessage {
     pub region: Option<String>,
     /// X25519 encryption pubkey (hex-encoded, for onion routing)
     pub encryption_pubkey: Option<String>,
+    /// Connected peers with active streams (peer ID strings).
+    /// Carries topology data so the separate topology topic is not needed.
+    #[serde(default)]
+    pub connected_peers: Vec<String>,
     /// Unix timestamp (seconds)
     pub timestamp: u64,
 }
@@ -61,6 +65,7 @@ impl ExitStatusMessage {
         downlink_kbps: u32,
         uptime_secs: u64,
         region: Option<String>,
+        connected_peers: Vec<String>,
     ) -> Self {
         Self {
             status: ExitStatusType::Heartbeat,
@@ -73,6 +78,7 @@ impl ExitStatusMessage {
             uptime_secs,
             region,
             encryption_pubkey: None,
+            connected_peers,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -93,6 +99,7 @@ impl ExitStatusMessage {
             uptime_secs: 0,
             region: None,
             encryption_pubkey: None,
+            connected_peers: vec![],
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -137,6 +144,7 @@ mod tests {
             50000,  // 50 MB/s downlink
             3600,   // 1 hour uptime
             Some("us-west".to_string()),
+            vec!["peer1".to_string(), "peer2".to_string()],
         );
 
         assert_eq!(msg.status, ExitStatusType::Heartbeat);
@@ -146,6 +154,7 @@ mod tests {
         assert_eq!(msg.downlink_kbps, 50000);
         assert_eq!(msg.uptime_secs, 3600);
         assert_eq!(msg.region, Some("us-west".to_string()));
+        assert_eq!(msg.connected_peers, vec!["peer1", "peer2"]);
     }
 
     #[test]
@@ -170,6 +179,7 @@ mod tests {
             25000,
             86400,  // 1 day uptime
             Some("eu-central".to_string()),
+            vec!["peer_a".to_string()],
         );
         let bytes = msg.to_bytes();
         let parsed = ExitStatusMessage::from_bytes(&bytes).unwrap();
@@ -185,14 +195,14 @@ mod tests {
 
     #[test]
     fn test_load_clamped_to_100() {
-        let msg = ExitStatusMessage::heartbeat([4u8; 32], "peer", 150, 0, 0, 0, 0, None);
+        let msg = ExitStatusMessage::heartbeat([4u8; 32], "peer", 150, 0, 0, 0, 0, None, vec![]);
         assert_eq!(msg.load_percent, 100);
     }
 
     #[test]
     fn test_pubkey_bytes() {
         let pubkey = [5u8; 32];
-        let msg = ExitStatusMessage::heartbeat(pubkey, "peer", 0, 0, 0, 0, 0, None);
+        let msg = ExitStatusMessage::heartbeat(pubkey, "peer", 0, 0, 0, 0, 0, None, vec![]);
         assert_eq!(msg.pubkey_bytes(), Some(pubkey));
     }
 }
