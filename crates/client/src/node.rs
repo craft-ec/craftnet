@@ -919,7 +919,7 @@ impl TunnelCraftNode {
             dir.join(format!("aggregator-state-{}.json", peer_id))
         });
         let aggregator_history_file = config.data_dir.as_ref().map(|dir| {
-            dir.join(format!("aggregator-history-{}.jsonl", peer_id))
+            dir.join(format!("aggregator-history-{}.bin", peer_id))
         });
 
         // Load existing receipts from disk
@@ -1095,7 +1095,7 @@ impl TunnelCraftNode {
                 } else {
                     Aggregator::new(make_agg_prover())
                 };
-                // Recover history sequence number from JSONL file (doesn't load into memory)
+                // Recover history sequence number from binary file (doesn't load into memory)
                 if let Some(ref path) = aggregator_history_file {
                     let next_seq = Aggregator::recover_history_seq(path);
                     if next_seq > 0 {
@@ -4632,7 +4632,7 @@ impl TunnelCraftNode {
             const SYNC_BATCH_SIZE: usize = 1000;
             let batch: Vec<Vec<u8>> = entries.iter()
                 .take(SYNC_BATCH_SIZE)
-                .filter_map(|e| serde_json::to_vec(e).ok())
+                .filter_map(|e| bincode::serialize(e).ok())
                 .collect();
             let has_more = entries.len() > SYNC_BATCH_SIZE;
             let batch_len = batch.len();
@@ -4950,7 +4950,7 @@ impl TunnelCraftNode {
         aggregator.save_to_file(path, &self.posted_distributions);
     }
 
-    /// Flush unflushed history entries to the append-only JSONL file.
+    /// Flush unflushed history entries to the append-only binary file.
     fn flush_aggregator_history(&mut self) {
         let Some(ref mut aggregator) = self.aggregator else { return };
         let Some(ref path) = self.aggregator_history_file else { return };

@@ -8440,6 +8440,7 @@ dependencies = [
 name = "tunnelcraft-aggregator"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "hex",
  "serde",
  "serde_json",
@@ -8487,6 +8488,7 @@ dependencies = [
 name = "tunnelcraft-client"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "futures",
  "hex",
  "libp2p",

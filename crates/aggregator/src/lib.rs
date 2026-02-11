@@ -8,7 +8,7 @@
 //! a future ecosystem reward pool.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, Write};
+use std::io::{Read as _, Write};
 use std::path::Path;
 
 use serde::{Serialize, Deserialize};
@@ -24,39 +24,6 @@ const MAX_PENDING_PER_CHAIN: usize = 16;
 
 /// Maximum total pending proofs across all chains.
 const MAX_PENDING_TOTAL: usize = 4096;
-
-// =========================================================================
-// Hex serde helper for [u8; 32] fields
-// =========================================================================
-
-/// Serialize/deserialize `[u8; 32]` as a hex string (64 chars) instead of
-/// a JSON array of 32 numbers (~130 chars). Cuts JSONL line size ~47%.
-mod hex32 {
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        if bytes.len() != 32 {
-            return Err(serde::de::Error::custom(format!(
-                "expected 32 bytes, got {}", bytes.len()
-            )));
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(arr)
-    }
-}
 
 // =========================================================================
 // History ledger types (append-only log)
@@ -80,38 +47,30 @@ pub struct HistoryEntry {
 pub enum HistoryEvent {
     /// A relay proof was accepted and applied
     ProofAccepted {
-        #[serde(with = "hex32")]
-        relay_pubkey: [u8; 32],
-        #[serde(with = "hex32")]
-        pool_pubkey: [u8; 32],
+relay_pubkey: [u8; 32],
+pool_pubkey: [u8; 32],
         pool_type: PoolType,
         epoch: u64,
         batch_bytes: u64,
         cumulative_bytes: u64,
-        #[serde(with = "hex32")]
-        prev_root: [u8; 32],
-        #[serde(with = "hex32")]
-        new_root: [u8; 32],
+prev_root: [u8; 32],
+new_root: [u8; 32],
         proof_timestamp: u64,
     },
     /// A distribution was built (snapshot before on-chain posting)
     DistributionBuilt {
-        #[serde(with = "hex32")]
-        user_pubkey: [u8; 32],
+user_pubkey: [u8; 32],
         pool_type: PoolType,
         epoch: u64,
-        #[serde(with = "hex32")]
-        distribution_root: [u8; 32],
+distribution_root: [u8; 32],
         total_bytes: u64,
         num_relays: usize,
     },
     /// A distribution was posted on-chain
     DistributionPosted {
-        #[serde(with = "hex32")]
-        user_pubkey: [u8; 32],
+user_pubkey: [u8; 32],
         epoch: u64,
-        #[serde(with = "hex32")]
-        distribution_root: [u8; 32],
+distribution_root: [u8; 32],
         total_bytes: u64,
     },
 }
@@ -777,19 +736,29 @@ impl Aggregator {
             .collect()
     }
 
-    /// Scan the JSONL file, returning entries that pass the filter.
+    /// Scan the binary history file, returning entries that pass the filter.
+    ///
+    /// Format: repeated `[u32-LE length][bincode payload]` records.
     fn scan_history<F>(path: &Path, filter: F) -> Vec<HistoryEntry>
     where
         F: Fn(&HistoryEntry) -> bool,
     {
-        let file = match std::fs::File::open(path) {
+        let mut file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(_) => return Vec::new(),
         };
-        let reader = std::io::BufReader::new(file);
         let mut results = Vec::new();
-        for line in reader.lines().map_while(|r| r.ok()) {
-            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if file.read_exact(&mut len_buf).is_err() {
+                break; // EOF or read error
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            if file.read_exact(&mut payload).is_err() {
+                break; // truncated record
+            }
+            if let Ok(entry) = bincode::deserialize::<HistoryEntry>(&payload) {
                 if filter(&entry) {
                     results.push(entry);
                 }
@@ -799,10 +768,11 @@ impl Aggregator {
     }
 
     // =========================================================================
-    // History persistence (JSONL)
+    // History persistence (length-prefixed bincode)
     // =========================================================================
 
-    /// Flush buffered history entries to the JSONL file (append-only).
+    /// Flush buffered history entries to the binary file (append-only).
+    /// Each record is `[u32-LE length][bincode payload]`.
     /// After flush, the buffer is cleared — disk is the only copy.
     pub fn flush_history(&mut self, path: &Path) {
         if self.history.buffer.is_empty() {
@@ -817,8 +787,10 @@ impl Aggregator {
             Ok(mut file) => {
                 let count = self.history.buffer.len();
                 for entry in self.history.buffer.drain(..) {
-                    if let Ok(json) = serde_json::to_string(&entry) {
-                        let _ = writeln!(file, "{}", json);
+                    if let Ok(payload) = bincode::serialize(&entry) {
+                        let len = (payload.len() as u32).to_le_bytes();
+                        let _ = file.write_all(&len);
+                        let _ = file.write_all(&payload);
                     }
                 }
                 info!("Flushed {} history entries to disk", count);
@@ -829,18 +801,26 @@ impl Aggregator {
         }
     }
 
-    /// Recover the next_seq from an existing JSONL file on startup.
-    /// Only reads the last entry's seq — does not load the full file into memory.
+    /// Recover the next_seq from an existing binary history file on startup.
+    /// Scans all records for the last seq — does not keep entries in memory.
     pub fn recover_history_seq(path: &Path) -> u64 {
-        let file = match std::fs::File::open(path) {
+        let mut file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(_) => return 0,
         };
-        let reader = std::io::BufReader::new(file);
         let mut last_seq = 0u64;
         let mut count = 0u64;
-        for line in reader.lines().map_while(|r| r.ok()) {
-            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if file.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            if file.read_exact(&mut payload).is_err() {
+                break;
+            }
+            if let Ok(entry) = bincode::deserialize::<HistoryEntry>(&payload) {
                 last_seq = entry.seq;
                 count += 1;
             }
@@ -1356,7 +1336,7 @@ mod tests {
     fn history_tmp(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("tunnelcraft-test-{}", name));
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("history.jsonl");
+        let path = dir.join("history.bin");
         let _ = std::fs::remove_file(&path);
         (dir, path)
     }
@@ -1581,8 +1561,8 @@ mod tests {
     }
 
     #[test]
-    fn test_history_hex_encoding_size() {
-        // Verify hex encoding reduces line size vs the old array-of-numbers format
+    fn test_history_bincode_size() {
+        // Verify bincode keeps entries compact (~184 bytes)
         let entry = HistoryEntry {
             seq: 999_999,
             recorded_at: 1_700_000_000,
@@ -1598,17 +1578,17 @@ mod tests {
                 proof_timestamp: 1_700_000_000,
             },
         };
-        let json = serde_json::to_string(&entry).unwrap();
-        let bytes = json.len();
+        let bytes = bincode::serialize(&entry).unwrap();
+        let size = bytes.len();
 
-        // With hex encoding: ~504 bytes (4 × 64-char hex strings)
-        // Without hex encoding: ~756 bytes (4 × ~130-char number arrays)
-        // Reduction: ~33%
-        assert!(bytes < 550, "Hex-encoded entry should be <550 bytes, got {}", bytes);
-        assert!(bytes > 400, "Entry too small: {} bytes", bytes);
+        // bincode: ~184 bytes (raw bytes for [u8;32], fixed-width u64s)
+        // vs hex JSON: ~504 bytes  → ~64% reduction
+        // vs raw JSON: ~756 bytes  → ~76% reduction
+        assert!(size < 250, "Bincode entry should be <250 bytes, got {}", size);
+        assert!(size > 150, "Entry too small: {} bytes", size);
 
         // Verify roundtrip
-        let decoded: HistoryEntry = serde_json::from_str(&json).unwrap();
+        let decoded: HistoryEntry = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.seq, 999_999);
         match decoded.event {
             HistoryEvent::ProofAccepted { relay_pubkey, new_root, .. } => {
