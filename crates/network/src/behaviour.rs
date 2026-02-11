@@ -54,6 +54,9 @@ pub const PROOF_TOPIC: &str = "tunnelcraft/proofs/1.0.0";
 /// Gossipsub topic for subscription announcements
 pub const SUBSCRIPTION_TOPIC: &str = "tunnelcraft/subscriptions/1.0.0";
 
+/// Gossipsub topic for aggregator history sync (new aggregators catching up)
+pub const AGGREGATOR_SYNC_TOPIC: &str = "tunnelcraft/aggregator-sync/1.0.0";
+
 /// Heartbeat interval for exit nodes (30 seconds)
 pub const EXIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -334,6 +337,24 @@ impl TunnelCraftBehaviour {
     /// Publish a subscription announcement
     pub fn publish_subscription(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, gossipsub::PublishError> {
         let topic = gossipsub::IdentTopic::new(SUBSCRIPTION_TOPIC);
+        self.gossipsub.publish(topic, data)
+    }
+
+    /// Subscribe to the aggregator sync topic
+    pub fn subscribe_aggregator_sync(&mut self) -> Result<bool, gossipsub::SubscriptionError> {
+        let topic = gossipsub::IdentTopic::new(AGGREGATOR_SYNC_TOPIC);
+        self.gossipsub.subscribe(&topic)
+    }
+
+    /// Unsubscribe from the aggregator sync topic
+    pub fn unsubscribe_aggregator_sync(&mut self) -> bool {
+        let topic = gossipsub::IdentTopic::new(AGGREGATOR_SYNC_TOPIC);
+        self.gossipsub.unsubscribe(&topic)
+    }
+
+    /// Publish an aggregator sync message (request or response)
+    pub fn publish_aggregator_sync(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, gossipsub::PublishError> {
+        let topic = gossipsub::IdentTopic::new(AGGREGATOR_SYNC_TOPIC);
         self.gossipsub.publish(topic, data)
     }
 

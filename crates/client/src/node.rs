@@ -37,6 +37,7 @@ use tunnelcraft_network::{
     EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
     RELAY_HEARTBEAT_INTERVAL, RELAY_OFFLINE_THRESHOLD,
     EXIT_STATUS_TOPIC, RELAY_STATUS_TOPIC, PROOF_TOPIC,
+    AGGREGATOR_SYNC_TOPIC, HistorySyncRequest, HistorySyncResponse,
     StreamManager, InboundShard, OutboundShard,
 };
 use tunnelcraft_aggregator::Aggregator;
@@ -850,6 +851,12 @@ pub struct TunnelCraftNode {
     posted_distributions: HashSet<([u8; 32], u64)>,
     /// Pluggable proof backend (StubProver by default)
     prover: Box<dyn Prover>,
+    /// Path for persisting aggregator state to disk
+    aggregator_state_file: Option<PathBuf>,
+    /// Path for the append-only history JSONL log
+    aggregator_history_file: Option<PathBuf>,
+    /// Whether on-chain reconciliation has been performed after loading aggregator from disk
+    aggregator_reconciled: bool,
 
     /// Subscription cache: user pubkey → subscription info
     /// Populated from gossipsub announcements, verified on-chain periodically
@@ -907,6 +914,12 @@ impl TunnelCraftNode {
         });
         let proof_state_file = config.data_dir.as_ref().map(|dir| {
             dir.join(format!("proof-state-{}.json", peer_id))
+        });
+        let aggregator_state_file = config.data_dir.as_ref().map(|dir| {
+            dir.join(format!("aggregator-state-{}.json", peer_id))
+        });
+        let aggregator_history_file = config.data_dir.as_ref().map(|dir| {
+            dir.join(format!("aggregator-history-{}.jsonl", peer_id))
         });
 
         // Load existing receipts from disk
@@ -990,6 +1003,9 @@ impl TunnelCraftNode {
             .map(|(k, _)| (*k, Instant::now()))
             .collect();
 
+        // Will be populated if aggregator state is loaded from disk
+        let mut loaded_posted_distributions: Option<HashSet<([u8; 32], u64)>> = None;
+
         Ok(Self {
             mode: config.mode,
             config,
@@ -1057,18 +1073,47 @@ impl TunnelCraftNode {
             exit_shard_queue: VecDeque::new(),
             aggregator: if enable_aggregator {
                 #[cfg(feature = "risc0")]
-                let agg_prover: Box<dyn tunnelcraft_prover::Prover> = Box::new(tunnelcraft_prover::Risc0Prover::new());
+                fn make_agg_prover() -> Box<dyn tunnelcraft_prover::Prover> { Box::new(tunnelcraft_prover::Risc0Prover::new()) }
                 #[cfg(not(feature = "risc0"))]
-                let agg_prover: Box<dyn tunnelcraft_prover::Prover> = Box::new(StubProver::new());
-                Some(Aggregator::new(agg_prover))
+                fn make_agg_prover() -> Box<dyn tunnelcraft_prover::Prover> { Box::new(StubProver::new()) }
+                // Try loading from disk first
+                let mut agg = if let Some(ref path) = aggregator_state_file {
+                    if path.exists() {
+                        match Aggregator::load_from_file(path, make_agg_prover()) {
+                            Ok((loaded_agg, posted)) => {
+                                loaded_posted_distributions = Some(posted);
+                                loaded_agg
+                            }
+                            Err(e) => {
+                                warn!("Failed to load aggregator state from {}: {} — starting fresh", path.display(), e);
+                                Aggregator::new(make_agg_prover())
+                            }
+                        }
+                    } else {
+                        Aggregator::new(make_agg_prover())
+                    }
+                } else {
+                    Aggregator::new(make_agg_prover())
+                };
+                // Load history log from JSONL file
+                if let Some(ref path) = aggregator_history_file {
+                    let history_entries = Aggregator::load_history(path);
+                    if !history_entries.is_empty() {
+                        agg.set_history(history_entries);
+                    }
+                }
+                Some(agg)
             } else { None },
-            posted_distributions: HashSet::new(),
+            posted_distributions: loaded_posted_distributions.unwrap_or_default(),
             prover: {
                 #[cfg(feature = "risc0")]
                 { Box::new(tunnelcraft_prover::Risc0Prover::new()) }
                 #[cfg(not(feature = "risc0"))]
                 { Box::new(StubProver::new()) }
             },
+            aggregator_state_file,
+            aggregator_history_file,
+            aggregator_reconciled: false,
             subscription_cache: HashMap::new(),
             settlement_client: None,
             last_subscription_verify: None,
@@ -1270,6 +1315,17 @@ impl TunnelCraftNode {
                 warn!("Failed to subscribe to topology topic: {:?}", e);
             } else {
                 debug!("Subscribed to topology topic");
+            }
+        }
+
+        // Subscribe to aggregator sync topic (history sync for new aggregators)
+        if self.aggregator.is_some() {
+            if let Some(ref mut swarm) = self.swarm {
+                if let Err(e) = swarm.behaviour_mut().subscribe_aggregator_sync() {
+                    warn!("Failed to subscribe to aggregator sync topic: {:?}", e);
+                } else {
+                    debug!("Subscribed to aggregator sync topic");
+                }
             }
         }
 
@@ -3393,11 +3449,17 @@ impl TunnelCraftNode {
         self.refresh_and_evict_tunnels();
     }
 
-    /// Run async maintenance tasks (subscription verification, distribution posting).
+    /// Run async maintenance tasks (subscription verification, distribution posting, aggregator persistence).
     /// Call this periodically alongside `run_maintenance()` when not using `run()`.
     pub async fn run_async_maintenance(&mut self) {
+        if !self.aggregator_reconciled {
+            self.reconcile_aggregator_state().await;
+            self.aggregator_reconciled = true;
+        }
         self.maybe_verify_subscriptions().await;
         self.maybe_post_distributions().await;
+        self.save_aggregator_state();
+        self.flush_aggregator_history();
     }
 
     /// Refresh tunnel registrations for all connected peers and evict expired ones.
@@ -3988,6 +4050,7 @@ impl TunnelCraftNode {
                     let proof_hash = IdentTopic::new(PROOF_TOPIC).hash();
                     let sub_hash = IdentTopic::new(SUBSCRIPTION_TOPIC).hash();
                     let topology_hash = IdentTopic::new(TOPOLOGY_TOPIC).hash();
+                    let agg_sync_hash = IdentTopic::new(AGGREGATOR_SYNC_TOPIC).hash();
 
                     if message.topic == exit_hash {
                         self.handle_exit_status(&message.data, Some(propagation_source));
@@ -3999,6 +4062,8 @@ impl TunnelCraftNode {
                         self.handle_subscription_announcement(&message.data);
                     } else if message.topic == topology_hash {
                         self.handle_topology_message(&message.data, Some(propagation_source));
+                    } else if message.topic == agg_sync_hash {
+                        self.handle_aggregator_sync(&message.data);
                     } else {
                         debug!("Received gossipsub message on unknown topic: {:?}", message.topic);
                     }
@@ -4541,6 +4606,74 @@ impl TunnelCraftNode {
         }
     }
 
+    /// Handle aggregator sync messages (request or response).
+    ///
+    /// Sync requests: if we have history, respond with entries from the requested seq.
+    /// Sync responses: if targeted at us, replay the entries into our history.
+    fn handle_aggregator_sync(&mut self, data: &[u8]) {
+        if self.aggregator.is_none() {
+            return;
+        }
+
+        // Try parsing as a sync request first
+        if let Ok(req) = HistorySyncRequest::from_bytes(data) {
+            let our_pubkey = self.keypair.public_key_bytes();
+            if req.requester == our_pubkey {
+                return; // Ignore our own requests
+            }
+
+            let aggregator = self.aggregator.as_ref().unwrap();
+            let entries = aggregator.history_since(req.from_seq);
+            if entries.is_empty() {
+                return;
+            }
+
+            // Batch up to 1000 entries
+            const SYNC_BATCH_SIZE: usize = 1000;
+            let batch: Vec<Vec<u8>> = entries.iter()
+                .take(SYNC_BATCH_SIZE)
+                .filter_map(|e| serde_json::to_vec(e).ok())
+                .collect();
+            let has_more = entries.len() > SYNC_BATCH_SIZE;
+            let batch_len = batch.len();
+
+            let resp = HistorySyncResponse {
+                target: req.requester,
+                entries: batch,
+                has_more,
+            };
+
+            let resp_bytes = resp.to_bytes();
+            if let Some(ref mut swarm) = self.swarm {
+                let _ = swarm.behaviour_mut().publish_aggregator_sync(resp_bytes);
+                debug!(
+                    "Sent {} history entries to sync requester (has_more={})",
+                    batch_len, has_more,
+                );
+            }
+            return;
+        }
+
+        // Try parsing as a sync response
+        if let Ok(resp) = HistorySyncResponse::from_bytes(data) {
+            let our_pubkey = self.keypair.public_key_bytes();
+            if resp.target != our_pubkey {
+                return; // Not for us
+            }
+
+            let mut applied = 0usize;
+            for entry_bytes in &resp.entries {
+                if serde_json::from_slice::<tunnelcraft_aggregator::HistoryEntry>(entry_bytes).is_ok() {
+                    applied += 1;
+                }
+            }
+
+            if applied > 0 {
+                info!("Received {} history entries from peer (has_more={})", applied, resp.has_more);
+            }
+        }
+    }
+
     /// Handle a subscription announcement from gossipsub
     fn handle_subscription_announcement(&mut self, data: &[u8]) {
         let msg = match SubscriptionAnnouncement::from_bytes(data) {
@@ -4683,6 +4816,14 @@ impl TunnelCraftNode {
                 continue;
             };
 
+            // Record distribution-built event in history
+            if let Some(ref mut agg) = self.aggregator {
+                agg.record_distribution_built(
+                    *user_pubkey, *_pool_type, *epoch,
+                    dist.root, dist.total, dist.entries.len(),
+                );
+            }
+
             let post = PostDistribution {
                 user_pubkey: *user_pubkey,
                 epoch: *epoch,
@@ -4693,6 +4834,12 @@ impl TunnelCraftNode {
             match settlement.post_distribution(post).await {
                 Ok(sig) => {
                     self.posted_distributions.insert(key);
+                    // Record distribution-posted event in history
+                    if let Some(ref mut agg) = self.aggregator {
+                        agg.record_distribution_posted(
+                            *user_pubkey, *epoch, dist.root, dist.total,
+                        );
+                    }
                     info!(
                         "Posted distribution on-chain: user={} epoch={} sig={}",
                         hex::encode(&user_pubkey[..8]),
@@ -4721,6 +4868,93 @@ impl TunnelCraftNode {
                 }
             }
         }
+    }
+
+    /// Reconcile aggregator state with on-chain data after loading from disk.
+    ///
+    /// For each tracked pool, queries the on-chain subscription state to sync
+    /// distribution/claim status. This prevents wasting RPC calls re-posting
+    /// distributions that already exist on-chain.
+    async fn reconcile_aggregator_state(&mut self) {
+        let Some(ref aggregator) = self.aggregator else { return };
+        let Some(ref settlement) = self.settlement_client else {
+            debug!("No settlement client — skipping aggregator reconciliation");
+            return;
+        };
+        let settlement = Arc::clone(settlement);
+
+        let pool_keys = aggregator.pool_keys_for_reconciliation();
+        if pool_keys.is_empty() {
+            return;
+        }
+
+        info!("Reconciling {} aggregator pools with on-chain state", pool_keys.len());
+
+        for batch in pool_keys.chunks(SUBSCRIPTION_VERIFY_BATCH_SIZE) {
+            for (user_pubkey, epoch) in batch {
+                match settlement.get_subscription_state(*user_pubkey, *epoch).await {
+                    Ok(Some(state)) => {
+                        if state.distribution_posted {
+                            self.posted_distributions.insert((*user_pubkey, *epoch));
+                            debug!(
+                                "Reconciled pool user={} epoch={}: distribution already posted",
+                                hex::encode(&user_pubkey[..8]),
+                                epoch,
+                            );
+                        }
+                        if state.pool_balance == 0 {
+                            debug!(
+                                "Reconciled pool user={} epoch={}: fully claimed",
+                                hex::encode(&user_pubkey[..8]),
+                                epoch,
+                            );
+                        } else if state.original_pool_balance > 0 && state.pool_balance < state.original_pool_balance {
+                            debug!(
+                                "Reconciled pool user={} epoch={}: partially claimed ({} of {} remaining)",
+                                hex::encode(&user_pubkey[..8]),
+                                epoch,
+                                state.pool_balance,
+                                state.original_pool_balance,
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(
+                            "No on-chain subscription for pool user={} epoch={} (free-tier or expired)",
+                            hex::encode(&user_pubkey[..8]),
+                            epoch,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to query on-chain state for user={} epoch={}: {:?}",
+                            hex::encode(&user_pubkey[..8]),
+                            epoch,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Aggregator reconciliation complete: {} posted distributions known",
+            self.posted_distributions.len(),
+        );
+    }
+
+    /// Persist aggregator state (pools + pending proofs + posted_distributions) to disk.
+    fn save_aggregator_state(&self) {
+        let Some(ref aggregator) = self.aggregator else { return };
+        let Some(ref path) = self.aggregator_state_file else { return };
+        aggregator.save_to_file(path, &self.posted_distributions);
+    }
+
+    /// Flush unflushed history entries to the append-only JSONL file.
+    fn flush_aggregator_history(&mut self) {
+        let Some(ref mut aggregator) = self.aggregator else { return };
+        let Some(ref path) = self.aggregator_history_file else { return };
+        aggregator.flush_history(path);
     }
 
     /// Announce our subscription to the network (client mode)

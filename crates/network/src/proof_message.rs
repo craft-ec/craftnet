@@ -133,6 +133,55 @@ impl ProofStateResponse {
     }
 }
 
+// =========================================================================
+// Aggregator history sync types
+// =========================================================================
+
+/// Request history from peers (gossipped by new aggregators).
+///
+/// A new aggregator broadcasts this on the aggregator-sync topic.
+/// Existing aggregators respond with batches of history entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySyncRequest {
+    /// Requester's signing pubkey (so responders know who to target)
+    pub requester: [u8; 32],
+    /// Current history height — "give me everything after this seq"
+    pub from_seq: u64,
+}
+
+impl HistorySyncRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("HistorySyncRequest serialization should not fail")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
+/// Response with a batch of history entries (gossipped by existing aggregators).
+///
+/// Only the requester (matching `target` pubkey) should process this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySyncResponse {
+    /// Target peer's signing pubkey (so only the requester processes this)
+    pub target: [u8; 32],
+    /// Batch of serialized history entries (JSON strings)
+    pub entries: Vec<Vec<u8>>,
+    /// Whether there are more entries available beyond this batch
+    pub has_more: bool,
+}
+
+impl HistorySyncResponse {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("HistorySyncResponse serialization should not fail")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

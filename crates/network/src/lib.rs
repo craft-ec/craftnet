@@ -32,8 +32,9 @@ pub use behaviour::{
     RELAY_DHT_KEY_PREFIX, RELAY_REGISTRY_KEY, RELAY_RECORD_TTL,
     RELAY_STATUS_TOPIC, RELAY_HEARTBEAT_INTERVAL, RELAY_OFFLINE_THRESHOLD,
     relay_dht_key,
+    AGGREGATOR_SYNC_TOPIC,
 };
-pub use proof_message::{ProofMessage, PoolType, ProofStateQuery, ProofStateResponse};
+pub use proof_message::{ProofMessage, PoolType, ProofStateQuery, ProofStateResponse, HistorySyncRequest, HistorySyncResponse};
 pub use relay_status::{RelayStatusMessage, RelayStatusType};
 pub use status::{ExitStatusMessage, ExitStatusType};
 pub use subscription::SubscriptionAnnouncement;
