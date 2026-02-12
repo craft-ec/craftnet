@@ -64,6 +64,14 @@ fn derive_tunnel_id(client_peer_id: &PeerId, gateway_peer_id: &PeerId) -> Id {
     id
 }
 
+/// Result from async proof generation (spawn_blocking)
+struct ProveResult {
+    pool_key: (PublicKey, PoolType, u64),
+    batch: Vec<ForwardReceipt>,
+    output: std::result::Result<tunnelcraft_prover::ProofOutput, tunnelcraft_prover::ProverError>,
+    start: Instant,
+}
+
 // === Proof state persistence types ===
 
 /// On-disk proof state: pool_roots + pending receipts
@@ -849,8 +857,12 @@ pub struct TunnelCraftNode {
     aggregator: Option<Aggregator>,
     /// Tracks which (user_pubkey, epoch) distributions have been posted on-chain
     posted_distributions: HashSet<([u8; 32], u64)>,
-    /// Pluggable proof backend (StubProver by default)
-    prover: Box<dyn Prover>,
+    /// Pluggable proof backend (StubProver by default, Sp1Prover with --features sp1)
+    prover: Arc<dyn Prover>,
+    /// Stub prover for free-tier receipts (no ZK proof needed, instant)
+    stub_prover: Arc<StubProver>,
+    /// Channel for receiving proof results from spawn_blocking
+    proof_result_rx: Option<tokio::sync::oneshot::Receiver<ProveResult>>,
     /// Path for persisting aggregator state to disk
     aggregator_state_file: Option<PathBuf>,
     /// Path for the append-only history JSONL log
@@ -1070,9 +1082,9 @@ impl TunnelCraftNode {
             exit_task_rx,
             exit_shard_queue: VecDeque::new(),
             aggregator: if enable_aggregator {
-                #[cfg(feature = "risc0")]
-                fn make_agg_prover() -> Box<dyn tunnelcraft_prover::Prover> { Box::new(tunnelcraft_prover::Risc0Prover::new()) }
-                #[cfg(not(feature = "risc0"))]
+                #[cfg(feature = "sp1")]
+                fn make_agg_prover() -> Box<dyn tunnelcraft_prover::Prover> { Box::new(tunnelcraft_prover::Sp1Prover::new()) }
+                #[cfg(not(feature = "sp1"))]
                 fn make_agg_prover() -> Box<dyn tunnelcraft_prover::Prover> { Box::new(StubProver::new()) }
                 // Try loading from disk first
                 let mut agg = if let Some(ref path) = aggregator_state_file {
@@ -1104,11 +1116,13 @@ impl TunnelCraftNode {
             } else { None },
             posted_distributions: loaded_posted_distributions.unwrap_or_default(),
             prover: {
-                #[cfg(feature = "risc0")]
-                { Box::new(tunnelcraft_prover::Risc0Prover::new()) }
-                #[cfg(not(feature = "risc0"))]
-                { Box::new(StubProver::new()) }
+                #[cfg(feature = "sp1")]
+                { Arc::new(tunnelcraft_prover::Sp1Prover::new()) }
+                #[cfg(not(feature = "sp1"))]
+                { Arc::new(StubProver::new()) }
             },
+            stub_prover: Arc::new(StubProver::new()),
+            proof_result_rx: None,
             aggregator_state_file,
             aggregator_history_file,
             aggregator_reconciled: false,
@@ -3197,6 +3211,7 @@ impl TunnelCraftNode {
     pub async fn poll_once(&mut self) {
         // Try to generate proofs from queued receipts (relay/exit mode)
         if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+            self.poll_proof_result();
             self.try_prove();
         }
 
@@ -5094,6 +5109,9 @@ impl TunnelCraftNode {
     ///
     /// Called from `poll_once()` on every tick. If the prover is busy or no
     /// pool has enough queued receipts, this is a no-op.
+    ///
+    /// The actual prove() call runs on spawn_blocking to avoid blocking the
+    /// async event loop (SP1 zkVM proving is CPU-intensive).
     fn try_prove(&mut self) {
         if self.prover_busy {
             return;
@@ -5133,28 +5151,75 @@ impl TunnelCraftNode {
         let batch: Vec<ForwardReceipt> = queue.drain(..batch_size).collect();
 
         self.prover_busy = true;
-        let start = Instant::now();
 
-        // Delegate to pluggable prover (StubProver builds Merkle tree)
-        let proof_output = match self.prover.prove(&batch) {
+        // Select prover: free-tier receipts use StubProver (instant, no ZK needed),
+        // subscribed receipts use the real prover (SP1 or StubProver depending on feature)
+        let prover: Arc<dyn Prover> = if pool_type == PoolType::Free {
+            Arc::clone(&self.stub_prover) as Arc<dyn Prover>
+        } else {
+            Arc::clone(&self.prover)
+        };
+
+        // Spawn prove on a blocking thread to avoid starving the async event loop
+        let batch_clone = batch.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.proof_result_rx = Some(rx);
+
+        tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
+            let output = prover.prove(&batch_clone);
+            let _ = tx.send(ProveResult {
+                pool_key,
+                batch: batch_clone,
+                output,
+                start,
+            });
+        });
+    }
+
+    /// Check for completed proof results from spawn_blocking and process them.
+    fn poll_proof_result(&mut self) {
+        let rx = match self.proof_result_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        // Non-blocking check
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                warn!("Proof result channel closed unexpectedly");
+                self.prover_busy = false;
+                self.proof_result_rx = None;
+                return;
+            }
+        };
+        self.proof_result_rx = None;
+
+        let pool_key = result.pool_key;
+        let (pool, pool_type, epoch) = pool_key;
+
+        let proof_output = match result.output {
             Ok(output) => output,
             Err(e) => {
                 warn!("Prover failed: {:?}", e);
                 self.prover_busy = false;
                 // Re-queue the batch
                 let queue = self.proof_queue.entry(pool_key).or_default();
-                for receipt in batch.into_iter().rev() {
+                for receipt in result.batch.into_iter().rev() {
                     queue.push_front(receipt);
                 }
                 return;
             }
         };
+
         let new_root = proof_output.new_root;
         let (prev_root, prev_bytes) = self.pool_roots.get(&pool_key)
             .copied()
             .unwrap_or(([0u8; 32], 0));
 
-        let batch_bytes_total: u64 = batch.iter().map(|r| r.payload_size as u64).sum();
+        let batch_bytes_total: u64 = result.batch.iter().map(|r| r.payload_size as u64).sum();
         let cumulative_bytes = prev_bytes + batch_bytes_total;
 
         // Generate proof message
@@ -5214,7 +5279,7 @@ impl TunnelCraftNode {
         self.save_proof_state();
 
         // Adaptive batch sizing
-        let duration = start.elapsed();
+        let duration = result.start.elapsed();
         self.last_proof_duration = Some(duration);
         self.adjust_batch_size(duration);
 

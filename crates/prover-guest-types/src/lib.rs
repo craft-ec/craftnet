@@ -1,7 +1,7 @@
-//! Shared types between the risc0 guest program and the host prover.
+//! Shared types between the zkVM guest program and the host prover.
 //!
 //! These types are `no_std`-compatible so they can be used inside the
-//! risc0 RISC-V VM guest as well as by the host-side `Risc0Prover`.
+//! SP1 RISC-V VM guest as well as by the host-side prover.
 
 #![no_std]
 

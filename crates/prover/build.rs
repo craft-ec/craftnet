@@ -1,6 +1,6 @@
 fn main() {
-    #[cfg(feature = "risc0")]
+    #[cfg(feature = "sp1")]
     {
-        risc0_build::embed_methods();
+        sp1_build::build_program("../prover-guest");
     }
 }

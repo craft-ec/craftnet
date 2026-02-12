@@ -11,12 +11,12 @@ pub mod merkle;
 pub mod stub;
 pub mod traits;
 
-#[cfg(feature = "risc0")]
-pub mod risc0;
+#[cfg(feature = "sp1")]
+pub mod sp1;
 
 pub use merkle::{hash_pair, merkle_leaf, MerkleProof, MerkleTree};
 pub use stub::StubProver;
 pub use traits::{ProofOutput, Prover, ProverError};
 
-#[cfg(feature = "risc0")]
-pub use risc0::Risc0Prover;
+#[cfg(feature = "sp1")]
+pub use sp1::Sp1Prover;

@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-risc0 = ["tunnelcraft-prover/risc0"]
+sp1 = ["tunnelcraft-prover/sp1"]
 
 [dependencies]
 tunnelcraft-core = { workspace = true }

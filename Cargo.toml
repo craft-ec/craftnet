@@ -47,9 +47,9 @@ serde_json = "1.0"
 serde-big-array = "0.5"
 bincode = "1.3"
 
-# ZK proving (risc0)
-risc0-zkvm = "3.0"
-risc0-build = "3.0"
+# ZK proving (SP1)
+sp1-sdk = "5.2"
+sp1-build = "5.2"
 
 # Cryptography (dalek ecosystem - pure Rust, audited)
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
