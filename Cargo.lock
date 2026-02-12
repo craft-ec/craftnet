@@ -11908,6 +11908,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnelcraft-distribution-guest-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "tunnelcraft-erasure"
 version = "0.1.0"
 dependencies = [
@@ -11997,6 +12004,7 @@ dependencies = [
  "tracing-subscriber",
  "tunnelcraft-core",
  "tunnelcraft-crypto",
+ "tunnelcraft-distribution-guest-types",
  "tunnelcraft-prover-guest-types",
 ]
 

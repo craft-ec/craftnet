@@ -377,6 +377,8 @@ async fn test_aggregator_to_settlement_claim_flow() {
             epoch,
             distribution_root: dist.root,
             total_bytes: dist.total,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .unwrap();
@@ -462,6 +464,8 @@ async fn test_chained_proofs_to_settlement() {
             epoch,
             distribution_root: dist.root,
             total_bytes: dist.total,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .unwrap();
@@ -510,6 +514,8 @@ async fn test_post_distribution_blocked_during_active() {
             epoch,
             distribution_root: [0xAA; 32],
             total_bytes: 100,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await;
 
@@ -582,6 +588,8 @@ async fn test_double_claim_rejected_e2e() {
             epoch,
             distribution_root: [0xDD; 32],
             total_bytes: 100,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .unwrap();
@@ -747,6 +755,8 @@ async fn test_multi_pool_aggregation_and_claims() {
                 epoch,
                 distribution_root: dist.root,
                 total_bytes: dist.total,
+                groth16_proof: vec![],
+                sp1_public_inputs: vec![],
             })
             .await
             .unwrap();

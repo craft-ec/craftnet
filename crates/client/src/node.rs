@@ -855,6 +855,9 @@ pub struct TunnelCraftNode {
 
     /// Aggregator service (collects proof messages, builds distributions)
     aggregator: Option<Aggregator>,
+    /// Groth16 distribution prover for on-chain verified distributions (SP1 only)
+    #[cfg(feature = "sp1")]
+    distribution_prover: Option<tunnelcraft_prover::DistributionProver>,
     /// Tracks which (user_pubkey, epoch) distributions have been posted on-chain
     posted_distributions: HashSet<([u8; 32], u64)>,
     /// Pluggable proof backend (StubProver by default, Sp1Prover with --features sp1)
@@ -1114,6 +1117,12 @@ impl TunnelCraftNode {
                 }
                 Some(agg)
             } else { None },
+            #[cfg(feature = "sp1")]
+            distribution_prover: if enable_aggregator {
+                Some(tunnelcraft_prover::DistributionProver::new())
+            } else {
+                None
+            },
             posted_distributions: loaded_posted_distributions.unwrap_or_default(),
             prover: {
                 #[cfg(feature = "sp1")]
@@ -4774,11 +4783,31 @@ impl TunnelCraftNode {
                 );
             }
 
+            // Generate Groth16 proof if SP1 distribution prover is available
+            #[cfg(feature = "sp1")]
+            let (groth16_proof, sp1_public_inputs) = {
+                if let Some(ref dp) = self.distribution_prover {
+                    match dp.prove_distribution(&dist.entries, *user_pubkey, *epoch) {
+                        Ok(proof) => (proof.proof_bytes, proof.public_values),
+                        Err(e) => {
+                            warn!("Distribution Groth16 prove failed: {} — posting without proof", e);
+                            (vec![], vec![])
+                        }
+                    }
+                } else {
+                    (vec![], vec![])
+                }
+            };
+            #[cfg(not(feature = "sp1"))]
+            let (groth16_proof, sp1_public_inputs) = (vec![], vec![]);
+
             let post = PostDistribution {
                 user_pubkey: *user_pubkey,
                 epoch: *epoch,
                 distribution_root: dist.root,
                 total_bytes: dist.total,
+                groth16_proof,
+                sp1_public_inputs,
             };
 
             match settlement.post_distribution(post).await {

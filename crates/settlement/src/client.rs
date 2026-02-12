@@ -395,8 +395,13 @@ impl SettlementClient {
         hash
     }
 
-    /// Send a transaction to Solana
+    /// Send a transaction with a single instruction to Solana
     async fn send_transaction(&self, instruction: Instruction) -> Result<TransactionSignature> {
+        self.send_transaction_multi(vec![instruction]).await
+    }
+
+    /// Send a transaction with multiple instructions to Solana
+    async fn send_transaction_multi(&self, instructions: Vec<Instruction>) -> Result<TransactionSignature> {
         let rpc = self.rpc_client.as_ref()
             .ok_or_else(|| SettlementError::RpcError("RPC client not initialized".to_string()))?;
 
@@ -407,7 +412,7 @@ impl SettlementClient {
             .map_err(|e| SettlementError::RpcError(e.to_string()))?;
 
         let tx = Transaction::new_signed_with_payer(
-            &[instruction],
+            &instructions,
             Some(&keypair.pubkey()),
             &[keypair],
             blockhash,
@@ -589,6 +594,19 @@ impl SettlementClient {
         data.extend_from_slice(&dist.epoch.to_le_bytes());
         data.extend_from_slice(&dist.distribution_root);
         data.extend_from_slice(&dist.total_bytes.to_le_bytes());
+        // Serialize Groth16 proof (4-byte LE length prefix + bytes)
+        data.extend_from_slice(&(dist.groth16_proof.len() as u32).to_le_bytes());
+        data.extend_from_slice(&dist.groth16_proof);
+        // Serialize SP1 public inputs (4-byte LE length prefix + bytes)
+        data.extend_from_slice(&(dist.sp1_public_inputs.len() as u32).to_le_bytes());
+        data.extend_from_slice(&dist.sp1_public_inputs);
+
+        // Prepend compute budget if proof is present (Groth16 verification needs more CUs)
+        let mut instructions = Vec::new();
+        if !dist.groth16_proof.is_empty() {
+            use solana_sdk::compute_budget::ComputeBudgetInstruction;
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(400_000));
+        }
 
         let instruction = Instruction {
             program_id: self.program_id(),
@@ -598,8 +616,9 @@ impl SettlementClient {
             ],
             data,
         };
+        instructions.push(instruction);
 
-        self.send_transaction(instruction).await
+        self.send_transaction_multi(instructions).await
     }
 
     // ==================== Claim Rewards ====================
@@ -1140,6 +1159,8 @@ mod tests {
             epoch,
             distribution_root: dist_root,
             total_bytes: 10,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         }).await.unwrap();
 
         // Verify distribution was stored
@@ -1190,6 +1211,8 @@ mod tests {
             epoch,
             distribution_root: [0xAA; 32],
             total_bytes: 100,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         }).await;
 
         assert!(matches!(result, Err(SettlementError::EpochNotComplete)));
@@ -1270,6 +1293,8 @@ mod tests {
             epoch,
             distribution_root: [0xAA; 32],
             total_bytes: 10,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         }).await.unwrap();
 
         // First claim succeeds
@@ -1345,6 +1370,8 @@ mod tests {
             epoch,
             distribution_root: [0xAA; 32],
             total_bytes: 100,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         }).await.unwrap();
 
         // Second post fails — first-writer-wins
@@ -1353,6 +1380,8 @@ mod tests {
             epoch,
             distribution_root: [0xBB; 32],
             total_bytes: 200,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         }).await;
 
         assert!(matches!(result, Err(SettlementError::DistributionAlreadyPosted)));
@@ -1397,6 +1426,7 @@ mod tests {
         client.post_distribution(PostDistribution {
             user_pubkey: user, epoch: epoch0,
             distribution_root: [0xAA; 32], total_bytes: 10,
+            groth16_proof: vec![], sp1_public_inputs: vec![],
         }).await.unwrap();
         client.claim_rewards(ClaimRewards {
             user_pubkey: user, epoch: epoch0, node_pubkey: [2u8; 32],

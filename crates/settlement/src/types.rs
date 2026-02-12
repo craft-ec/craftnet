@@ -55,6 +55,10 @@ pub struct Subscribe {
 ///
 /// Called by the aggregator after the grace period ends. Sets the
 /// distribution root that relays use to claim their share.
+///
+/// In live mode with SP1 verification enabled, `groth16_proof` and
+/// `sp1_public_inputs` must contain a valid Groth16 proof over the
+/// distribution construction. In mock mode these are ignored.
 #[derive(Debug, Clone)]
 pub struct PostDistribution {
     /// User whose pool this distribution covers
@@ -65,6 +69,10 @@ pub struct PostDistribution {
     pub distribution_root: [u8; 32],
     /// Total payload bytes across all relays for this pool
     pub total_bytes: u64,
+    /// Groth16 proof bytes (empty if SP1 verification is not enabled)
+    pub groth16_proof: Vec<u8>,
+    /// SP1 public inputs (84 bytes when present, empty otherwise)
+    pub sp1_public_inputs: Vec<u8>,
 }
 
 /// Light Protocol parameters for on-chain claim (non-inclusion proof + address tree info).
@@ -202,6 +210,8 @@ mod tests {
             epoch: 0,
             distribution_root: [0xAA; 32],
             total_bytes: 1000,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         };
 
         assert_eq!(dist.user_pubkey, [1u8; 32]);

@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-sp1 = ["dep:sp1-sdk", "dep:bincode", "dep:tunnelcraft-prover-guest-types", "dep:sp1-build", "dep:hex"]
+sp1 = ["dep:sp1-sdk", "dep:bincode", "dep:tunnelcraft-prover-guest-types", "dep:tunnelcraft-distribution-guest-types", "dep:sp1-build", "dep:hex"]
 
 [dependencies]
 tunnelcraft-core = { workspace = true }
@@ -19,6 +19,7 @@ tracing = { workspace = true }
 sp1-sdk = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 tunnelcraft-prover-guest-types = { workspace = true, optional = true }
+tunnelcraft-distribution-guest-types = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 
 [dev-dependencies]

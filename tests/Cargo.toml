@@ -31,6 +31,10 @@ bs58 = { workspace = true }
 solana-sdk = "2.1"
 solana-client = "2.1"
 
+[features]
+default = []
+sp1 = ["tunnelcraft-client/sp1", "tunnelcraft-prover/sp1"]
+
 [[test]]
 name = "shard_flow"
 path = "shard_flow.rs"

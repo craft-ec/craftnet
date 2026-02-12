@@ -246,6 +246,8 @@ async fn test_ten_relay_forward_receipt_settlement() {
             epoch: claim_epoch,
             distribution_root: [0xAA; 32],
             total_bytes: total_receipts as u64,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .expect("Post distribution should succeed");
@@ -409,6 +411,8 @@ async fn test_receipt_isolation_across_requests() {
             epoch,
             distribution_root: [0xBB; 32],
             total_bytes: total,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .unwrap();
@@ -569,6 +573,8 @@ async fn test_merkle_proof_claim() {
             epoch,
             distribution_root: root,
             total_bytes,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .unwrap();
@@ -635,6 +641,8 @@ async fn test_invalid_merkle_proof_rejected() {
             epoch,
             distribution_root: root,
             total_bytes,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .unwrap();
@@ -745,6 +753,8 @@ async fn test_unequal_receipt_distribution() {
             epoch,
             distribution_root: [0xCC; 32],
             total_bytes: 10,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .unwrap();
@@ -934,6 +944,8 @@ async fn test_bandwidth_weighted_settlement() {
             epoch,
             distribution_root: [0xDD; 32],
             total_bytes,
+            groth16_proof: vec![],
+            sp1_public_inputs: vec![],
         })
         .await
         .unwrap();

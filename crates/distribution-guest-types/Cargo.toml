@@ -1,0 +1,9 @@
+[package]
+name = "tunnelcraft-distribution-guest-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }

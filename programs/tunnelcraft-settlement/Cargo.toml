@@ -22,3 +22,4 @@ anchor-spl = { version = "0.32.1", features = ["token", "associated_token"] }
 light-sdk = { version = "0.17.1", features = ["anchor"] }
 light-compressed-account = "0.7.0"
 solana-sha256-hasher = "2.1"
+sp1-solana = { git = "https://github.com/succinctlabs/sp1-solana" }

@@ -14,9 +14,15 @@ pub mod traits;
 #[cfg(feature = "sp1")]
 pub mod sp1;
 
+#[cfg(feature = "sp1")]
+pub mod distribution;
+
 pub use merkle::{hash_pair, merkle_leaf, MerkleProof, MerkleTree};
 pub use stub::StubProver;
 pub use traits::{ProofOutput, Prover, ProverError};
 
 #[cfg(feature = "sp1")]
 pub use sp1::Sp1Prover;
+
+#[cfg(feature = "sp1")]
+pub use distribution::{DistributionProver, DistributionGroth16Proof};

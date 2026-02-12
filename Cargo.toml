@@ -3,6 +3,7 @@ resolver = "2"
 exclude = [
     "programs/tunnelcraft-settlement",
     "crates/prover-guest",
+    "crates/distribution-guest",
 ]
 members = [
     "crates/core",
@@ -23,6 +24,7 @@ members = [
     "crates/aggregator",
     "crates/prover",
     "crates/prover-guest-types",
+    "crates/distribution-guest-types",
     "apps/cli",
     "tests",
 ]
@@ -105,6 +107,7 @@ tunnelcraft-app = { path = "crates/app" }
 tunnelcraft-aggregator = { path = "crates/aggregator" }
 tunnelcraft-prover = { path = "crates/prover" }
 tunnelcraft-prover-guest-types = { path = "crates/prover-guest-types" }
+tunnelcraft-distribution-guest-types = { path = "crates/distribution-guest-types" }
 
 [profile.release]
 overflow-checks = true

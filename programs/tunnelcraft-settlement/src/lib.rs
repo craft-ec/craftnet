@@ -17,6 +17,15 @@ declare_id!("2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH");
 /// Grace period after subscription expires before distribution can be posted (1 day)
 const GRACE_PERIOD_SECS: i64 = 86_400;
 
+/// Distribution guest verification key hash.
+///
+/// Computed by running:
+///   `cargo run -p tunnelcraft-prover --features sp1 --example vkey_hash`
+///
+/// Must be updated whenever the distribution guest program changes.
+/// Placeholder — replace with actual hash after first build.
+const DISTRIBUTION_VKEY_HASH: [u8; 32] = [0u8; 32];
+
 /// Subscription epoch duration (30 days)
 const EPOCH_DURATION_SECS: i64 = 30 * 24 * 3600;
 
@@ -90,12 +99,18 @@ pub mod tunnelcraft_settlement {
     /// Can only be called after the grace period (epoch expired + 1 day).
     /// The aggregator collects ZK-proven summaries from relays and builds
     /// this distribution off-chain.
+    ///
+    /// When `groth16_proof` is non-empty, the proof is verified on-chain
+    /// using `sp1-solana`. The public values (84 bytes) must match the
+    /// instruction arguments (root, total_receipts, user_pubkey, epoch).
     pub fn post_distribution(
         ctx: Context<PostDistributionCtx>,
         _user_pubkey: [u8; 32],
         _epoch: u64,
         distribution_root: [u8; 32],
         total_receipts: u64,
+        groth16_proof: Vec<u8>,
+        sp1_public_inputs: Vec<u8>,
     ) -> Result<()> {
         let subscription = &mut ctx.accounts.subscription_account;
         let clock = Clock::get()?;
@@ -111,6 +126,52 @@ pub mod tunnelcraft_settlement {
             !subscription.distribution_posted,
             SettlementError::DistributionAlreadyPosted,
         );
+
+        // Verify Groth16 proof if provided
+        if !groth16_proof.is_empty() {
+            require!(
+                sp1_public_inputs.len() == 84,
+                SettlementError::InvalidProof,
+            );
+
+            // Verify the SP1 Groth16 proof on-chain
+            sp1_solana::verify_proof(
+                &groth16_proof,
+                &sp1_public_inputs,
+                &DISTRIBUTION_VKEY_HASH,
+                sp1_solana::GROTH16_VK_5_0_0_BYTES,
+            )
+            .map_err(|_| SettlementError::InvalidProof)?;
+
+            // Parse 84-byte public values:
+            //   root (32B) + total_bytes (8B LE) + entry_count (4B LE) + pool_pubkey (32B) + epoch (8B LE)
+            let pi = &sp1_public_inputs;
+            let mut proven_root = [0u8; 32];
+            proven_root.copy_from_slice(&pi[0..32]);
+            let proven_total = u64::from_le_bytes(pi[32..40].try_into().unwrap());
+            // entry_count at pi[40..44] — not checked against instruction args
+            let mut proven_pool = [0u8; 32];
+            proven_pool.copy_from_slice(&pi[44..76]);
+            let proven_epoch = u64::from_le_bytes(pi[76..84].try_into().unwrap());
+
+            // Assert proven values match instruction arguments
+            require!(
+                proven_root == distribution_root,
+                SettlementError::InvalidProof,
+            );
+            require!(
+                proven_total == total_receipts,
+                SettlementError::InvalidProof,
+            );
+            require!(
+                proven_pool == subscription.user_pubkey,
+                SettlementError::InvalidProof,
+            );
+            require!(
+                proven_epoch == subscription.epoch,
+                SettlementError::InvalidProof,
+            );
+        }
 
         subscription.distribution_root = distribution_root;
         subscription.total_receipts = total_receipts;
@@ -559,4 +620,6 @@ pub enum SettlementError {
     AlreadyClaimed,
     #[msg("Light Protocol CPI error")]
     LightCpiError,
+    #[msg("Invalid distribution proof")]
+    InvalidProof,
 }

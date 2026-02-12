@@ -291,6 +291,8 @@ async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
                 epoch,
                 distribution_root: root,
                 total_bytes: relay_bytes,
+                groth16_proof: vec![],
+                sp1_public_inputs: vec![],
             })
             .await?;
         println!("  post_distribution tx: {}", bs58::encode(&tx_sig).into_string());
