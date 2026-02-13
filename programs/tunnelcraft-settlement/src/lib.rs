@@ -24,7 +24,7 @@ const GRACE_PERIOD_SECS: i64 = 30;
 ///
 /// Must be updated whenever the distribution guest program changes.
 /// Placeholder — replace with actual hash after first build.
-const DISTRIBUTION_VKEY_HASH: &str = "0x0096ecd3b7a251ada0363ec42df8b66ab839a1ce18f638be527c34a16ded3bb5";
+const DISTRIBUTION_VKEY_HASH: &str = "0x0066ecec5d94acf91c1ffa5674cc7535a33637ab9c6fd1b9a40cf086805226bf";
 
 pub const LIGHT_CPI_SIGNER: CpiSigner =
     derive_light_cpi_signer!("2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH");
@@ -33,34 +33,28 @@ pub const LIGHT_CPI_SIGNER: CpiSigner =
 pub mod tunnelcraft_settlement {
     use super::*;
 
-    /// Subscribe: User purchases a subscription tier with USDC.
+    /// Subscribe: Any wallet purchases a subscription for an ephemeral pool identity.
     ///
-    /// Creates a UserMeta PDA (if first time), reads `next_epoch`, creates a
-    /// per-epoch SubscriptionAccount PDA and pool token account, transfers USDC
-    /// from payer to pool, then increments `next_epoch`.
+    /// Creates a SubscriptionAccount PDA keyed by `pool_pubkey` (ephemeral key).
+    /// The pool token account holds the USDC payment. No persistent UserMeta —
+    /// each subscription is independent.
     pub fn subscribe(
         ctx: Context<SubscribeCtx>,
-        user_pubkey: [u8; 32],
+        pool_pubkey: [u8; 32],
         tier: u8,
         payment_amount: u64,
-        epoch_duration_secs: u64,
+        duration_secs: u64,
     ) -> Result<()> {
-        require!(epoch_duration_secs >= 60, SettlementError::InvalidEpochDuration);
+        require!(duration_secs >= 60, SettlementError::InvalidDuration);
 
-        let user_meta = &mut ctx.accounts.user_meta;
         let subscription = &mut ctx.accounts.subscription_account;
         let clock = Clock::get()?;
 
-        // Set UserMeta on first init
-        user_meta.user_pubkey = user_pubkey;
-        let epoch = user_meta.next_epoch;
-
         // Init subscription
-        subscription.user_pubkey = user_pubkey;
-        subscription.epoch = epoch;
+        subscription.pool_pubkey = pool_pubkey;
         subscription.tier = tier;
         subscription.created_at = clock.unix_timestamp;
-        subscription.expires_at = clock.unix_timestamp + epoch_duration_secs as i64;
+        subscription.expires_at = clock.unix_timestamp + duration_secs as i64;
         subscription.pool_balance = payment_amount;
         subscription.original_pool_balance = payment_amount;
         subscription.total_receipts = 0;
@@ -80,12 +74,8 @@ pub mod tunnelcraft_settlement {
             payment_amount,
         )?;
 
-        // Increment epoch for next subscription
-        user_meta.next_epoch = epoch + 1;
-
         emit!(Subscribed {
-            user_pubkey,
-            epoch,
+            pool_pubkey,
             tier,
             pool_balance: payment_amount,
             expires_at: subscription.expires_at,
@@ -96,17 +86,16 @@ pub mod tunnelcraft_settlement {
 
     /// Post Distribution: Aggregator posts a Merkle distribution root.
     ///
-    /// Can only be called after the grace period (epoch expired + 1 day).
-    /// The aggregator collects ZK-proven summaries from relays and builds
+    /// Can only be called after the grace period (subscription expired + grace).
+    /// The aggregator collects proven summaries from relays and builds
     /// this distribution off-chain.
     ///
     /// When `groth16_proof` is non-empty, the proof is verified on-chain
-    /// using `sp1-solana`. The public values (84 bytes) must match the
-    /// instruction arguments (root, total_receipts, user_pubkey, epoch).
+    /// using `sp1-solana`. The public values (76 bytes) must match the
+    /// instruction arguments (root, total_receipts, pool_pubkey).
     pub fn post_distribution(
         ctx: Context<PostDistributionCtx>,
-        _user_pubkey: [u8; 32],
-        _epoch: u64,
+        _pool_pubkey: [u8; 32],
         distribution_root: [u8; 32],
         total_receipts: u64,
         groth16_proof: Vec<u8>,
@@ -118,7 +107,7 @@ pub mod tunnelcraft_settlement {
         // Must be past grace period
         require!(
             clock.unix_timestamp >= subscription.expires_at + GRACE_PERIOD_SECS,
-            SettlementError::EpochNotComplete,
+            SettlementError::PoolNotClaimable,
         );
 
         // Must not already have a distribution
@@ -127,51 +116,54 @@ pub mod tunnelcraft_settlement {
             SettlementError::DistributionAlreadyPosted,
         );
 
-        // Verify Groth16 proof if provided
-        if !groth16_proof.is_empty() {
-            require!(
-                sp1_public_inputs.len() == 84,
-                SettlementError::InvalidProof,
-            );
+        // Proof is mandatory — reject empty proof
+        require!(
+            !groth16_proof.is_empty(),
+            SettlementError::ProofRequired,
+        );
+        require!(
+            sp1_public_inputs.len() == 76,
+            SettlementError::InvalidProof,
+        );
 
-            // Verify the SP1 Groth16 proof on-chain
-            sp1_solana::verify_proof(
-                &groth16_proof,
-                &sp1_public_inputs,
-                &DISTRIBUTION_VKEY_HASH,
-                sp1_solana::GROTH16_VK_5_0_0_BYTES,
-            )
-            .map_err(|_| SettlementError::InvalidProof)?;
-
-            // Parse 84-byte public values:
-            //   root (32B) + total_bytes (8B LE) + entry_count (4B LE) + pool_pubkey (32B) + epoch (8B LE)
-            let pi = &sp1_public_inputs;
-            let mut proven_root = [0u8; 32];
-            proven_root.copy_from_slice(&pi[0..32]);
-            let proven_total = u64::from_le_bytes(pi[32..40].try_into().unwrap());
-            // entry_count at pi[40..44] — not checked against instruction args
-            let mut proven_pool = [0u8; 32];
-            proven_pool.copy_from_slice(&pi[44..76]);
-            let proven_epoch = u64::from_le_bytes(pi[76..84].try_into().unwrap());
-
-            // Assert proven values match instruction arguments
-            require!(
-                proven_root == distribution_root,
-                SettlementError::InvalidProof,
-            );
-            require!(
-                proven_total == total_receipts,
-                SettlementError::InvalidProof,
-            );
-            require!(
-                proven_pool == subscription.user_pubkey,
-                SettlementError::InvalidProof,
-            );
-            require!(
-                proven_epoch == subscription.epoch,
-                SettlementError::InvalidProof,
-            );
+        // Verify the SP1 Groth16 proof on-chain
+        msg!("Verifying proof: {} bytes, {} public values, vkey={}", groth16_proof.len(), sp1_public_inputs.len(), &DISTRIBUTION_VKEY_HASH[..18]);
+        match sp1_solana::verify_proof(
+            &groth16_proof,
+            &sp1_public_inputs,
+            &DISTRIBUTION_VKEY_HASH,
+            sp1_solana::GROTH16_VK_5_0_0_BYTES,
+        ) {
+            Ok(()) => msg!("SP1 proof verified successfully"),
+            Err(e) => {
+                msg!("SP1 proof verification failed: {:?}", e);
+                return Err(SettlementError::InvalidProof.into());
+            }
         }
+
+        // Parse 76-byte public values:
+        //   root (32B) + total_bytes (8B LE) + entry_count (4B LE) + pool_pubkey (32B)
+        let pi = &sp1_public_inputs;
+        let mut proven_root = [0u8; 32];
+        proven_root.copy_from_slice(&pi[0..32]);
+        let proven_total = u64::from_le_bytes(pi[32..40].try_into().unwrap());
+        // entry_count at pi[40..44] — not checked against instruction args
+        let mut proven_pool = [0u8; 32];
+        proven_pool.copy_from_slice(&pi[44..76]);
+
+        // Assert proven values match instruction arguments
+        require!(
+            proven_root == distribution_root,
+            SettlementError::InvalidProof,
+        );
+        require!(
+            proven_total == total_receipts,
+            SettlementError::InvalidProof,
+        );
+        require!(
+            proven_pool == subscription.pool_pubkey,
+            SettlementError::InvalidProof,
+        );
 
         subscription.distribution_root = distribution_root;
         subscription.total_receipts = total_receipts;
@@ -179,8 +171,7 @@ pub mod tunnelcraft_settlement {
         subscription.distribution_posted = true;
 
         emit!(DistributionPosted {
-            user_pubkey: subscription.user_pubkey,
-            epoch: subscription.epoch,
+            pool_pubkey: subscription.pool_pubkey,
             total_receipts,
             distribution_root,
         });
@@ -194,14 +185,13 @@ pub mod tunnelcraft_settlement {
     ///
     /// Requires distribution to be posted. Double-claim prevented by
     /// Light Protocol compressed ClaimReceipt (address derived from
-    /// ["claim", user_pubkey, epoch, relay_pubkey] — if it exists,
+    /// ["claim_receipt", pool_pubkey, relay_pubkey] — if it exists,
     /// validity proof fails and tx reverts).
     ///
     /// Payout is USDC transferred from pool token account to relay's token account.
     pub fn claim<'info>(
         ctx: Context<'_, '_, '_, 'info, ClaimCtx<'info>>,
-        user_pubkey: [u8; 32],
-        epoch: u64,
+        pool_pubkey: [u8; 32],
         relay_pubkey: [u8; 32],
         relay_count: u64,
         leaf_index: u32,
@@ -232,7 +222,7 @@ pub mod tunnelcraft_settlement {
         );
 
         // 4. Create compressed ClaimReceipt (Light Protocol)
-        //    Address derived from ["claim_receipt", user_pubkey, epoch, relay_pubkey].
+        //    Address derived from ["claim_receipt", pool_pubkey, relay_pubkey].
         //    If address already exists → non-inclusion validity proof fails → tx reverts.
         let light_proof: ValidityProof = light_params.proof.into();
         let light_tree_info: PackedAddressTreeInfo = light_params.address_tree_info.into();
@@ -248,12 +238,10 @@ pub mod tunnelcraft_settlement {
             .get_tree_pubkey(&light_cpi_accounts)
             .map_err(|_| SettlementError::LightCpiError)?;
 
-        let epoch_le = epoch.to_le_bytes();
         let (address, address_seed) = derive_address(
             &[
                 ClaimReceipt::SEED_PREFIX,
-                user_pubkey.as_ref(),
-                epoch_le.as_ref(),
+                pool_pubkey.as_ref(),
                 relay_pubkey.as_ref(),
             ],
             &address_tree_pubkey,
@@ -269,8 +257,7 @@ pub mod tunnelcraft_settlement {
             light_params.output_tree_index,
         );
         let clock = Clock::get()?;
-        claim_receipt.user_pubkey = user_pubkey;
-        claim_receipt.epoch = epoch;
+        claim_receipt.pool_pubkey = pool_pubkey;
         claim_receipt.relay_pubkey = relay_pubkey;
         claim_receipt.claimed_at = clock.unix_timestamp;
 
@@ -296,8 +283,7 @@ pub mod tunnelcraft_settlement {
 
         // 6. Transfer USDC from pool to relay (PDA-signed)
         let bump = ctx.bumps.subscription_account;
-        let epoch_bytes = epoch.to_le_bytes();
-        let signer_seeds: &[&[u8]] = &[b"sub", user_pubkey.as_ref(), epoch_bytes.as_ref(), &[bump]];
+        let signer_seeds: &[&[u8]] = &[b"pool", pool_pubkey.as_ref(), &[bump]];
 
         token::transfer(
             CpiContext::new_with_signer(
@@ -316,8 +302,7 @@ pub mod tunnelcraft_settlement {
         ctx.accounts.subscription_account.pool_balance = pool_balance.saturating_sub(payout);
 
         emit!(RewardsClaimed {
-            user_pubkey,
-            epoch,
+            pool_pubkey,
             relay_pubkey,
             payout,
         });
@@ -372,7 +357,7 @@ fn verify_merkle_proof(
 // ============================================================================
 
 #[derive(Accounts)]
-#[instruction(user_pubkey: [u8; 32], tier: u8, payment_amount: u64, epoch_duration_secs: u64)]
+#[instruction(pool_pubkey: [u8; 32], tier: u8, payment_amount: u64, duration_secs: u64)]
 pub struct SubscribeCtx<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -380,17 +365,8 @@ pub struct SubscribeCtx<'info> {
     #[account(
         init_if_needed,
         payer = payer,
-        space = 8 + UserMeta::INIT_SPACE,
-        seeds = [b"user", user_pubkey.as_ref()],
-        bump,
-    )]
-    pub user_meta: Account<'info, UserMeta>,
-
-    #[account(
-        init,
-        payer = payer,
         space = 8 + SubscriptionAccount::INIT_SPACE,
-        seeds = [b"sub", user_pubkey.as_ref(), &user_meta.next_epoch.to_le_bytes()],
+        seeds = [b"pool", pool_pubkey.as_ref()],
         bump,
     )]
     pub subscription_account: Account<'info, SubscriptionAccount>,
@@ -401,7 +377,7 @@ pub struct SubscribeCtx<'info> {
 
     /// Pool USDC token account (ATA owned by subscription PDA)
     #[account(
-        init,
+        init_if_needed,
         payer = payer,
         associated_token::mint = usdc_mint,
         associated_token::authority = subscription_account,
@@ -417,28 +393,28 @@ pub struct SubscribeCtx<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(user_pubkey: [u8; 32], epoch: u64)]
+#[instruction(pool_pubkey: [u8; 32])]
 pub struct PostDistributionCtx<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,
 
     #[account(
         mut,
-        seeds = [b"sub", user_pubkey.as_ref(), &epoch.to_le_bytes()],
+        seeds = [b"pool", pool_pubkey.as_ref()],
         bump,
     )]
     pub subscription_account: Account<'info, SubscriptionAccount>,
 }
 
 #[derive(Accounts)]
-#[instruction(user_pubkey: [u8; 32], epoch: u64, relay_pubkey: [u8; 32])]
+#[instruction(pool_pubkey: [u8; 32], relay_pubkey: [u8; 32])]
 pub struct ClaimCtx<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,
 
     #[account(
         mut,
-        seeds = [b"sub", user_pubkey.as_ref(), &epoch.to_le_bytes()],
+        seeds = [b"pool", pool_pubkey.as_ref()],
         bump,
     )]
     pub subscription_account: Account<'info, SubscriptionAccount>,
@@ -468,20 +444,9 @@ pub struct ClaimCtx<'info> {
 
 #[account]
 #[derive(InitSpace)]
-pub struct UserMeta {
-    /// User's ed25519 public key
-    pub user_pubkey: [u8; 32],
-    /// Next epoch to be assigned on subscribe (monotonic counter)
-    pub next_epoch: u64,
-}
-
-#[account]
-#[derive(InitSpace)]
 pub struct SubscriptionAccount {
-    /// User's ed25519 public key
-    pub user_pubkey: [u8; 32],
-    /// Subscription epoch (monotonic per user)
-    pub epoch: u64,
+    /// Ephemeral pool pubkey (subscription identity)
+    pub pool_pubkey: [u8; 32],
     /// Subscription tier (0=Basic, 1=Standard, 2=Premium)
     pub tier: u8,
     /// When subscription was created (unix timestamp)
@@ -504,14 +469,13 @@ pub struct SubscriptionAccount {
 // Compressed Account (Light Protocol)
 // ============================================================================
 
-/// Compressed ClaimReceipt — one per (user, epoch, relay).
-/// Address derived from ["claim_receipt", user_pubkey, epoch_le, relay_pubkey].
+/// Compressed ClaimReceipt — one per (pool, relay).
+/// Address derived from ["claim_receipt", pool_pubkey, relay_pubkey].
 /// If a relay already claimed, the address exists, non-inclusion proof fails,
 /// and the transaction reverts — preventing double-claims.
 #[derive(Clone, Debug, Default, LightDiscriminator, AnchorSerialize, AnchorDeserialize)]
 pub struct ClaimReceipt {
-    pub user_pubkey: [u8; 32],
-    pub epoch: u64,
+    pub pool_pubkey: [u8; 32],
     pub relay_pubkey: [u8; 32],
     pub claimed_at: i64,
 }
@@ -575,8 +539,7 @@ pub struct LightClaimParams {
 
 #[event]
 pub struct Subscribed {
-    pub user_pubkey: [u8; 32],
-    pub epoch: u64,
+    pub pool_pubkey: [u8; 32],
     pub tier: u8,
     pub pool_balance: u64,
     pub expires_at: i64,
@@ -584,16 +547,14 @@ pub struct Subscribed {
 
 #[event]
 pub struct DistributionPosted {
-    pub user_pubkey: [u8; 32],
-    pub epoch: u64,
+    pub pool_pubkey: [u8; 32],
     pub total_receipts: u64,
     pub distribution_root: [u8; 32],
 }
 
 #[event]
 pub struct RewardsClaimed {
-    pub user_pubkey: [u8; 32],
-    pub epoch: u64,
+    pub pool_pubkey: [u8; 32],
     pub relay_pubkey: [u8; 32],
     pub payout: u64,
 }
@@ -604,9 +565,9 @@ pub struct RewardsClaimed {
 
 #[error_code]
 pub enum SettlementError {
-    #[msg("Epoch not complete — wait for grace period")]
-    EpochNotComplete,
-    #[msg("Distribution already posted for this epoch")]
+    #[msg("Pool not claimable — wait for grace period")]
+    PoolNotClaimable,
+    #[msg("Distribution already posted for this pool")]
     DistributionAlreadyPosted,
     #[msg("Distribution not yet posted")]
     DistributionNotPosted,
@@ -620,8 +581,10 @@ pub enum SettlementError {
     AlreadyClaimed,
     #[msg("Light Protocol CPI error")]
     LightCpiError,
+    #[msg("Distribution proof is required")]
+    ProofRequired,
     #[msg("Invalid distribution proof")]
     InvalidProof,
-    #[msg("Epoch duration must be at least 60 seconds")]
-    InvalidEpochDuration,
+    #[msg("Duration must be at least 60 seconds")]
+    InvalidDuration,
 }

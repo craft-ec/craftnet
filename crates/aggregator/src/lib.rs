@@ -50,7 +50,6 @@ pub enum HistoryEvent {
 relay_pubkey: [u8; 32],
 pool_pubkey: [u8; 32],
         pool_type: PoolType,
-        epoch: u64,
         batch_bytes: u64,
         cumulative_bytes: u64,
 prev_root: [u8; 32],
@@ -61,7 +60,6 @@ new_root: [u8; 32],
     DistributionBuilt {
 user_pubkey: [u8; 32],
         pool_type: PoolType,
-        epoch: u64,
 distribution_root: [u8; 32],
         total_bytes: u64,
         num_relays: usize,
@@ -69,7 +67,6 @@ distribution_root: [u8; 32],
     /// A distribution was posted on-chain
     DistributionPosted {
 user_pubkey: [u8; 32],
-        epoch: u64,
 distribution_root: [u8; 32],
         total_bytes: u64,
     },
@@ -173,7 +170,7 @@ pub struct NetworkStats {
 }
 
 /// Key identifying a single relay's proof chain within a pool.
-type ChainKey = (PublicKey, PublicKey, PoolType, u64); // (relay, pool, pool_type, epoch)
+type ChainKey = (PublicKey, PublicKey, PoolType); // (relay, pool, pool_type)
 
 // === Persistence types (private, for JSON serialization) ===
 
@@ -200,16 +197,16 @@ struct ProofClaimState {
 #[derive(Serialize, Deserialize)]
 struct PostedEntry {
     user_pubkey: String,
-    epoch: u64,
+
 }
 
-/// Format a pool key as "hex_pubkey:PoolType:epoch"
-fn format_pool_key(pubkey: &PublicKey, pool_type: &PoolType, epoch: u64) -> String {
-    format!("{}:{:?}:{}", hex::encode(pubkey), pool_type, epoch)
+/// Format a pool key as "hex_pubkey:PoolType"
+fn format_pool_key(pubkey: &PublicKey, pool_type: &PoolType) -> String {
+    format!("{}:{:?}", hex::encode(pubkey), pool_type)
 }
 
-/// Parse a pool key from "hex_pubkey:PoolType:epoch"
-fn parse_pool_key(s: &str) -> Option<(PublicKey, PoolType, u64)> {
+/// Parse a pool key from "hex_pubkey:PoolType"
+fn parse_pool_key(s: &str) -> Option<(PublicKey, PoolType)> {
     let parts: Vec<&str> = s.splitn(3, ':').collect();
     if parts.len() < 2 { return None; }
     let bytes = hex::decode(parts[0]).ok()?;
@@ -221,23 +218,18 @@ fn parse_pool_key(s: &str) -> Option<(PublicKey, PoolType, u64)> {
         "Free" => PoolType::Free,
         _ => return None,
     };
-    let epoch = if parts.len() == 3 {
-        parts[2].parse::<u64>().unwrap_or(0)
-    } else {
-        0
-    };
-    Some((pubkey, pool_type, epoch))
+    Some((pubkey, pool_type))
 }
 
-/// Format a chain key as "hex_relay:hex_pool:PoolType:epoch"
-fn format_chain_key(relay: &PublicKey, pool: &PublicKey, pool_type: &PoolType, epoch: u64) -> String {
-    format!("{}:{}:{:?}:{}", hex::encode(relay), hex::encode(pool), pool_type, epoch)
+/// Format a chain key as "hex_relay:hex_pool:PoolType"
+fn format_chain_key(relay: &PublicKey, pool: &PublicKey, pool_type: &PoolType) -> String {
+    format!("{}:{}:{:?}", hex::encode(relay), hex::encode(pool), pool_type)
 }
 
-/// Parse a chain key from "hex_relay:hex_pool:PoolType:epoch"
+/// Parse a chain key from "hex_relay:hex_pool:PoolType"
 fn parse_chain_key(s: &str) -> Option<ChainKey> {
-    let parts: Vec<&str> = s.splitn(4, ':').collect();
-    if parts.len() < 4 { return None; }
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() < 3 { return None; }
     let relay_bytes = hex::decode(parts[0]).ok()?;
     let pool_bytes = hex::decode(parts[1]).ok()?;
     if relay_bytes.len() != 32 || pool_bytes.len() != 32 { return None; }
@@ -250,24 +242,23 @@ fn parse_chain_key(s: &str) -> Option<ChainKey> {
         "Free" => PoolType::Free,
         _ => return None,
     };
-    let epoch = parts[3].parse::<u64>().unwrap_or(0);
-    Some((relay, pool, pool_type, epoch))
+    Some((relay, pool, pool_type))
 }
 
 /// The aggregator service
 ///
 /// Collects ZK-proven summaries from relays via gossipsub, builds
-/// Merkle distributions per pool per epoch, and provides query APIs.
+/// Merkle distributions per pool, and provides query APIs.
 ///
 /// Out-of-order proofs are buffered and replayed when the missing link
 /// arrives — like blockchain block buffering for orphan blocks.
 pub struct Aggregator {
-    /// Per (user, pool_type, epoch): relay → latest cumulative proof
-    pools: HashMap<(PublicKey, PoolType, u64), PoolTracker>,
+    /// Per (user, pool_type): relay → latest cumulative proof
+    pools: HashMap<(PublicKey, PoolType), PoolTracker>,
     /// Pluggable prover for ZK proof verification
     prover: Box<dyn Prover>,
     /// Out-of-order proofs waiting for their prev_root to appear.
-    /// Keyed by (relay, pool, pool_type, epoch) → queue of proofs ordered by arrival.
+    /// Keyed by (relay, pool, pool_type) → queue of proofs ordered by arrival.
     pending: HashMap<ChainKey, VecDeque<ProofMessage>>,
     /// Total count of pending proofs across all chains (for global cap).
     pending_total: usize,
@@ -300,7 +291,7 @@ impl Aggregator {
         Self::verify_proof(&*self.prover, &msg)?;
 
         // Try to apply. If out-of-order, buffer it.
-        let chain_key = (msg.relay_pubkey, msg.pool_pubkey, msg.pool_type, msg.epoch);
+        let chain_key = (msg.relay_pubkey, msg.pool_pubkey, msg.pool_type);
         match self.try_apply_proof(&msg) {
             Ok(()) => {
                 // Success — drain any pending proofs that now chain from this one
@@ -389,7 +380,7 @@ impl Aggregator {
     /// Returns `ChainBreak` if prev_root doesn't match (caller decides
     /// whether to buffer or reject).
     fn try_apply_proof(&mut self, msg: &ProofMessage) -> Result<(), AggregatorError> {
-        let pool_key = (msg.pool_pubkey, msg.pool_type, msg.epoch);
+        let pool_key = (msg.pool_pubkey, msg.pool_type);
         let pool = self.pools.entry(pool_key).or_insert_with(|| PoolTracker {
             relay_claims: HashMap::new(),
         });
@@ -434,7 +425,7 @@ impl Aggregator {
             relay_pubkey: msg.relay_pubkey,
             pool_pubkey: msg.pool_pubkey,
             pool_type: msg.pool_type,
-            epoch: msg.epoch,
+
             batch_bytes: msg.batch_bytes,
             cumulative_bytes: msg.cumulative_bytes,
             prev_root: msg.prev_root,
@@ -459,10 +450,10 @@ impl Aggregator {
     /// chain head. Any buffered proof whose `prev_root` matches can now
     /// be applied, which may in turn unblock further pending proofs.
     fn drain_pending(&mut self, chain_key: ChainKey) {
-        let (relay, pool, pool_type, epoch) = chain_key;
+        let (relay, pool, pool_type) = chain_key;
         loop {
             // Get current chain head
-            let pool_key = (pool, pool_type, epoch);
+            let pool_key = (pool, pool_type);
             let current_root = match self.pools.get(&pool_key)
                 .and_then(|t| t.relay_claims.get(&relay))
             {
@@ -509,11 +500,11 @@ impl Aggregator {
         }
     }
 
-    /// Build a Merkle distribution for a pool+epoch.
+    /// Build a Merkle distribution for a pool.
     ///
     /// Returns the distribution root and entries that can be posted
     /// on-chain via `post_distribution()`.
-    pub fn build_distribution(&self, pool_key: &(PublicKey, PoolType, u64)) -> Option<Distribution> {
+    pub fn build_distribution(&self, pool_key: &(PublicKey, PoolType)) -> Option<Distribution> {
         let tracker = self.pools.get(pool_key)?;
 
         let mut entries: Vec<(PublicKey, u64)> = tracker.relay_claims.iter()
@@ -549,8 +540,8 @@ impl Aggregator {
     // Query APIs
     // =========================================================================
 
-    /// Get per-relay usage breakdown for a specific pool+epoch
-    pub fn get_pool_usage(&self, pool_key: &(PublicKey, PoolType, u64)) -> Vec<(PublicKey, u64)> {
+    /// Get per-relay usage breakdown for a specific pool
+    pub fn get_pool_usage(&self, pool_key: &(PublicKey, PoolType)) -> Vec<(PublicKey, u64)> {
         self.pools.get(pool_key)
             .map(|tracker| {
                 tracker.relay_claims.iter()
@@ -561,7 +552,7 @@ impl Aggregator {
     }
 
     /// Get per-pool breakdown for a specific relay
-    pub fn get_relay_stats(&self, relay: &PublicKey) -> Vec<((PublicKey, PoolType, u64), u64)> {
+    pub fn get_relay_stats(&self, relay: &PublicKey) -> Vec<((PublicKey, PoolType), u64)> {
         self.pools.iter()
             .filter_map(|(pool_key, tracker)| {
                 tracker.relay_claims.get(relay)
@@ -570,7 +561,7 @@ impl Aggregator {
             .collect()
     }
 
-    /// Get a relay's latest chain state for a specific pool+epoch.
+    /// Get a relay's latest chain state for a specific pool.
     ///
     /// Used for chain recovery: a relay that lost its proof state can query
     /// any aggregator for its latest root and cumulative count. This is
@@ -579,7 +570,7 @@ impl Aggregator {
     pub fn get_relay_state(
         &self,
         relay: &PublicKey,
-        pool_key: &(PublicKey, PoolType, u64),
+        pool_key: &(PublicKey, PoolType),
     ) -> Option<([u8; 32], u64)> {
         self.pools.get(pool_key)
             .and_then(|tracker| tracker.relay_claims.get(relay))
@@ -591,7 +582,7 @@ impl Aggregator {
         let mut stats = NetworkStats::default();
         let mut all_relays: std::collections::HashSet<PublicKey> = std::collections::HashSet::new();
 
-        for ((_, pool_type, _), tracker) in &self.pools {
+        for ((_, pool_type), tracker) in &self.pools {
             stats.active_pools += 1;
             for (relay, claim) in &tracker.relay_claims {
                 all_relays.insert(*relay);
@@ -611,7 +602,7 @@ impl Aggregator {
     pub fn get_free_tier_stats(&self) -> Vec<(PublicKey, u64)> {
         let mut relay_totals: HashMap<PublicKey, u64> = HashMap::new();
 
-        for ((_, pool_type, _), tracker) in &self.pools {
+        for ((_, pool_type), tracker) in &self.pools {
             if *pool_type == PoolType::Free {
                 for (relay, claim) in &tracker.relay_claims {
                     *relay_totals.entry(*relay).or_default() += claim.cumulative_bytes;
@@ -631,7 +622,6 @@ impl Aggregator {
         &mut self,
         user_pubkey: [u8; 32],
         pool_type: PoolType,
-        epoch: u64,
         distribution_root: [u8; 32],
         total_bytes: u64,
         num_relays: usize,
@@ -639,7 +629,6 @@ impl Aggregator {
         self.history.append(HistoryEvent::DistributionBuilt {
             user_pubkey,
             pool_type,
-            epoch,
             distribution_root,
             total_bytes,
             num_relays,
@@ -650,13 +639,11 @@ impl Aggregator {
     pub fn record_distribution_posted(
         &mut self,
         user_pubkey: [u8; 32],
-        epoch: u64,
         distribution_root: [u8; 32],
         total_bytes: u64,
     ) {
         self.history.append(HistoryEvent::DistributionPosted {
             user_pubkey,
-            epoch,
             distribution_root,
             total_bytes,
         });
@@ -714,11 +701,11 @@ impl Aggregator {
     }
 
     /// Get a specific pool's bandwidth history.
-    /// Returns `(timestamp, batch_bytes, cumulative_bytes)` for the pool+epoch.
+    /// Returns `(timestamp, batch_bytes, cumulative_bytes)` for the pool.
     pub fn get_pool_history(
         path: &Path,
         pool: &PublicKey,
-        epoch: u64,
+
         from_ts: u64,
         to_ts: u64,
     ) -> Vec<(u64, u64, u64)> {
@@ -727,8 +714,8 @@ impl Aggregator {
             .into_iter()
             .filter_map(move |e| match e.event {
                 HistoryEvent::ProofAccepted {
-                    pool_pubkey, epoch: ev_epoch, batch_bytes, cumulative_bytes, proof_timestamp, ..
-                } if pool_pubkey == pool && ev_epoch == epoch => {
+                    pool_pubkey, batch_bytes, cumulative_bytes, proof_timestamp, ..
+                } if pool_pubkey == pool => {
                     Some((proof_timestamp, batch_bytes, cumulative_bytes))
                 }
                 _ => None,
@@ -845,10 +832,10 @@ impl Aggregator {
     /// Save aggregator state + posted_distributions to a JSON file.
     ///
     /// Uses atomic write (tmp + rename) to prevent corruption.
-    pub fn save_to_file(&self, path: &Path, posted: &HashSet<([u8; 32], u64)>) {
+    pub fn save_to_file(&self, path: &Path, posted: &HashSet<[u8; 32]>) {
         let mut pools_map = HashMap::new();
-        for ((pubkey, pool_type, epoch), tracker) in &self.pools {
-            let key = format_pool_key(pubkey, pool_type, *epoch);
+        for ((pubkey, pool_type), tracker) in &self.pools {
+            let key = format_pool_key(pubkey, pool_type);
             let mut relay_claims = HashMap::new();
             for (relay, claim) in &tracker.relay_claims {
                 relay_claims.insert(hex::encode(relay), ProofClaimState {
@@ -861,14 +848,13 @@ impl Aggregator {
         }
 
         let mut pending_map = HashMap::new();
-        for ((relay, pool, pool_type, epoch), queue) in &self.pending {
-            let key = format_chain_key(relay, pool, pool_type, *epoch);
+        for ((relay, pool, pool_type), queue) in &self.pending {
+            let key = format_chain_key(relay, pool, pool_type);
             pending_map.insert(key, queue.iter().cloned().collect::<Vec<_>>());
         }
 
-        let posted_entries: Vec<PostedEntry> = posted.iter().map(|(pubkey, epoch)| PostedEntry {
+        let posted_entries: Vec<PostedEntry> = posted.iter().map(|pubkey| PostedEntry {
             user_pubkey: hex::encode(pubkey),
-            epoch: *epoch,
         }).collect();
 
         let state_file = AggregatorStateFile {
@@ -910,7 +896,7 @@ impl Aggregator {
     pub fn load_from_file(
         path: &Path,
         prover: Box<dyn Prover>,
-    ) -> Result<(Self, HashSet<([u8; 32], u64)>), std::io::Error> {
+    ) -> Result<(Self, HashSet<[u8; 32]>), std::io::Error> {
         let contents = std::fs::read_to_string(path)?;
         let state_file: AggregatorStateFile = serde_json::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -952,7 +938,7 @@ impl Aggregator {
             if bytes.len() != 32 { continue; }
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&bytes);
-            posted.insert((pubkey, entry.epoch));
+            posted.insert(pubkey);
         }
 
         info!(
@@ -975,27 +961,27 @@ impl Aggregator {
         Ok((agg, posted))
     }
 
-    /// Return deduplicated (user_pubkey, epoch) pairs from tracked pools.
+    /// Return deduplicated user_pubkeys from tracked pools.
     ///
     /// Used by the node to batch-query on-chain subscription status
     /// for reconciliation after loading from disk.
-    pub fn pool_keys_for_reconciliation(&self) -> Vec<(PublicKey, u64)> {
+    pub fn pool_keys_for_reconciliation(&self) -> Vec<PublicKey> {
         let mut seen = HashSet::new();
-        for (pubkey, _pool_type, epoch) in self.pools.keys() {
-            seen.insert((*pubkey, *epoch));
+        for (pubkey, _pool_type) in self.pools.keys() {
+            seen.insert(*pubkey);
         }
         seen.into_iter().collect()
     }
 
     /// Get all pool keys (both Subscribed and Free)
-    pub fn all_pool_keys(&self) -> Vec<(PublicKey, PoolType, u64)> {
+    pub fn all_pool_keys(&self) -> Vec<(PublicKey, PoolType)> {
         self.pools.keys().cloned().collect()
     }
 
-    /// Get all subscribed pools (for epoch-end distribution posting)
-    pub fn subscribed_pools(&self) -> Vec<(PublicKey, PoolType, u64)> {
+    /// Get all subscribed pools (for distribution posting)
+    pub fn subscribed_pools(&self) -> Vec<(PublicKey, PoolType)> {
         self.pools.iter()
-            .filter(|((_, pool_type, _), _)| *pool_type == PoolType::Subscribed)
+            .filter(|((_, pool_type), _)| *pool_type == PoolType::Subscribed)
             .map(|(pool_key, _)| *pool_key)
             .collect()
     }
@@ -1038,17 +1024,16 @@ mod tests {
     }
 
     fn make_proof(relay: u8, pool: u8, pool_type: PoolType, batch: u64, cumulative: u64, prev_root: [u8; 32], new_root: [u8; 32]) -> ProofMessage {
-        make_proof_epoch(relay, pool, pool_type, 0, batch, cumulative, prev_root, new_root)
+        make_proof_epoch(relay, pool, pool_type, batch, cumulative, prev_root, new_root)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn make_proof_epoch(relay: u8, pool: u8, pool_type: PoolType, epoch: u64, batch: u64, cumulative: u64, prev_root: [u8; 32], new_root: [u8; 32]) -> ProofMessage {
+    fn make_proof_epoch(relay: u8, pool: u8, pool_type: PoolType, batch: u64, cumulative: u64, prev_root: [u8; 32], new_root: [u8; 32]) -> ProofMessage {
         let keypair = tunnelcraft_crypto::SigningKeypair::from_secret_bytes(&[relay; 32]);
         let mut msg = ProofMessage {
             relay_pubkey: keypair.public_key_bytes(),
             pool_pubkey: [pool; 32],
             pool_type,
-            epoch,
             batch_bytes: batch,
             cumulative_bytes: cumulative,
             prev_root,
@@ -1080,7 +1065,7 @@ mod tests {
         agg.handle_proof(msg).unwrap();
 
         assert_eq!(agg.pool_count(), 1);
-        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed));
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].1, 100);
     }
@@ -1097,7 +1082,7 @@ mod tests {
         let msg2 = make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xAA; 32], [0xBB; 32]);
         agg.handle_proof(msg2).unwrap();
 
-        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed));
         assert_eq!(usage[0].1, 150);
     }
 
@@ -1117,13 +1102,13 @@ mod tests {
 
         // Deliver batch 3 before batch 2 (out of order) — should be buffered
         agg.handle_proof(msg3).unwrap();
-        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed));
         assert_eq!(usage[0].1, 100); // Only batch 1 applied
 
         // Now deliver batch 2 — should apply batch 2 then auto-replay batch 3
         agg.handle_proof(msg2).unwrap();
 
-        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed));
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].1, 350); // All three batches applied
     }
@@ -1145,7 +1130,7 @@ mod tests {
         agg.handle_proof(msg3).unwrap(); // buffered (needs [0xBB])
         agg.handle_proof(msg2).unwrap(); // applied (needs [0xAA] ✓) → drains msg3 → drains msg4
 
-        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed));
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].1, 450); // All four batches applied
     }
@@ -1162,7 +1147,7 @@ mod tests {
         agg.handle_proof(msg_bad).unwrap(); // buffered, not rejected
 
         // Relay's claim stays at batch 1
-        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed));
         assert_eq!(usage[0].1, 100);
     }
 
@@ -1188,7 +1173,7 @@ mod tests {
         agg.handle_proof(msg1).unwrap();
         agg.handle_proof(msg2).unwrap();
 
-        let usage = agg.get_pool_usage(&([10u8; 32], PoolType::Subscribed, 0));
+        let usage = agg.get_pool_usage(&([10u8; 32], PoolType::Subscribed));
         assert_eq!(usage.len(), 2);
 
         let total: u64 = usage.iter().map(|(_, c)| c).sum();
@@ -1204,7 +1189,7 @@ mod tests {
         agg.handle_proof(msg1).unwrap();
         agg.handle_proof(msg2).unwrap();
 
-        let dist = agg.build_distribution(&([10u8; 32], PoolType::Subscribed, 0)).unwrap();
+        let dist = agg.build_distribution(&([10u8; 32], PoolType::Subscribed)).unwrap();
         assert_eq!(dist.total, 100);
         assert_eq!(dist.entries.len(), 2);
         assert_ne!(dist.root, [0u8; 32]);
@@ -1213,7 +1198,7 @@ mod tests {
     #[test]
     fn test_build_distribution_empty_pool() {
         let agg = new_agg();
-        assert!(agg.build_distribution(&([99u8; 32], PoolType::Subscribed, 0)).is_none());
+        assert!(agg.build_distribution(&([99u8; 32], PoolType::Subscribed)).is_none());
     }
 
     #[test]
@@ -1225,7 +1210,7 @@ mod tests {
         agg.handle_proof(msg1).unwrap();
         agg.handle_proof(msg2).unwrap();
 
-        let pool_key = ([10u8; 32], PoolType::Subscribed, 0);
+        let pool_key = ([10u8; 32], PoolType::Subscribed);
         let dist1 = agg.build_distribution(&pool_key).unwrap();
         let dist2 = agg.build_distribution(&pool_key).unwrap();
         assert_eq!(dist1.root, dist2.root);
@@ -1288,7 +1273,6 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].0, [10u8; 32]);
         assert_eq!(pools[0].1, PoolType::Subscribed);
-        assert_eq!(pools[0].2, 0);
     }
 
     #[test]
@@ -1299,7 +1283,7 @@ mod tests {
         agg.handle_proof(msg).unwrap();
 
         let relay = relay_pubkey(1);
-        let pool_key = ([2u8; 32], PoolType::Subscribed, 0);
+        let pool_key = ([2u8; 32], PoolType::Subscribed);
 
         let state = agg.get_relay_state(&relay, &pool_key).unwrap();
         assert_eq!(state.0, [0xAA; 32]); // root
@@ -1319,11 +1303,11 @@ mod tests {
 
         assert_eq!(agg.pool_count(), 2);
 
-        let sub_usage = agg.get_pool_usage(&([10u8; 32], PoolType::Subscribed, 0));
+        let sub_usage = agg.get_pool_usage(&([10u8; 32], PoolType::Subscribed));
         assert_eq!(sub_usage.len(), 1);
         assert_eq!(sub_usage[0].1, 70);
 
-        let free_usage = agg.get_pool_usage(&([10u8; 32], PoolType::Free, 0));
+        let free_usage = agg.get_pool_usage(&([10u8; 32], PoolType::Free));
         assert_eq!(free_usage.len(), 1);
         assert_eq!(free_usage[0].1, 30);
     }
@@ -1417,13 +1401,13 @@ mod tests {
         let (dir, path) = history_tmp("dist-events");
 
         agg.record_distribution_built(
-            [10u8; 32], PoolType::Subscribed, 1,
+            [10u8; 32], PoolType::Subscribed,
             [0xDD; 32], 1000, 5,
         );
         assert_eq!(agg.history_height(), 1);
 
         agg.record_distribution_posted(
-            [10u8; 32], 1, [0xDD; 32], 1000,
+            [10u8; 32], [0xDD; 32], 1000,
         );
         assert_eq!(agg.history_height(), 2);
 
@@ -1493,7 +1477,7 @@ mod tests {
         agg.handle_proof(make_proof(1, 20, PoolType::Free, 50, 50, [0u8; 32], [0xCC; 32])).unwrap();
         agg.flush_history(&path);
 
-        let history = Aggregator::get_pool_history(&path, &[10u8; 32], 0, 0, u64::MAX);
+        let history = Aggregator::get_pool_history(&path, &[10u8; 32], 0, u64::MAX);
         assert_eq!(history.len(), 2);
 
         history_cleanup(&dir, &path);
@@ -1540,7 +1524,7 @@ mod tests {
         assert_eq!(agg2.history_height(), 2);
 
         // New entries continue from seq 2
-        agg2.record_distribution_built([10u8; 32], PoolType::Subscribed, 1, [0xDD; 32], 1000, 5);
+        agg2.record_distribution_built([10u8; 32], PoolType::Subscribed, [0xDD; 32], 1000, 5);
         assert_eq!(agg2.history_height(), 3);
 
         // Flush new entries — they append to existing file
@@ -1570,7 +1554,6 @@ mod tests {
                 relay_pubkey: [0xAB; 32],
                 pool_pubkey: [0xCD; 32],
                 pool_type: PoolType::Subscribed,
-                epoch: 12,
                 batch_bytes: 3_145_728,
                 cumulative_bytes: 1_073_741_824,
                 prev_root: [0xEE; 32],

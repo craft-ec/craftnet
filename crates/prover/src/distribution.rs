@@ -28,7 +28,7 @@ const DISTRIBUTION_ELF: &[u8] = include_elf!("tunnelcraft-distribution-guest");
 pub struct DistributionGroth16Proof {
     /// Raw Groth16 proof bytes (~256 bytes)
     pub proof_bytes: Vec<u8>,
-    /// Public values committed by the guest (84 bytes fixed layout)
+    /// Public values committed by the guest (76 bytes fixed layout)
     pub public_values: Vec<u8>,
     /// Verification key hash ("0x..." hex string)
     pub vkey_hash: String,
@@ -64,12 +64,11 @@ impl DistributionProver {
     /// 1. Entries were sorted by relay_pubkey
     /// 2. Merkle tree was correctly built (matching off-chain `MerkleTree`)
     /// 3. Total bytes and entry count are correct
-    /// 4. Pool pubkey and epoch are bound to the proof
+    /// 4. Pool pubkey is bound to the proof
     pub fn prove_distribution(
         &self,
         entries: &[([u8; 32], u64)],
         pool_pubkey: [u8; 32],
-        epoch: u64,
     ) -> Result<DistributionGroth16Proof, String> {
         if entries.is_empty() {
             return Err("empty distribution entries".to_string());
@@ -78,14 +77,12 @@ impl DistributionProver {
         let input = DistributionInput {
             entries: entries.to_vec(),
             pool_pubkey,
-            epoch,
         };
 
         info!(
-            "Starting distribution Groth16 prove for {} entries, pool={}, epoch={}",
+            "Starting distribution Groth16 prove for {} entries, pool={}",
             entries.len(),
             hex::encode(&pool_pubkey[..8]),
-            epoch,
         );
 
         let t0 = std::time::Instant::now();
@@ -102,8 +99,7 @@ impl DistributionProver {
             .map_err(|e| format!("Distribution Groth16 prove failed: {}", e))?;
 
         let public_values = proof.public_values.as_slice().to_vec();
-        let proof_bytes = bincode::serialize(&proof.proof)
-            .map_err(|e| format!("failed to serialize Groth16 proof: {}", e))?;
+        let proof_bytes = proof.bytes();
 
         let vkey_hash = vk.bytes32();
 

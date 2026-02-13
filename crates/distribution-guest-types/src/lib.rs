@@ -20,8 +20,6 @@ pub struct DistributionInput {
     pub entries: Vec<([u8; 32], u64)>,
     /// Pool pubkey (subscription account)
     pub pool_pubkey: [u8; 32],
-    /// Epoch this distribution covers
-    pub epoch: u64,
 }
 
 /// Output committed by the distribution guest program.
@@ -39,6 +37,4 @@ pub struct DistributionOutput {
     pub entry_count: u32,
     /// Pool pubkey (passed through for binding)
     pub pool_pubkey: [u8; 32],
-    /// Epoch (passed through for binding)
-    pub epoch: u64,
 }

@@ -7,7 +7,7 @@ use sha2::{Sha256, Digest};
 
 use tunnelcraft_core::{
     Shard, Id, PublicKey, ExitPayload, ShardType, OnionSettlement,
-    compute_blind_token, lease_set::LeaseSet,
+    lease_set::LeaseSet,
 };
 use tunnelcraft_crypto::{
     SigningKeypair, build_onion_header, encrypt_exit_payload, encrypt_routing_tag,
@@ -85,7 +85,7 @@ impl RequestBuilder {
     /// * `exit` - Exit node hop info (pubkey + encryption key)
     /// * `paths` - Per-shard onion paths (one per shard, or round-robin)
     /// * `lease_set` - LeaseSet for response routing
-    /// * `epoch` - Current settlement epoch
+    /// * `pool_pubkey` - Ephemeral subscription key or persistent free-tier key
     ///
     /// # Returns
     /// * `(request_id, Vec<Shard>)` — request ID and shards ready to send
@@ -95,10 +95,9 @@ impl RequestBuilder {
         exit: &PathHop,
         paths: &[OnionPath],
         lease_set: &LeaseSet,
-        epoch: u64,
         pool_pubkey: PublicKey,
     ) -> Result<(Id, Vec<Shard>)> {
-        self.build_onion_with_enc_key(keypair, exit, paths, lease_set, epoch, [0u8; 32], pool_pubkey)
+        self.build_onion_with_enc_key(keypair, exit, paths, lease_set, [0u8; 32], pool_pubkey)
     }
 
     /// Build onion-routed request shards with an explicit X25519 encryption pubkey
@@ -109,7 +108,6 @@ impl RequestBuilder {
         exit: &PathHop,
         paths: &[OnionPath],
         lease_set: &LeaseSet,
-        epoch: u64,
         response_enc_pubkey: [u8; 32],
         pool_pubkey: PublicKey,
     ) -> Result<(Id, Vec<Shard>)> {
@@ -117,15 +115,10 @@ impl RequestBuilder {
         let assembly_id = random_id();
         let user_pubkey = keypair.public_key_bytes();
 
-        // Compute user_proof
-        let sig = tunnelcraft_crypto::sign_data(keypair, &request_id);
-        let user_proof = compute_user_proof(&request_id, &user_pubkey, &sig);
-
         // Build ExitPayload
         let exit_payload = ExitPayload {
             request_id,
             user_pubkey,
-            user_proof,
             lease_set: lease_set.clone(),
             total_hops: paths.first().map(|p| p.hops.len() as u8).unwrap_or(0),
             shard_type: ShardType::Request,
@@ -165,15 +158,12 @@ impl RequestBuilder {
                     &paths[i % paths.len()]
                 };
 
-                // Build per-hop settlement data with unique shard_id and blind_token per relay
+                // Build per-hop settlement data with unique shard_id per relay
                 let settlement: Vec<OnionSettlement> = path.hops.iter().map(|hop| {
                     let shard_id = generate_shard_id(&request_id, chunk_index, i as u8, &hop.signing_pubkey);
-                    let blind_token = compute_blind_token(&user_proof, &shard_id, &hop.signing_pubkey);
                     OnionSettlement {
-                        blind_token,
                         shard_id,
                         payload_size: payload.len() as u32,
-                        epoch,
                         pool_pubkey,
                     }
                 }).collect();
@@ -211,18 +201,6 @@ impl RequestBuilder {
 
         Ok((request_id, shards))
     }
-}
-
-/// Compute user_proof = SHA256(request_id || user_pubkey || signature)
-pub fn compute_user_proof(request_id: &Id, user_pubkey: &PublicKey, sig: &[u8; 64]) -> Id {
-    let mut hasher = Sha256::new();
-    hasher.update(request_id);
-    hasher.update(user_pubkey);
-    hasher.update(sig);
-    let result = hasher.finalize();
-    let mut proof = [0u8; 32];
-    proof.copy_from_slice(&result);
-    proof
 }
 
 /// Generate a per-hop unique shard ID: SHA256(request_id || "shard" || chunk_index || shard_index || relay_pubkey)
@@ -286,7 +264,6 @@ mod tests {
             &exit,
             &[], // direct mode
             &lease_set,
-            42,
             [0u8; 32],
         ).unwrap();
 
@@ -338,21 +315,4 @@ mod tests {
         assert_ne!(id_a, id_b, "Same shard for different relays should have different shard_ids");
     }
 
-    #[test]
-    fn test_user_proof_deterministic() {
-        let request_id = [1u8; 32];
-        let user_pubkey = [2u8; 32];
-        let sig = [3u8; 64];
-
-        let proof1 = compute_user_proof(&request_id, &user_pubkey, &sig);
-        let proof2 = compute_user_proof(&request_id, &user_pubkey, &sig);
-        assert_eq!(proof1, proof2);
-    }
-
-    #[test]
-    fn test_user_proof_different_inputs() {
-        let proof1 = compute_user_proof(&[1u8; 32], &[2u8; 32], &[3u8; 64]);
-        let proof2 = compute_user_proof(&[4u8; 32], &[2u8; 32], &[3u8; 64]);
-        assert_ne!(proof1, proof2);
-    }
 }

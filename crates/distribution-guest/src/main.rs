@@ -37,13 +37,12 @@ pub fn main() {
     let root = merkle_root(&leaves);
 
     // 4. Commit output fields individually for predictable byte layout
-    //    root (32B) + total_bytes (8B LE) + entry_count (4B LE) + pool_pubkey (32B) + epoch (8B LE)
-    //    = 84 bytes total
+    //    root (32B) + total_bytes (8B LE) + entry_count (4B LE) + pool_pubkey (32B)
+    //    = 76 bytes total
     sp1_zkvm::io::commit_slice(&root);
     sp1_zkvm::io::commit_slice(&total_bytes.to_le_bytes());
     sp1_zkvm::io::commit_slice(&(entries.len() as u32).to_le_bytes());
     sp1_zkvm::io::commit_slice(&input.pool_pubkey);
-    sp1_zkvm::io::commit_slice(&input.epoch.to_le_bytes());
 }
 
 /// Compute a leaf hash matching `merkle_leaf()` in `crates/prover/src/merkle.rs`.

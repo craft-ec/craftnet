@@ -18,13 +18,11 @@ pub struct SubscriptionAnnouncement {
     pub user_pubkey: [u8; 32],
     /// Claimed subscription tier
     pub tier: u8, // 0=Basic, 1=Standard, 2=Premium, 255=None
-    /// Subscription epoch (from UserMeta.next_epoch at subscribe time)
-    pub epoch: u64,
     /// Claimed expiry timestamp (unix seconds)
     pub expires_at: u64,
     /// Timestamp of this announcement
     pub timestamp: u64,
-    /// User's ed25519 signature over (user_pubkey || tier || epoch || expires_at || timestamp)
+    /// User's ed25519 signature over (user_pubkey || tier || expires_at || timestamp)
     pub signature: Vec<u8>,
 }
 
@@ -41,10 +39,9 @@ impl SubscriptionAnnouncement {
 
     /// Data that gets signed (excludes signature field)
     pub fn signable_data(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(32 + 1 + 8 + 8 + 8);
+        let mut data = Vec::with_capacity(32 + 1 + 8 + 8);
         data.extend_from_slice(&self.user_pubkey);
         data.push(self.tier);
-        data.extend_from_slice(&self.epoch.to_le_bytes());
         data.extend_from_slice(&self.expires_at.to_le_bytes());
         data.extend_from_slice(&self.timestamp.to_le_bytes());
         data

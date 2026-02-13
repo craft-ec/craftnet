@@ -43,7 +43,7 @@ use tunnelcraft_network::{
 use tunnelcraft_aggregator::Aggregator;
 use tunnelcraft_prover::{Prover, StubProver};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
-use tunnelcraft_settlement::{PostDistribution, SettlementClient, SettlementConfig, SettlementError};
+use tunnelcraft_settlement::{PostDistribution, SettlementClient, SettlementConfig};
 
 use sha2::{Sha256, Digest};
 
@@ -66,7 +66,7 @@ fn derive_tunnel_id(client_peer_id: &PeerId, gateway_peer_id: &PeerId) -> Id {
 
 /// Result from async proof generation (spawn_blocking)
 struct ProveResult {
-    pool_key: (PublicKey, PoolType, u64),
+    pool_key: (PublicKey, PoolType),
     batch: Vec<ForwardReceipt>,
     output: std::result::Result<tunnelcraft_prover::ProofOutput, tunnelcraft_prover::ProverError>,
     start: Instant,
@@ -93,13 +93,13 @@ struct PendingReceiptEntry {
     receipt: ForwardReceipt,
 }
 
-/// Format a pool key as "hex_pubkey:PoolType:epoch" for serialization
-fn format_pool_key(pubkey: &PublicKey, pool_type: &PoolType, epoch: u64) -> String {
-    format!("{}:{:?}:{}", hex::encode(pubkey), pool_type, epoch)
+/// Format a pool key as "hex_pubkey:PoolType" for serialization
+fn format_pool_key(pubkey: &PublicKey, pool_type: &PoolType) -> String {
+    format!("{}:{:?}", hex::encode(pubkey), pool_type)
 }
 
-/// Parse a pool key from "hex_pubkey:PoolType:epoch"
-fn parse_pool_key(s: &str) -> Option<(PublicKey, PoolType, u64)> {
+/// Parse a pool key from "hex_pubkey:PoolType"
+fn parse_pool_key(s: &str) -> Option<(PublicKey, PoolType)> {
     let parts: Vec<&str> = s.splitn(3, ':').collect();
     if parts.len() < 2 { return None; }
     let bytes = hex::decode(parts[0]).ok()?;
@@ -111,13 +111,7 @@ fn parse_pool_key(s: &str) -> Option<(PublicKey, PoolType, u64)> {
         "Free" => PoolType::Free,
         _ => return None,
     };
-    // Epoch defaults to 0 for backwards compatibility with old state files
-    let epoch = if parts.len() == 3 {
-        parts[2].parse::<u64>().unwrap_or(0)
-    } else {
-        0
-    };
-    Some((pubkey, pool_type, epoch))
+    Some((pubkey, pool_type))
 }
 
 /// Maximum time receipts can sit in the proof queue before forcing a prove,
@@ -135,8 +129,6 @@ const SUBSCRIPTION_VERIFY_BATCH_SIZE: usize = 10;
 struct SubscriptionEntry {
     /// Subscription tier (0=Basic, 1=Standard, 2=Premium, 255=None/Free)
     tier: u8,
-    /// Subscription epoch (from announcement)
-    epoch: u64,
     /// Claimed expiry (from announcement)
     expires_at: u64,
     /// Whether this has been verified on-chain
@@ -815,14 +807,14 @@ pub struct TunnelCraftNode {
 
     // === Proof queue + backpressure ===
 
-    /// Bounded proof queue: (user_pubkey, pool_type, epoch) → pending receipts awaiting proving
-    proof_queue: HashMap<(PublicKey, PoolType, u64), VecDeque<ForwardReceipt>>,
+    /// Bounded proof queue: (user_pubkey, pool_type) → pending receipts awaiting proving
+    proof_queue: HashMap<(PublicKey, PoolType), VecDeque<ForwardReceipt>>,
     /// Max queue size per pool before backpressure kicks in
     proof_queue_limit: usize,
-    /// Map request_id → (user_pubkey, pool_type, epoch) for receipt-to-pool routing
-    request_user: HashMap<Id, (PublicKey, PoolType, u64)>,
+    /// Map request_id → (user_pubkey, pool_type) for receipt-to-pool routing
+    request_user: HashMap<Id, (PublicKey, PoolType)>,
     /// Cumulative Merkle roots per pool: (root, cumulative_bytes)
-    pool_roots: HashMap<(PublicKey, PoolType, u64), ([u8; 32], u64)>,
+    pool_roots: HashMap<(PublicKey, PoolType), ([u8; 32], u64)>,
     /// Adaptive batch size (starts at 10K, adjusts based on prover speed)
     proof_batch_size: usize,
     /// Maximum time receipts can sit in the proof queue before forcing a prove.
@@ -843,10 +835,10 @@ pub struct TunnelCraftNode {
     /// Counter for debouncing proof state saves after enqueue (save every 100 receipts)
     proof_enqueue_since_save: u64,
     /// Timestamp of the oldest un-proven receipt per pool (for deadline flush)
-    proof_oldest_receipt: HashMap<(PublicKey, PoolType, u64), Instant>,
+    proof_oldest_receipt: HashMap<(PublicKey, PoolType), Instant>,
     /// Pool keys that need chain recovery (have pending receipts but no pool_roots entry).
     /// On startup, if proof state is lost, query aggregator peers for latest chain state.
-    needs_chain_recovery: Vec<(PublicKey, PoolType, u64)>,
+    needs_chain_recovery: Vec<(PublicKey, PoolType)>,
     /// Persistent stream manager for shard transport
     stream_manager: Option<StreamManager>,
     /// High-priority inbound shard channel (subscribed peers)
@@ -869,15 +861,15 @@ pub struct TunnelCraftNode {
 
     /// Aggregator service (collects proof messages, builds distributions)
     aggregator: Option<Aggregator>,
-    /// Groth16 distribution prover for on-chain verified distributions (SP1 only)
-    #[cfg(feature = "sp1")]
-    distribution_prover: Option<tunnelcraft_prover::DistributionProver>,
-    /// Tracks which (user_pubkey, epoch) distributions have been posted on-chain
-    posted_distributions: HashSet<([u8; 32], u64)>,
+    /// Tracks which user_pubkeys have had distributions posted on-chain
+    posted_distributions: HashSet<[u8; 32]>,
     /// Pluggable proof backend (StubProver by default, Sp1Prover with --features sp1)
     prover: Arc<dyn Prover>,
     /// Stub prover for free-tier receipts (no ZK proof needed, instant)
     stub_prover: Arc<StubProver>,
+    /// SP1 Groth16 distribution prover (lazy-initialized, requires `sp1` feature)
+    #[cfg(feature = "sp1")]
+    distribution_prover: Option<tunnelcraft_prover::DistributionProver>,
     /// Channel for receiving proof results from spawn_blocking
     proof_result_rx: Option<tokio::sync::oneshot::Receiver<ProveResult>>,
     /// Path for persisting aggregator state to disk
@@ -960,7 +952,7 @@ impl TunnelCraftNode {
                         for line in reader.lines().map_while(|r| r.ok()) {
                             if let Ok(receipt) = serde_json::from_str::<ForwardReceipt>(&line) {
                                 forward_receipts
-                                    .entry(receipt.request_id)
+                                    .entry(receipt.shard_id)
                                     .or_default()
                                     .push(receipt);
                                 loaded += 1;
@@ -976,8 +968,8 @@ impl TunnelCraftNode {
         }
 
         // Load proof state (pool_roots + pending receipts) from disk
-        let mut proof_queue: HashMap<(PublicKey, PoolType, u64), VecDeque<ForwardReceipt>> = HashMap::new();
-        let mut pool_roots: HashMap<(PublicKey, PoolType, u64), ([u8; 32], u64)> = HashMap::new();
+        let mut proof_queue: HashMap<(PublicKey, PoolType), VecDeque<ForwardReceipt>> = HashMap::new();
+        let mut pool_roots: HashMap<(PublicKey, PoolType), ([u8; 32], u64)> = HashMap::new();
         if let Some(ref path) = proof_state_file {
             if path.exists() {
                 match std::fs::read_to_string(path) {
@@ -1013,7 +1005,7 @@ impl TunnelCraftNode {
         }
 
         // Detect pools that need chain recovery: have queued receipts but no pool_roots entry
-        let needs_chain_recovery: Vec<(PublicKey, PoolType, u64)> = proof_queue.keys()
+        let needs_chain_recovery: Vec<(PublicKey, PoolType)> = proof_queue.keys()
             .filter(|key| !pool_roots.contains_key(key))
             .copied()
             .collect();
@@ -1025,13 +1017,13 @@ impl TunnelCraftNode {
         }
 
         // Seed deadline tracker for any pools restored with pending receipts
-        let proof_oldest_receipt: HashMap<(PublicKey, PoolType, u64), Instant> = proof_queue.iter()
+        let proof_oldest_receipt: HashMap<(PublicKey, PoolType), Instant> = proof_queue.iter()
             .filter(|(_, q)| !q.is_empty())
             .map(|(k, _)| (*k, Instant::now()))
             .collect();
 
         // Will be populated if aggregator state is loaded from disk
-        let mut loaded_posted_distributions: Option<HashSet<([u8; 32], u64)>> = None;
+        let mut loaded_posted_distributions: Option<HashSet<[u8; 32]>> = None;
 
         Ok(Self {
             mode: config.mode,
@@ -1101,9 +1093,6 @@ impl TunnelCraftNode {
             exit_task_rx,
             exit_shard_queue: VecDeque::new(),
             aggregator: if enable_aggregator {
-                #[cfg(feature = "sp1")]
-                fn make_agg_prover() -> Box<dyn tunnelcraft_prover::Prover> { Box::new(tunnelcraft_prover::Sp1Prover::new()) }
-                #[cfg(not(feature = "sp1"))]
                 fn make_agg_prover() -> Box<dyn tunnelcraft_prover::Prover> { Box::new(StubProver::new()) }
                 // Try loading from disk first
                 let mut agg = if let Some(ref path) = aggregator_state_file {
@@ -1133,20 +1122,11 @@ impl TunnelCraftNode {
                 }
                 Some(agg)
             } else { None },
-            #[cfg(feature = "sp1")]
-            distribution_prover: if enable_aggregator {
-                Some(tunnelcraft_prover::DistributionProver::new())
-            } else {
-                None
-            },
             posted_distributions: loaded_posted_distributions.unwrap_or_default(),
-            prover: {
-                #[cfg(feature = "sp1")]
-                { Arc::new(tunnelcraft_prover::Sp1Prover::new()) }
-                #[cfg(not(feature = "sp1"))]
-                { Arc::new(StubProver::new()) }
-            },
+            prover: Arc::new(StubProver::new()),
             stub_prover: Arc::new(StubProver::new()),
+            #[cfg(feature = "sp1")]
+            distribution_prover: None,
             proof_result_rx: None,
             aggregator_state_file,
             aggregator_history_file,
@@ -2022,8 +2002,8 @@ impl TunnelCraftNode {
 
     /// Get the proof queue sizes per pool
     pub fn proof_queue_sizes(&self) -> Vec<(String, usize)> {
-        self.proof_queue.iter().map(|((pool, pool_type, epoch), q)| {
-            (format!("{}:{:?}:{}", hex::encode(&pool[..8]), pool_type, epoch), q.len())
+        self.proof_queue.iter().map(|((pool, pool_type), q)| {
+            (format!("{}:{:?}", hex::encode(&pool[..8]), pool_type), q.len())
         }).collect()
     }
 
@@ -2154,7 +2134,6 @@ impl TunnelCraftNode {
             &exit_hop,
             &paths,
             &lease_set,
-            0, // epoch
             self.encryption_keypair.public_key_bytes(), // response encryption key
             self.keypair.public_key_bytes(), // pool_pubkey — always user pubkey (tracks subscription or free usage)
         )?;
@@ -2607,7 +2586,7 @@ impl TunnelCraftNode {
         // Lock released here
 
         match relay_result {
-            Ok((modified_shard, next_peer_bytes, receipt, pool_pubkey, epoch)) => {
+            Ok((modified_shard, next_peer_bytes, receipt, pool_pubkey)) => {
                 let has_tunnel = modified_shard.header.is_empty();
                 let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
                 let local_short = &local_id[local_id.len().saturating_sub(6)..];
@@ -2642,7 +2621,7 @@ impl TunnelCraftNode {
                 } else {
                     PoolType::Free
                 };
-                self.request_user.insert(receipt.shard_id, (pool_pubkey, pool_type, epoch));
+                self.request_user.insert(receipt.shard_id, (pool_pubkey, pool_type));
 
                 // Store the receipt for settlement
                 self.store_forward_receipt(receipt.clone());
@@ -2742,8 +2721,7 @@ impl TunnelCraftNode {
     /// Receipts are grouped by request_id for later batch settlement.
     fn store_forward_receipt(&mut self, receipt: ForwardReceipt) {
         info!(
-            "Stored ForwardReceipt: req={}, shard={}, from={}",
-            hex::encode(&receipt.request_id[..8]),
+            "Stored ForwardReceipt: shard={}, from={}",
             hex::encode(&receipt.shard_id[..8]),
             hex::encode(&receipt.receiver_pubkey[..8]),
         );
@@ -2753,14 +2731,14 @@ impl TunnelCraftNode {
 
         // Store in forward_receipts for per-request tracking
         self.forward_receipts
-            .entry(receipt.request_id)
+            .entry(receipt.shard_id)
             .or_default()
             .push(receipt.clone());
 
         // Route into proof queue for ZK proving (relay/exit mode only)
         if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            if let Some((pool, pool_type, epoch)) = self.request_user.get(&receipt.shard_id) {
-                let key = (*pool, *pool_type, *epoch);
+            if let Some((pool, pool_type)) = self.request_user.get(&receipt.shard_id) {
+                let key = (*pool, *pool_type);
                 let queue = self.proof_queue.entry(key).or_default();
                 if queue.len() < self.proof_queue_limit {
                     info!(
@@ -3044,7 +3022,6 @@ impl TunnelCraftNode {
             &exit_hop,
             &paths,
             &lease_set,
-            0, // epoch
             self.keypair.public_key_bytes(), // pool_pubkey — always user pubkey (tracks subscription or free usage)
         );
 
@@ -4678,13 +4655,11 @@ impl TunnelCraftNode {
         let now = std::time::Instant::now();
         let entry = self.subscription_cache.entry(msg.user_pubkey).or_insert(SubscriptionEntry {
             tier: msg.tier,
-            epoch: msg.epoch,
             expires_at: msg.expires_at,
             verified: false,
             last_seen: now,
         });
         entry.tier = msg.tier;
-        entry.epoch = msg.epoch;
         entry.expires_at = msg.expires_at;
         entry.last_seen = now;
 
@@ -4764,29 +4739,56 @@ impl TunnelCraftNode {
         }
     }
 
-    /// Post Merkle distribution roots on-chain for completed pool epochs.
+    /// Pre-build Merkle distributions for expired pool epochs.
     ///
     /// Called periodically from the maintenance interval. For each subscribed pool
-    /// the aggregator knows about, builds the distribution and posts it via the
-    /// settlement client. Skips pools that are still active (EpochNotComplete) or
-    /// already posted (DistributionAlreadyPosted).
+    /// the aggregator knows about, checks if the epoch has expired and builds the
+    /// distribution Merkle tree. The distribution is recorded but NOT posted
+    /// on-chain — an external prover must generate a Groth16 proof and post the
+    /// distribution + proof via the settlement client.
     async fn maybe_post_distributions(&mut self) {
         let Some(ref aggregator) = self.aggregator else { return };
-        let Some(ref settlement) = self.settlement_client else { return };
-        let settlement = Arc::clone(settlement);
 
         let pools = aggregator.subscribed_pools();
         if pools.is_empty() {
             return;
         }
 
-        for (user_pubkey, _pool_type, epoch) in &pools {
-            let key = (*user_pubkey, *epoch);
-            if self.posted_distributions.contains(&key) {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for (user_pubkey, _pool_type) in &pools {
+            if self.posted_distributions.contains(user_pubkey) {
                 continue;
             }
 
-            let pool_key = (*user_pubkey, _pool_type.clone(), *epoch);
+            // Only post distributions after the subscription epoch has expired
+            if let Some(entry) = self.subscription_cache.get(user_pubkey) {
+                if entry.expires_at > now_unix {
+                    info!(
+                        "Skipping distribution for pool {}: subscription still active (expires in {}s)",
+                        hex::encode(&user_pubkey[..8]),
+                        entry.expires_at - now_unix,
+                    );
+                    continue;
+                }
+                info!(
+                    "Pool {} epoch expired (expired {}s ago) — proceeding with distribution",
+                    hex::encode(&user_pubkey[..8]),
+                    now_unix - entry.expires_at,
+                );
+            } else {
+                // No subscription info — skip until we receive it via gossip
+                info!(
+                    "Skipping distribution for pool {}: no subscription info in cache",
+                    hex::encode(&user_pubkey[..8]),
+                );
+                continue;
+            }
+
+            let pool_key = (*user_pubkey, _pool_type.clone());
             let Some(dist) = self.aggregator.as_ref().unwrap().build_distribution(&pool_key) else {
                 continue;
             };
@@ -4794,32 +4796,85 @@ impl TunnelCraftNode {
             // Record distribution-built event in history
             if let Some(ref mut agg) = self.aggregator {
                 agg.record_distribution_built(
-                    *user_pubkey, *_pool_type, *epoch,
+                    *user_pubkey, *_pool_type,
                     dist.root, dist.total, dist.entries.len(),
                 );
             }
 
-            // Generate Groth16 proof if SP1 distribution prover is available
-            #[cfg(feature = "sp1")]
+            info!(
+                "Distribution built for pool {}: {} entries, {} total bytes",
+                hex::encode(&user_pubkey[..8]),
+                dist.entries.len(),
+                dist.total,
+            );
+
+            // Verify on-chain subscription exists before expensive proving
+            if let Some(ref settlement) = self.settlement_client {
+                match settlement.get_subscription_state(*user_pubkey).await {
+                    Ok(Some(state)) => {
+                        if state.distribution_posted {
+                            info!("Distribution already posted on-chain for pool {} — skipping", hex::encode(&user_pubkey[..8]));
+                            self.posted_distributions.insert(*user_pubkey);
+                            continue;
+                        }
+                        info!("On-chain subscription confirmed for pool {} (balance: {})", hex::encode(&user_pubkey[..8]), state.pool_balance);
+                    }
+                    Ok(None) => {
+                        info!("No on-chain subscription for pool {} — skipping prove", hex::encode(&user_pubkey[..8]));
+                        self.posted_distributions.insert(*user_pubkey);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Failed to check subscription for pool {}: {} — skipping this round", hex::encode(&user_pubkey[..8]), e);
+                        continue;
+                    }
+                }
+            }
+
+            // Generate Groth16 proof (SP1 feature required)
             let (groth16_proof, sp1_public_inputs) = {
-                if let Some(ref dp) = self.distribution_prover {
-                    match dp.prove_distribution(&dist.entries, *user_pubkey, *epoch) {
-                        Ok(proof) => (proof.proof_bytes, proof.public_values),
+                #[cfg(feature = "sp1")]
+                {
+                    // Lazy-init the distribution prover
+                    if self.distribution_prover.is_none() {
+                        info!("Initializing SP1 distribution prover...");
+                        self.distribution_prover = Some(tunnelcraft_prover::DistributionProver::new());
+                    }
+                    let prover = self.distribution_prover.as_ref().unwrap();
+                    let entries: Vec<([u8; 32], u64)> = dist.entries.iter()
+                        .map(|(relay, bytes)| (*relay, *bytes))
+                        .collect();
+                    match prover.prove_distribution(&entries, *user_pubkey) {
+                        Ok(proof) => {
+                            info!(
+                                "Groth16 proof generated: {} proof bytes, {} public values, vkey={}",
+                                proof.proof_bytes.len(),
+                                proof.public_values.len(),
+                                proof.vkey_hash,
+                            );
+                            (proof.proof_bytes, proof.public_values)
+                        }
                         Err(e) => {
-                            warn!("Distribution Groth16 prove failed: {} — posting without proof", e);
-                            (vec![], vec![])
+                            error!("Groth16 distribution proof failed for pool {}: {}", hex::encode(&user_pubkey[..8]), e);
+                            continue;
                         }
                     }
-                } else {
-                    (vec![], vec![])
+                }
+                #[cfg(not(feature = "sp1"))]
+                {
+                    warn!("SP1 feature not enabled — cannot generate distribution proof, skipping post");
+                    continue;
                 }
             };
-            #[cfg(not(feature = "sp1"))]
-            let (groth16_proof, sp1_public_inputs) = (vec![], vec![]);
+
+            // Post on-chain via settlement client
+            let Some(ref settlement) = self.settlement_client else {
+                warn!("No settlement client — cannot post distribution on-chain");
+                continue;
+            };
 
             let post = PostDistribution {
-                user_pubkey: *user_pubkey,
-                epoch: *epoch,
+                pool_pubkey: *user_pubkey,
                 distribution_root: dist.root,
                 total_bytes: dist.total,
                 groth16_proof,
@@ -4828,38 +4883,35 @@ impl TunnelCraftNode {
 
             match settlement.post_distribution(post).await {
                 Ok(sig) => {
-                    self.posted_distributions.insert(key);
-                    // Record distribution-posted event in history
-                    if let Some(ref mut agg) = self.aggregator {
-                        agg.record_distribution_posted(
-                            *user_pubkey, *epoch, dist.root, dist.total,
-                        );
-                    }
                     info!(
-                        "Posted distribution on-chain: user={} epoch={} sig={}",
+                        "Distribution posted on-chain for pool {}: sig={}",
                         hex::encode(&user_pubkey[..8]),
-                        epoch,
-                        hex::encode(&sig[..16]),
+                        hex::encode(sig),
                     );
-                }
-                Err(SettlementError::EpochNotComplete) => {
-                    // Epoch still active or in grace period — skip silently
-                }
-                Err(SettlementError::DistributionAlreadyPosted) => {
-                    self.posted_distributions.insert(key);
-                    debug!(
-                        "Distribution already posted for user={} epoch={}, skipping",
-                        hex::encode(&user_pubkey[..8]),
-                        epoch,
-                    );
+                    self.posted_distributions.insert(*user_pubkey);
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to post distribution for user={} epoch={}: {:?}",
-                        hex::encode(&user_pubkey[..8]),
-                        epoch,
-                        e,
-                    );
+                    let err_str = format!("{}", e);
+                    if err_str.contains("already been posted") || err_str.contains("AlreadyPosted") {
+                        info!(
+                            "Distribution already posted for pool {} — marking done",
+                            hex::encode(&user_pubkey[..8]),
+                        );
+                        self.posted_distributions.insert(*user_pubkey);
+                    } else if err_str.contains("AccountNotInitialized") || err_str.contains("not initialized") {
+                        // No on-chain subscription for this pool — skip permanently
+                        info!(
+                            "No on-chain subscription for pool {} — skipping",
+                            hex::encode(&user_pubkey[..8]),
+                        );
+                        self.posted_distributions.insert(*user_pubkey);
+                    } else {
+                        error!(
+                            "Failed to post distribution for pool {}: {}",
+                            hex::encode(&user_pubkey[..8]),
+                            e,
+                        );
+                    }
                 }
             }
         }
@@ -4886,45 +4938,43 @@ impl TunnelCraftNode {
         info!("Reconciling {} aggregator pools with on-chain state", pool_keys.len());
 
         for batch in pool_keys.chunks(SUBSCRIPTION_VERIFY_BATCH_SIZE) {
-            for (user_pubkey, epoch) in batch {
-                match settlement.get_subscription_state(*user_pubkey, *epoch).await {
+            for user_pubkey in batch {
+                match settlement.get_subscription_state(*user_pubkey).await {
                     Ok(Some(state)) => {
                         if state.distribution_posted {
-                            self.posted_distributions.insert((*user_pubkey, *epoch));
+                            self.posted_distributions.insert(*user_pubkey);
                             debug!(
-                                "Reconciled pool user={} epoch={}: distribution already posted",
+                                "Reconciled pool user={}: distribution already posted",
                                 hex::encode(&user_pubkey[..8]),
-                                epoch,
                             );
                         }
                         if state.pool_balance == 0 {
                             debug!(
-                                "Reconciled pool user={} epoch={}: fully claimed",
+                                "Reconciled pool user={}: fully claimed",
                                 hex::encode(&user_pubkey[..8]),
-                                epoch,
                             );
                         } else if state.original_pool_balance > 0 && state.pool_balance < state.original_pool_balance {
                             debug!(
-                                "Reconciled pool user={} epoch={}: partially claimed ({} of {} remaining)",
+                                "Reconciled pool user={}: partially claimed ({} of {} remaining)",
                                 hex::encode(&user_pubkey[..8]),
-                                epoch,
                                 state.pool_balance,
                                 state.original_pool_balance,
                             );
                         }
                     }
                     Ok(None) => {
+                        // No on-chain subscription — mark as posted to prevent
+                        // wasting RPC calls attempting post_distribution.
+                        self.posted_distributions.insert(*user_pubkey);
                         debug!(
-                            "No on-chain subscription for pool user={} epoch={} (free-tier or expired)",
+                            "No on-chain subscription for pool user={}, marking as skipped",
                             hex::encode(&user_pubkey[..8]),
-                            epoch,
                         );
                     }
                     Err(e) => {
                         warn!(
-                            "Failed to query on-chain state for user={} epoch={}: {:?}",
+                            "Failed to query on-chain state for user={}: {:?}",
                             hex::encode(&user_pubkey[..8]),
-                            epoch,
                             e,
                         );
                     }
@@ -4953,7 +5003,7 @@ impl TunnelCraftNode {
     }
 
     /// Announce our subscription to the network (client mode)
-    pub fn announce_subscription(&mut self, tier: u8, epoch: u64, expires_at: u64) {
+    pub fn announce_subscription(&mut self, tier: u8, expires_at: u64) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -4962,7 +5012,6 @@ impl TunnelCraftNode {
         let mut announcement = SubscriptionAnnouncement {
             user_pubkey: self.keypair.public_key_bytes(),
             tier,
-            epoch,
             expires_at,
             timestamp,
             signature: vec![],
@@ -5126,21 +5175,21 @@ impl TunnelCraftNode {
     }
 
     /// Get aggregator pool usage for a specific user (if aggregator is enabled)
-    pub fn aggregator_pool_usage(&self, pool_key: &(PublicKey, PoolType, u64)) -> Vec<(PublicKey, u64)> {
+    pub fn aggregator_pool_usage(&self, pool_key: &(PublicKey, PoolType)) -> Vec<(PublicKey, u64)> {
         self.aggregator.as_ref()
             .map(|a| a.get_pool_usage(pool_key))
             .unwrap_or_default()
     }
 
     /// Get all pool keys tracked by the aggregator (both Subscribed and Free)
-    pub fn aggregator_pool_keys(&self) -> Vec<(PublicKey, PoolType, u64)> {
+    pub fn aggregator_pool_keys(&self) -> Vec<(PublicKey, PoolType)> {
         self.aggregator.as_ref()
             .map(|a| a.all_pool_keys())
             .unwrap_or_default()
     }
 
     /// Get aggregator relay stats for a specific relay (if aggregator is enabled)
-    pub fn aggregator_relay_stats(&self, relay: &PublicKey) -> Vec<((PublicKey, PoolType, u64), u64)> {
+    pub fn aggregator_relay_stats(&self, relay: &PublicKey) -> Vec<((PublicKey, PoolType), u64)> {
         self.aggregator.as_ref()
             .map(|a| a.get_relay_stats(relay))
             .unwrap_or_default()
@@ -5151,9 +5200,8 @@ impl TunnelCraftNode {
         &self,
         pool_pubkey: [u8; 32],
         pool_type: PoolType,
-        epoch: u64,
     ) -> Option<tunnelcraft_aggregator::Distribution> {
-        self.aggregator.as_ref()?.build_distribution(&(pool_pubkey, pool_type, epoch))
+        self.aggregator.as_ref()?.build_distribution(&(pool_pubkey, pool_type))
     }
 
     // =========================================================================
@@ -5191,7 +5239,7 @@ impl TunnelCraftNode {
             .max_by_key(|(_, q)| q.len())
             .map(|(k, q)| (*k, q.len()));
 
-        let Some(((pool, pool_type, epoch), queue_len)) = best_pool else {
+        let Some(((pool, pool_type), queue_len)) = best_pool else {
             return;
         };
 
@@ -5201,7 +5249,7 @@ impl TunnelCraftNode {
         }
 
         // Take receipts from the front of the queue
-        let pool_key = (pool, pool_type, epoch);
+        let pool_key = (pool, pool_type);
         let queue = self.proof_queue.get_mut(&pool_key).unwrap();
         let batch: Vec<ForwardReceipt> = queue.drain(..batch_size).collect();
 
@@ -5253,7 +5301,7 @@ impl TunnelCraftNode {
         self.proof_result_rx = None;
 
         let pool_key = result.pool_key;
-        let (pool, pool_type, epoch) = pool_key;
+        let (pool, pool_type) = pool_key;
 
         let proof_output = match result.output {
             Ok(output) => output,
@@ -5283,7 +5331,6 @@ impl TunnelCraftNode {
             relay_pubkey: self.keypair.public_key_bytes(),
             pool_pubkey: pool,
             pool_type,
-            epoch,
             batch_bytes: batch_bytes_total,
             cumulative_bytes,
             prev_root,
@@ -5366,8 +5413,8 @@ impl TunnelCraftNode {
         let Some(ref path) = self.proof_state_file else { return };
 
         let mut pool_roots_map = HashMap::new();
-        for ((pubkey, pool_type, epoch), (root, cumulative_bytes)) in &self.pool_roots {
-            let key = format_pool_key(pubkey, pool_type, *epoch);
+        for ((pubkey, pool_type), (root, cumulative_bytes)) in &self.pool_roots {
+            let key = format_pool_key(pubkey, pool_type);
             pool_roots_map.insert(key, PoolRootState {
                 root: hex::encode(root),
                 cumulative_bytes: *cumulative_bytes,
@@ -5375,8 +5422,8 @@ impl TunnelCraftNode {
         }
 
         let mut pending_receipts = Vec::new();
-        for ((pubkey, pool_type, epoch), queue) in &self.proof_queue {
-            let key = format_pool_key(pubkey, pool_type, *epoch);
+        for ((pubkey, pool_type), queue) in &self.proof_queue {
+            let key = format_pool_key(pubkey, pool_type);
             for receipt in queue {
                 pending_receipts.push(PendingReceiptEntry {
                     pool_key: key.clone(),
@@ -5422,7 +5469,7 @@ impl TunnelCraftNode {
     /// Returns pool keys that have pending receipts but no known proof chain root.
     /// The caller should query aggregator peers for each key and call
     /// `apply_chain_recovery()` with the response.
-    pub fn pools_needing_recovery(&self) -> &[(PublicKey, PoolType, u64)] {
+    pub fn pools_needing_recovery(&self) -> &[(PublicKey, PoolType)] {
         &self.needs_chain_recovery
     }
 
@@ -5434,15 +5481,14 @@ impl TunnelCraftNode {
     /// so this is trustless — no harm from a lying aggregator.
     pub fn apply_chain_recovery(
         &mut self,
-        pool_key: (PublicKey, PoolType, u64),
+        pool_key: (PublicKey, PoolType),
         root: [u8; 32],
         cumulative_bytes: u64,
     ) {
         info!(
-            "Chain recovery applied for pool ({}, {:?}, epoch={}): root={}, cumulative={}",
+            "Chain recovery applied for pool ({}, {:?}): root={}, cumulative={}",
             hex::encode(&pool_key.0[..8]),
             pool_key.1,
-            pool_key.2,
             hex::encode(&root[..8]),
             cumulative_bytes,
         );
@@ -5468,7 +5514,7 @@ impl TunnelCraftNode {
     }
 
     /// Get proof queue depth for a specific pool key
-    pub fn pool_queue_depth(&self, pool_key: &(PublicKey, PoolType, u64)) -> usize {
+    pub fn pool_queue_depth(&self, pool_key: &(PublicKey, PoolType)) -> usize {
         self.proof_queue.get(pool_key).map(|q| q.len()).unwrap_or(0)
     }
 }

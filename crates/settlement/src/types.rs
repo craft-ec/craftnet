@@ -46,11 +46,11 @@ pub struct Subscribe {
     pub tier: SubscriptionTier,
     /// Payment amount in lamports (USDC in production)
     pub payment_amount: u64,
-    /// Epoch duration in seconds (minimum 60)
-    pub epoch_duration_secs: u64,
+    /// Duration in seconds (minimum 60)
+    pub duration_secs: u64,
 }
 
-/// Post a Merkle distribution root for a user's pool epoch.
+/// Post a Merkle distribution root for a pool.
 ///
 /// Called by the aggregator after the grace period ends. Sets the
 /// distribution root that relays use to claim their share.
@@ -60,10 +60,8 @@ pub struct Subscribe {
 /// distribution construction. In mock mode these are ignored.
 #[derive(Debug, Clone)]
 pub struct PostDistribution {
-    /// User whose pool this distribution covers
-    pub user_pubkey: PublicKey,
-    /// Epoch this distribution covers
-    pub epoch: u64,
+    /// Pool public key (subscription PDA identifier)
+    pub pool_pubkey: PublicKey,
     /// Merkle root of (relay, bytes) distribution
     pub distribution_root: [u8; 32],
     /// Total payload bytes across all relays for this pool
@@ -87,7 +85,7 @@ pub struct ClaimLightParams {
     pub output_tree_index: u8,
 }
 
-/// Claim rewards from a user's pool using a Merkle proof.
+/// Claim rewards from a pool using a Merkle proof.
 ///
 /// After distribution is posted, each relay claims its share.
 /// Payout transfers directly from pool PDA to relay wallet.
@@ -96,10 +94,8 @@ pub struct ClaimLightParams {
 /// payout = (relay_bytes / total_bytes) * pool_balance
 #[derive(Debug, Clone)]
 pub struct ClaimRewards {
-    /// User pool to claim from
-    pub user_pubkey: PublicKey,
-    /// Epoch to claim from
-    pub epoch: u64,
+    /// Pool public key (subscription PDA identifier)
+    pub pool_pubkey: PublicKey,
     /// Node claiming rewards
     pub node_pubkey: PublicKey,
     /// Total payload bytes this relay has forwarded (proven by Merkle proof)
@@ -112,13 +108,11 @@ pub struct ClaimRewards {
     pub light_params: Option<ClaimLightParams>,
 }
 
-/// On-chain subscription state for a user epoch
+/// On-chain subscription state for a pool
 #[derive(Debug, Clone)]
 pub struct SubscriptionState {
-    /// User's public key
-    pub user_pubkey: PublicKey,
-    /// Subscription epoch (monotonic per user)
-    pub epoch: u64,
+    /// Pool public key (subscription PDA identifier)
+    pub pool_pubkey: PublicKey,
     /// Active subscription tier
     pub tier: SubscriptionTier,
     /// When the subscription was created (unix seconds)
@@ -195,28 +189,26 @@ mod tests {
             user_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
             payment_amount: 15_000_000,
-            epoch_duration_secs: 30 * 24 * 3600,
+            duration_secs: 30 * 24 * 3600,
         };
 
         assert_eq!(sub.user_pubkey, [1u8; 32]);
         assert_eq!(sub.tier, SubscriptionTier::Standard);
         assert_eq!(sub.payment_amount, 15_000_000);
-        assert_eq!(sub.epoch_duration_secs, 30 * 24 * 3600);
+        assert_eq!(sub.duration_secs, 30 * 24 * 3600);
     }
 
     #[test]
     fn test_post_distribution_creation() {
         let dist = PostDistribution {
-            user_pubkey: [1u8; 32],
-            epoch: 0,
+            pool_pubkey: [1u8; 32],
             distribution_root: [0xAA; 32],
             total_bytes: 1000,
             groth16_proof: vec![],
             sp1_public_inputs: vec![],
         };
 
-        assert_eq!(dist.user_pubkey, [1u8; 32]);
-        assert_eq!(dist.epoch, 0);
+        assert_eq!(dist.pool_pubkey, [1u8; 32]);
         assert_eq!(dist.distribution_root, [0xAA; 32]);
         assert_eq!(dist.total_bytes, 1000);
     }
@@ -224,8 +216,7 @@ mod tests {
     #[test]
     fn test_claim_rewards_creation() {
         let claim = ClaimRewards {
-            user_pubkey: [1u8; 32],
-            epoch: 0,
+            pool_pubkey: [1u8; 32],
             node_pubkey: [2u8; 32],
             relay_bytes: 500,
             leaf_index: 0,
@@ -233,8 +224,7 @@ mod tests {
             light_params: None,
         };
 
-        assert_eq!(claim.user_pubkey, [1u8; 32]);
-        assert_eq!(claim.epoch, 0);
+        assert_eq!(claim.pool_pubkey, [1u8; 32]);
         assert_eq!(claim.node_pubkey, [2u8; 32]);
         assert_eq!(claim.relay_bytes, 500);
         assert_eq!(claim.merkle_proof.len(), 2);
@@ -242,13 +232,12 @@ mod tests {
 
     #[test]
     fn test_subscription_state_creation() {
-        let epoch_duration: u64 = 30 * 24 * 3600;
+        let duration: u64 = 30 * 24 * 3600;
         let state = SubscriptionState {
-            user_pubkey: [1u8; 32],
-            epoch: 0,
+            pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Premium,
             created_at: 1700000000,
-            expires_at: 1700000000 + epoch_duration,
+            expires_at: 1700000000 + duration,
             pool_balance: 40_000_000,
             original_pool_balance: 40_000_000,
             total_bytes: 0,
@@ -264,13 +253,12 @@ mod tests {
     #[test]
     fn test_epoch_phase_active() {
         let now = 1700000000;
-        let epoch_duration: u64 = 30 * 24 * 3600;
+        let duration: u64 = 30 * 24 * 3600;
         let state = SubscriptionState {
-            user_pubkey: [1u8; 32],
-            epoch: 0,
+            pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
             created_at: now,
-            expires_at: now + epoch_duration,
+            expires_at: now + duration,
             pool_balance: 1_000_000,
             original_pool_balance: 1_000_000,
             total_bytes: 0,
@@ -284,11 +272,10 @@ mod tests {
     #[test]
     fn test_epoch_phase_grace() {
         let now = 1700000000;
-        let epoch_duration: u64 = 30 * 24 * 3600;
-        let expires_at = now + epoch_duration;
+        let duration: u64 = 30 * 24 * 3600;
+        let expires_at = now + duration;
         let state = SubscriptionState {
-            user_pubkey: [1u8; 32],
-            epoch: 0,
+            pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
             created_at: now,
             expires_at,
@@ -308,11 +295,10 @@ mod tests {
     #[test]
     fn test_epoch_phase_claimable() {
         let now = 1700000000;
-        let epoch_duration: u64 = 30 * 24 * 3600;
-        let expires_at = now + epoch_duration;
+        let duration: u64 = 30 * 24 * 3600;
+        let expires_at = now + duration;
         let state = SubscriptionState {
-            user_pubkey: [1u8; 32],
-            epoch: 0,
+            pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
             created_at: now,
             expires_at,
@@ -330,11 +316,10 @@ mod tests {
     #[test]
     fn test_epoch_phase_closed() {
         let now = 1700000000;
-        let epoch_duration: u64 = 30 * 24 * 3600;
-        let expires_at = now + epoch_duration;
+        let duration: u64 = 30 * 24 * 3600;
+        let expires_at = now + duration;
         let state = SubscriptionState {
-            user_pubkey: [1u8; 32],
-            epoch: 0,
+            pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
             created_at: now,
             expires_at,

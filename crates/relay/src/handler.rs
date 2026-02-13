@@ -2,7 +2,7 @@
 //!
 //! Handles incoming shards by peeling one onion layer to learn the next hop.
 //! No plaintext routing metadata is visible — the relay only sees:
-//! - Settlement data (blind_token, shard_id, payload_size, epoch) from its onion layer
+//! - Settlement data (shard_id, payload_size, pool_pubkey) from its onion layer
 //! - The next hop's PeerId and ephemeral key
 //!
 //! Gateway mode: when the peeled layer contains a tunnel_id, the relay
@@ -137,16 +137,16 @@ impl RelayHandler {
 
     /// Handle an incoming shard by peeling one onion layer.
     ///
-    /// Returns `(modified_shard, next_peer_id_bytes, forward_receipt, pool_pubkey, epoch)`.
+    /// Returns `(modified_shard, next_peer_id_bytes, forward_receipt, pool_pubkey)`.
     /// The caller (node.rs) forwards the shard to the returned next_peer and uses
-    /// pool_pubkey + epoch to route the receipt into the correct proof queue.
+    /// pool_pubkey to route the receipt into the correct proof queue.
     ///
     /// `sender_pubkey` comes from the libp2p connection (authenticated via Noise).
     pub fn handle_shard(
         &self,
         mut shard: Shard,
         sender_pubkey: PublicKey,
-    ) -> Result<(Shard, Vec<u8>, ForwardReceipt, PublicKey, u64)> {
+    ) -> Result<(Shard, Vec<u8>, ForwardReceipt, PublicKey)> {
         // Peel one onion layer
         let layer = peel_onion_layer(
             &self.encryption_keypair.secret_key_bytes(),
@@ -156,18 +156,14 @@ impl RelayHandler {
 
         // Extract pool routing info before moving layer fields
         let pool_pubkey = layer.settlement.pool_pubkey;
-        let epoch = layer.settlement.epoch;
 
         // Create ForwardReceipt from the settlement data in this layer
-        // request_id is [0u8; 32] for onion shards (not used for dedup — use shard_id)
         let receipt = sign_forward_receipt(
             &self.keypair,
-            &[0u8; 32], // request_id not available in onion mode
             &layer.settlement.shard_id,
             &sender_pubkey,
-            &layer.settlement.blind_token,
+            &pool_pubkey,
             layer.settlement.payload_size,
-            epoch,
         );
 
         // Determine next peer
@@ -188,7 +184,7 @@ impl RelayHandler {
         shard.header = layer.remaining_header;
         shard.ephemeral_pubkey = layer.next_ephemeral_pubkey;
 
-        Ok((shard, next_peer, receipt, pool_pubkey, epoch))
+        Ok((shard, next_peer, receipt, pool_pubkey))
     }
 
     /// Register a tunnel_id → client PeerId mapping (called via TunnelSetup message).
@@ -271,10 +267,8 @@ mod tests {
 
     fn make_settlement(idx: u8) -> OnionSettlement {
         OnionSettlement {
-            blind_token: [idx; 32],
             shard_id: [idx + 100; 32],
             payload_size: 1024,
-            epoch: 42,
             pool_pubkey: [0u8; 32],
         }
     }
@@ -301,12 +295,11 @@ mod tests {
         );
 
         let sender = [9u8; 32];
-        let (modified, next_peer, receipt, _, _) = handler.handle_shard(shard, sender).unwrap();
+        let (modified, next_peer, receipt, _) = handler.handle_shard(shard, sender).unwrap();
 
         assert_eq!(next_peer, b"exit_pid");
         assert!(modified.header.is_empty()); // terminal layer
         assert_eq!(receipt.sender_pubkey, sender);
-        assert_eq!(receipt.blind_token, [1u8; 32]);
     }
 
     #[test]
@@ -338,17 +331,15 @@ mod tests {
 
         // Relay 1 peels
         let sender1 = [10u8; 32];
-        let (shard2, next1, receipt1, _, _) = handler1.handle_shard(shard, sender1).unwrap();
+        let (shard2, next1, _receipt1, _) = handler1.handle_shard(shard, sender1).unwrap();
         assert_eq!(next1, b"r2");
         assert!(!shard2.header.is_empty());
-        assert_eq!(receipt1.blind_token, [1u8; 32]); // settlement[0]
 
         // Relay 2 peels
         let sender2 = [11u8; 32];
-        let (shard3, next2, receipt2, _, _) = handler2.handle_shard(shard2, sender2).unwrap();
+        let (shard3, next2, _receipt2, _) = handler2.handle_shard(shard2, sender2).unwrap();
         assert_eq!(next2, b"exit");
         assert!(shard3.header.is_empty());
-        assert_eq!(receipt2.blind_token, [2u8; 32]); // settlement[1]
     }
 
     #[test]
@@ -410,7 +401,7 @@ mod tests {
             vec![0; 92],
         );
 
-        let (_, next_peer, _, _, _) = handler.handle_shard(shard, [0u8; 32]).unwrap();
+        let (_, next_peer, _, _) = handler.handle_shard(shard, [0u8; 32]).unwrap();
         // Gateway mode: should return the client peer ID
         assert_eq!(next_peer, client_peer);
     }

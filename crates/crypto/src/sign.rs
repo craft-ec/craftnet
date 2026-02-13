@@ -30,18 +30,14 @@ pub fn verify_signature(pubkey: &[u8; 32], data: &[u8], signature: &[u8; 64]) ->
 /// Uses shard_id (unique hash) so request and response shards produce distinct receipts.
 ///
 /// `sender_pubkey` binds this receipt to the forwarding relay (anti-Sybil).
-/// `blind_token` is a per-hop unique token derived from user_proof, preventing
-/// colluding relays from correlating settlement data across the same path.
+/// `pool_pubkey` is the ephemeral subscription key (or persistent key for free-tier).
 /// `payload_size` is the actual payload bytes — settlement weights by bandwidth.
-/// `epoch` prevents cross-epoch receipt replay.
 pub fn sign_forward_receipt(
     keypair: &SigningKeypair,
-    request_id: &[u8; 32],
     shard_id: &[u8; 32],
     sender_pubkey: &[u8; 32],
-    blind_token: &[u8; 32],
+    pool_pubkey: &[u8; 32],
     payload_size: u32,
-    epoch: u64,
 ) -> ForwardReceipt {
     let receiver_pubkey = keypair.public_key_bytes();
     let timestamp = SystemTime::now()
@@ -49,24 +45,20 @@ pub fn sign_forward_receipt(
         .unwrap_or_default()
         .as_secs();
     let data = ForwardReceipt::signable_data(
-        request_id,
         shard_id,
         sender_pubkey,
         &receiver_pubkey,
-        blind_token,
+        pool_pubkey,
         payload_size,
-        epoch,
         timestamp,
     );
     let signature = sign_data(keypair, &data);
     ForwardReceipt {
-        request_id: *request_id,
         shard_id: *shard_id,
         sender_pubkey: *sender_pubkey,
         receiver_pubkey,
-        blind_token: *blind_token,
+        pool_pubkey: *pool_pubkey,
         payload_size,
-        epoch,
         timestamp,
         signature,
     }
@@ -75,13 +67,11 @@ pub fn sign_forward_receipt(
 /// Verify a forward receipt's signature
 pub fn verify_forward_receipt(receipt: &ForwardReceipt) -> bool {
     let data = ForwardReceipt::signable_data(
-        &receipt.request_id,
         &receipt.shard_id,
         &receipt.sender_pubkey,
         &receipt.receiver_pubkey,
-        &receipt.blind_token,
+        &receipt.pool_pubkey,
         receipt.payload_size,
-        receipt.epoch,
         receipt.timestamp,
     );
     verify_signature(&receipt.receiver_pubkey, &data, &receipt.signature)

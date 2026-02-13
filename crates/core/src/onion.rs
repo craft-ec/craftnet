@@ -4,7 +4,6 @@
 //! Each relay peels one layer from the shard header to learn the next hop.
 //! No plaintext routing metadata is visible to intermediate relays.
 
-use sha2::{Sha256, Digest};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Id, PublicKey};
@@ -29,18 +28,12 @@ pub struct OnionLayer {
 /// Per-hop settlement data encrypted inside each onion layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnionSettlement {
-    /// Per-hop unique blind token: SHA256(user_proof || shard_id || relay_pubkey)
-    /// Different for each relay on the path — prevents cross-relay correlation.
-    pub blind_token: Id,
     /// Per-hop unique shard identifier: SHA256(request_id || "shard" || chunk_index || shard_index || relay_pubkey)
     pub shard_id: Id,
     /// Actual payload bytes (for bandwidth-weighted settlement)
     pub payload_size: u32,
-    /// Subscription epoch (anti-replay)
-    pub epoch: u64,
     /// Ephemeral subscription pubkey identifying the user's pool PDA.
     /// [0u8; 32] for free-tier (no subscription).
-    #[serde(default)]
     pub pool_pubkey: PublicKey,
 }
 
@@ -61,8 +54,6 @@ pub struct ExitPayload {
     pub request_id: Id,
     /// User's signing pubkey (for settlement)
     pub user_pubkey: PublicKey,
-    /// User proof copied into response shards
-    pub user_proof: Id,
     /// Lease set for response routing back to client
     pub lease_set: crate::lease_set::LeaseSet,
     /// Total relay hops for response path
@@ -96,21 +87,6 @@ pub struct RoutingTag {
     pub chunk_index: u16,
     /// Total number of chunks in this request/response
     pub total_chunks: u16,
-}
-
-/// Compute per-hop blind token: SHA256(user_proof || shard_id || relay_pubkey)
-///
-/// Each relay on a path sees a unique blind_token derived from the same
-/// user_proof. Prevents colluding relays from correlating settlement data.
-pub fn compute_blind_token(user_proof: &Id, shard_id: &Id, relay_pubkey: &PublicKey) -> Id {
-    let mut hasher = Sha256::new();
-    hasher.update(user_proof);
-    hasher.update(shard_id);
-    hasher.update(relay_pubkey);
-    let result = hasher.finalize();
-    let mut token = [0u8; 32];
-    token.copy_from_slice(&result);
-    token
 }
 
 impl OnionLayer {
@@ -172,10 +148,8 @@ mod tests {
             next_peer_id: vec![1, 2, 3, 4],
             next_ephemeral_pubkey: [5u8; 32],
             settlement: OnionSettlement {
-                blind_token: [6u8; 32],
                 shard_id: [7u8; 32],
                 payload_size: 1024,
-                epoch: 42,
                 pool_pubkey: [0u8; 32],
             },
             remaining_header: vec![8, 9, 10],
@@ -198,10 +172,8 @@ mod tests {
             next_peer_id: vec![],
             next_ephemeral_pubkey: [0u8; 32],
             settlement: OnionSettlement {
-                blind_token: [0u8; 32],
                 shard_id: [0u8; 32],
                 payload_size: 0,
-                epoch: 0,
                 pool_pubkey: [0u8; 32],
             },
             remaining_header: vec![],
@@ -220,7 +192,6 @@ mod tests {
         let payload = ExitPayload {
             request_id: [1u8; 32],
             user_pubkey: [2u8; 32],
-            user_proof: [3u8; 32],
             lease_set: LeaseSet {
                 session_id: [4u8; 32],
                 leases: vec![],
@@ -265,40 +236,5 @@ mod tests {
         assert_eq!(restored.total_shards, 5);
         assert_eq!(restored.chunk_index, 1);
         assert_eq!(restored.total_chunks, 3);
-    }
-
-    #[test]
-    fn test_compute_blind_token_deterministic() {
-        let user_proof = [1u8; 32];
-        let shard_id = [2u8; 32];
-        let relay_pubkey = [3u8; 32];
-
-        let t1 = compute_blind_token(&user_proof, &shard_id, &relay_pubkey);
-        let t2 = compute_blind_token(&user_proof, &shard_id, &relay_pubkey);
-        assert_eq!(t1, t2);
-    }
-
-    #[test]
-    fn test_compute_blind_token_unique_per_relay() {
-        let user_proof = [1u8; 32];
-        let shard_id = [2u8; 32];
-        let relay_a = [3u8; 32];
-        let relay_b = [4u8; 32];
-
-        let t_a = compute_blind_token(&user_proof, &shard_id, &relay_a);
-        let t_b = compute_blind_token(&user_proof, &shard_id, &relay_b);
-        assert_ne!(t_a, t_b, "Same user_proof and shard_id should yield different tokens for different relays");
-    }
-
-    #[test]
-    fn test_compute_blind_token_unique_per_shard_id() {
-        let user_proof = [1u8; 32];
-        let shard_id_a = [2u8; 32];
-        let shard_id_b = [3u8; 32];
-        let relay = [4u8; 32];
-
-        let t_a = compute_blind_token(&user_proof, &shard_id_a, &relay);
-        let t_b = compute_blind_token(&user_proof, &shard_id_b, &relay);
-        assert_ne!(t_a, t_b);
     }
 }

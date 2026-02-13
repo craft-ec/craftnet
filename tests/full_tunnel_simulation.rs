@@ -221,7 +221,7 @@ async fn test_full_tunnel_small_request() {
     // Build onion-encrypted request shards with client encryption pubkey for response
     let (_request_id, shards) = RequestBuilder::new("GET", &url)
         .header("User-Agent", "TunnelCraft-Test/1.0")
-        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, 0, client_enc_pubkey, [0u8; 32])
+        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, client_enc_pubkey, [0u8; 32])
         .expect("Failed to build onion request");
 
     assert_eq!(shards.len(), TOTAL_SHARDS);
@@ -310,7 +310,7 @@ async fn test_full_tunnel_large_response() {
 
     // Build onion request shards
     let (_request_id, shards) = RequestBuilder::new("GET", &url)
-        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, 0, client_enc_pubkey, [0u8; 32])
+        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, client_enc_pubkey, [0u8; 32])
         .expect("Failed to build onion request");
 
     println!(
@@ -394,7 +394,7 @@ async fn test_full_tunnel_json_api() {
     // Build request with Accept header
     let (_request_id, shards) = RequestBuilder::new("GET", &url)
         .header("Accept", "application/json")
-        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, 0, client_enc_pubkey, [0u8; 32])
+        .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, client_enc_pubkey, [0u8; 32])
         .unwrap();
 
     // Feed to exit
@@ -474,7 +474,7 @@ async fn test_full_tunnel_variable_sizes() {
         };
 
         let (_request_id, shards) = RequestBuilder::new("GET", &url)
-            .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, 0, client_enc_pubkey, [0u8; 32])
+            .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, client_enc_pubkey, [0u8; 32])
             .unwrap();
 
         let num_request_shards = shards.len();

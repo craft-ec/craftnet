@@ -8,7 +8,7 @@
 //! 5. HTTP request/response serialization
 //! 6. End-to-end: client -> relay(s) -> exit (direct mode)
 
-use tunnelcraft_client::{RequestBuilder, PathHop, OnionPath, compute_user_proof};
+use tunnelcraft_client::{RequestBuilder, PathHop, OnionPath};
 use tunnelcraft_core::{Shard, OnionSettlement, ExitPayload, ShardType, lease_set::LeaseSet};
 use tunnelcraft_crypto::{
     SigningKeypair, EncryptionKeypair, build_onion_header, peel_onion_layer,
@@ -59,7 +59,7 @@ fn test_build_onion_direct_mode_creates_valid_shards() {
         .header("User-Agent", "TunnelCraft-Test");
 
     let (request_id, shards) = builder
-        .build_onion(&keypair, &exit, &[], &empty_lease_set(), 1, [0u8; 32])
+        .build_onion(&keypair, &exit, &[], &empty_lease_set(), [0u8; 32])
         .expect("build_onion should succeed in direct mode");
 
     // Request ID should be non-zero
@@ -100,7 +100,7 @@ fn test_build_onion_with_single_relay_path() {
 
     let builder = RequestBuilder::new("GET", "https://example.com");
     let (_request_id, shards) = builder
-        .build_onion(&keypair, &exit, &[path], &empty_lease_set(), 42, [0u8; 32])
+        .build_onion(&keypair, &exit, &[path], &empty_lease_set(), [0u8; 32])
         .expect("build_onion should succeed with 1 relay");
 
     assert!(!shards.is_empty());
@@ -123,10 +123,8 @@ fn test_onion_header_1_hop_roundtrip() {
     let exit = EncryptionKeypair::generate();
 
     let settlement = vec![OnionSettlement {
-        blind_token: [10u8; 32],
         shard_id: [20u8; 32],
         payload_size: 512,
-        epoch: 7,
         pool_pubkey: [0u8; 32],
     }];
 
@@ -153,10 +151,8 @@ fn test_onion_header_1_hop_roundtrip() {
     assert!(layer.is_terminal);
     assert!(layer.remaining_header.is_empty());
     assert!(layer.tunnel_id.is_none());
-    assert_eq!(layer.settlement.blind_token, [10u8; 32]);
     assert_eq!(layer.settlement.shard_id, [20u8; 32]);
     assert_eq!(layer.settlement.payload_size, 512);
-    assert_eq!(layer.settlement.epoch, 7);
 }
 
 #[test]
@@ -167,17 +163,13 @@ fn test_onion_header_2_hop_roundtrip() {
 
     let settlement = vec![
         OnionSettlement {
-            blind_token: [1u8; 32],
             shard_id: [101u8; 32],
             payload_size: 1024,
-            epoch: 42,
             pool_pubkey: [0u8; 32],
         },
         OnionSettlement {
-            blind_token: [2u8; 32],
             shard_id: [102u8; 32],
             payload_size: 1024,
-            epoch: 42,
             pool_pubkey: [0u8; 32],
         },
     ];
@@ -204,7 +196,7 @@ fn test_onion_header_2_hop_roundtrip() {
     assert_eq!(layer1.next_peer_id, b"r2");
     assert!(!layer1.is_terminal);
     assert!(!layer1.remaining_header.is_empty());
-    assert_eq!(layer1.settlement.blind_token, [1u8; 32]);
+    assert_eq!(layer1.settlement.shard_id, [101u8; 32]);
 
     // Relay 2 peels its layer using the updated ephemeral key and remaining header
     let layer2 = peel_onion_layer(
@@ -217,7 +209,7 @@ fn test_onion_header_2_hop_roundtrip() {
     assert_eq!(layer2.next_peer_id, b"exit");
     assert!(layer2.is_terminal);
     assert!(layer2.remaining_header.is_empty());
-    assert_eq!(layer2.settlement.blind_token, [2u8; 32]);
+    assert_eq!(layer2.settlement.shard_id, [102u8; 32]);
 }
 
 #[test]
@@ -227,10 +219,8 @@ fn test_onion_header_wrong_key_fails() {
     let exit = EncryptionKeypair::generate();
 
     let settlement = vec![OnionSettlement {
-        blind_token: [1u8; 32],
         shard_id: [2u8; 32],
         payload_size: 100,
-        epoch: 0,
         pool_pubkey: [0u8; 32],
     }];
 
@@ -280,10 +270,8 @@ fn test_relay_handler_peels_1_hop_shard() {
     let handler = RelayHandler::new(relay_signing, relay_enc.clone());
 
     let settlement = vec![OnionSettlement {
-        blind_token: [5u8; 32],
         shard_id: [50u8; 32],
         payload_size: 256,
-        epoch: 10,
         pool_pubkey: [0u8; 32],
     }];
 
@@ -303,7 +291,7 @@ fn test_relay_handler_peels_1_hop_shard() {
     );
 
     let sender_pubkey = [9u8; 32];
-    let (modified_shard, next_peer, receipt, _, _) = handler
+    let (modified_shard, next_peer, receipt, _) = handler
         .handle_shard(shard, sender_pubkey)
         .expect("RelayHandler should peel shard successfully");
 
@@ -318,7 +306,7 @@ fn test_relay_handler_peels_1_hop_shard() {
 
     // Receipt should contain correct sender_pubkey and settlement data
     assert_eq!(receipt.sender_pubkey, sender_pubkey);
-    assert_eq!(receipt.blind_token, [5u8; 32]);
+    assert_eq!(receipt.shard_id, [50u8; 32]);
 }
 
 #[test]
@@ -334,17 +322,13 @@ fn test_relay_handler_peels_2_hop_chain() {
 
     let settlement = vec![
         OnionSettlement {
-            blind_token: [1u8; 32],
             shard_id: [101u8; 32],
             payload_size: 512,
-            epoch: 42,
             pool_pubkey: [0u8; 32],
         },
         OnionSettlement {
-            blind_token: [2u8; 32],
             shard_id: [102u8; 32],
             payload_size: 512,
-            epoch: 42,
             pool_pubkey: [0u8; 32],
         },
     ];
@@ -369,18 +353,18 @@ fn test_relay_handler_peels_2_hop_chain() {
 
     // Relay 1 peels
     let sender1 = [11u8; 32];
-    let (shard2, next1, receipt1, _, _) = handler1.handle_shard(shard, sender1).unwrap();
+    let (shard2, next1, receipt1, _) = handler1.handle_shard(shard, sender1).unwrap();
     assert_eq!(next1, b"r2");
     assert!(!shard2.header.is_empty(), "Header should still have relay2's layer");
-    assert_eq!(receipt1.blind_token, [1u8; 32]); // settlement[0]
+    assert_eq!(receipt1.shard_id, [101u8; 32]); // settlement[0]
     assert_eq!(receipt1.sender_pubkey, sender1);
 
     // Relay 2 peels
     let sender2 = [12u8; 32];
-    let (shard3, next2, receipt2, _, _) = handler2.handle_shard(shard2, sender2).unwrap();
+    let (shard3, next2, receipt2, _) = handler2.handle_shard(shard2, sender2).unwrap();
     assert_eq!(next2, b"exit");
     assert!(shard3.header.is_empty(), "After last relay, header should be empty");
-    assert_eq!(receipt2.blind_token, [2u8; 32]); // settlement[1]
+    assert_eq!(receipt2.shard_id, [102u8; 32]); // settlement[1]
     assert_eq!(receipt2.sender_pubkey, sender2);
 
     // Payload is preserved through the chain
@@ -398,10 +382,8 @@ fn test_relay_handler_wrong_key_rejects_shard() {
     let handler = RelayHandler::new(wrong_signing, wrong_enc);
 
     let settlement = vec![OnionSettlement {
-        blind_token: [1u8; 32],
         shard_id: [2u8; 32],
         payload_size: 100,
-        epoch: 0,
         pool_pubkey: [0u8; 32],
     }];
 
@@ -436,13 +418,10 @@ fn test_forward_receipt_from_relay_is_valid() {
 
     let handler = RelayHandler::new(relay_signing.clone(), relay_enc.clone());
 
-    let blind_token = [42u8; 32];
     let shard_id = [99u8; 32];
     let settlement = vec![OnionSettlement {
-        blind_token,
         shard_id,
         payload_size: 2048,
-        epoch: 100,
         pool_pubkey: [0u8; 32],
     }];
 
@@ -462,13 +441,12 @@ fn test_forward_receipt_from_relay_is_valid() {
     );
 
     let sender = [77u8; 32];
-    let (_modified, _next_peer, receipt, _, _) = handler.handle_shard(shard, sender).unwrap();
+    let (_modified, _next_peer, receipt, _) = handler.handle_shard(shard, sender).unwrap();
 
     // Verify receipt fields
     assert_eq!(receipt.sender_pubkey, sender);
     assert_eq!(receipt.receiver_pubkey, relay_signing.public_key_bytes());
-    assert_eq!(receipt.blind_token, blind_token);
-    assert_eq!(receipt.epoch, 100);
+    assert_eq!(receipt.shard_id, shard_id);
 
     // Verify receipt signature
     assert!(
@@ -480,28 +458,23 @@ fn test_forward_receipt_from_relay_is_valid() {
 #[test]
 fn test_forward_receipt_sign_and_verify() {
     let keypair = SigningKeypair::generate();
-    let request_id = [1u8; 32];
     let shard_id = [2u8; 32];
     let sender = [3u8; 32];
-    let blind_token = [4u8; 32];
+    let pool_pubkey = [4u8; 32];
 
     let receipt = sign_forward_receipt(
         &keypair,
-        &request_id,
         &shard_id,
         &sender,
-        &blind_token,
+        &pool_pubkey,
         4096,
-        55,
     );
 
-    assert_eq!(receipt.request_id, request_id);
     assert_eq!(receipt.shard_id, shard_id);
     assert_eq!(receipt.sender_pubkey, sender);
     assert_eq!(receipt.receiver_pubkey, keypair.public_key_bytes());
-    assert_eq!(receipt.blind_token, blind_token);
+    assert_eq!(receipt.pool_pubkey, pool_pubkey);
     assert_eq!(receipt.payload_size, 4096);
-    assert_eq!(receipt.epoch, 55);
 
     assert!(verify_forward_receipt(&receipt));
 }
@@ -512,12 +485,10 @@ fn test_forward_receipt_tampered_fails_verification() {
 
     let mut receipt = sign_forward_receipt(
         &keypair,
-        &[1u8; 32],
         &[2u8; 32],
         &[3u8; 32],
         &[4u8; 32],
         1024,
-        10,
     );
 
     // Tamper with the payload_size
@@ -750,7 +721,6 @@ fn test_exit_payload_encrypt_decrypt_roundtrip() {
     let payload = ExitPayload {
         request_id: [1u8; 32],
         user_pubkey: [2u8; 32],
-        user_proof: [3u8; 32],
         lease_set: empty_lease_set(),
         total_hops: 2,
         shard_type: ShardType::Request,
@@ -775,7 +745,6 @@ fn test_exit_payload_encrypt_decrypt_roundtrip() {
 
     assert_eq!(decrypted.request_id, [1u8; 32]);
     assert_eq!(decrypted.user_pubkey, [2u8; 32]);
-    assert_eq!(decrypted.user_proof, [3u8; 32]);
     assert_eq!(decrypted.total_hops, 2);
     assert_eq!(decrypted.shard_type, ShardType::Request);
     assert_eq!(decrypted.mode, 0x00);
@@ -816,7 +785,7 @@ async fn test_complete_direct_mode_flow_client_to_exit() {
         .header("User-Agent", "TunnelCraft-Test");
 
     let (_request_id, shards) = builder
-        .build_onion(&user_keypair, &exit_hop, &[], &empty_lease_set(), 1, [0u8; 32])
+        .build_onion(&user_keypair, &exit_hop, &[], &empty_lease_set(), [0u8; 32])
         .expect("build_onion should succeed");
 
     assert!(!shards.is_empty(), "Should produce shards");
@@ -891,32 +860,7 @@ fn test_shard_serialization_roundtrip() {
 }
 
 // =============================================================================
-// 11. User proof computation
-// =============================================================================
-
-#[test]
-fn test_user_proof_is_deterministic() {
-    let request_id = [1u8; 32];
-    let user_pubkey = [2u8; 32];
-    let sig = [3u8; 64];
-
-    let proof1 = compute_user_proof(&request_id, &user_pubkey, &sig);
-    let proof2 = compute_user_proof(&request_id, &user_pubkey, &sig);
-    assert_eq!(proof1, proof2, "Same inputs should produce same user_proof");
-}
-
-#[test]
-fn test_user_proof_different_inputs_differ() {
-    let proof1 = compute_user_proof(&[1u8; 32], &[2u8; 32], &[3u8; 64]);
-    let proof2 = compute_user_proof(&[4u8; 32], &[2u8; 32], &[3u8; 64]);
-    assert_ne!(proof1, proof2, "Different request_ids should produce different proofs");
-
-    let proof3 = compute_user_proof(&[1u8; 32], &[5u8; 32], &[3u8; 64]);
-    assert_ne!(proof1, proof3, "Different user_pubkeys should produce different proofs");
-}
-
-// =============================================================================
-// 12. Build onion shards contain encrypted routing tags with erasure metadata
+// 11. Build onion shards contain encrypted routing tags with erasure metadata
 // =============================================================================
 
 #[test]
@@ -931,7 +875,7 @@ fn test_build_onion_shards_have_encrypted_routing_tags() {
     };
 
     let (_request_id, shards) = RequestBuilder::new("GET", "https://example.com")
-        .build_onion(&keypair, &exit, &[], &empty_lease_set(), 1, [0u8; 32])
+        .build_onion(&keypair, &exit, &[], &empty_lease_set(), [0u8; 32])
         .expect("build_onion should succeed");
 
     // Verify each shard has a non-empty routing tag that the exit can decrypt

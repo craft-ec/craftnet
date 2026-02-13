@@ -207,31 +207,21 @@ pub struct PeerInfo {
 /// delivery. Relay A uses this receipt as on-chain proof for settlement.
 /// This replaces TCP ACK (which is fakeable at the transport level).
 ///
-/// The `blind_token` field is a per-hop unique derivation:
-/// `blind_token = SHA256(user_proof || shard_id || relay_pubkey)`.
-/// Each relay sees a different blind_token, preventing colluding relays
-/// from correlating receipts across the same path.
-///
-/// The `epoch` field prevents cross-epoch receipt replay: a relay cannot
-/// resubmit the same receipts to future subscription epochs for double rewards.
+/// The `pool_pubkey` identifies the subscription pool (ephemeral for
+/// subscribers, persistent for free-tier users).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardReceipt {
-    /// Request this shard belongs to
-    pub request_id: Id,
     /// Per-hop unique shard identifier (includes relay_pubkey in derivation)
     pub shard_id: Id,
     /// Public key of the relay that forwarded the shard (anti-Sybil: binds receipt to sender)
     pub sender_pubkey: PublicKey,
     /// Public key of the receiving node (signs this receipt)
     pub receiver_pubkey: PublicKey,
-    /// Per-hop unique blind token: SHA256(user_proof || shard_id || relay_pubkey)
-    /// Prevents cross-relay correlation of settlement data.
-    pub blind_token: Id,
+    /// Ephemeral subscription pubkey (pool identity) or persistent pubkey for free-tier
+    pub pool_pubkey: PublicKey,
     /// Actual payload bytes in the forwarded shard.
     /// Settlement weights rewards by bandwidth, not receipt count.
     pub payload_size: u32,
-    /// Subscription epoch this receipt belongs to (prevents cross-epoch replay)
-    pub epoch: u64,
     /// Unix timestamp (seconds) when the shard was received
     pub timestamp: u64,
     /// Receiver's ed25519 signature over the receipt payload
@@ -240,27 +230,22 @@ pub struct ForwardReceipt {
 }
 
 impl ForwardReceipt {
-    /// Get the data that the receiver signs (180 bytes):
-    /// request_id(32) || shard_id(32) || sender_pubkey(32) || receiver_pubkey(32) || blind_token(32) || payload_size_le(4) || epoch_le(8) || timestamp_le(8)
-    #[allow(clippy::too_many_arguments)]
+    /// Get the data that the receiver signs (140 bytes):
+    /// shard_id(32) || sender_pubkey(32) || receiver_pubkey(32) || pool_pubkey(32) || payload_size_le(4) || timestamp_le(8)
     pub fn signable_data(
-        request_id: &Id,
         shard_id: &Id,
         sender_pubkey: &PublicKey,
         receiver_pubkey: &PublicKey,
-        blind_token: &Id,
+        pool_pubkey: &PublicKey,
         payload_size: u32,
-        epoch: u64,
         timestamp: u64,
     ) -> Vec<u8> {
-        let mut data = Vec::with_capacity(32 + 32 + 32 + 32 + 32 + 4 + 8 + 8);
-        data.extend_from_slice(request_id);
+        let mut data = Vec::with_capacity(32 + 32 + 32 + 32 + 4 + 8);
         data.extend_from_slice(shard_id);
         data.extend_from_slice(sender_pubkey);
         data.extend_from_slice(receiver_pubkey);
-        data.extend_from_slice(blind_token);
+        data.extend_from_slice(pool_pubkey);
         data.extend_from_slice(&payload_size.to_le_bytes());
-        data.extend_from_slice(&epoch.to_le_bytes());
         data.extend_from_slice(&timestamp.to_le_bytes());
         data
     }
@@ -375,68 +360,55 @@ mod tests {
 
     #[test]
     fn test_forward_receipt_signable_data() {
-        let request_id = [1u8; 32];
         let shard_id = [3u8; 32];
         let sender_pubkey = [5u8; 32];
         let receiver_pubkey = [2u8; 32];
-        let blind_token = [4u8; 32];
-        let data = ForwardReceipt::signable_data(&request_id, &shard_id, &sender_pubkey, &receiver_pubkey, &blind_token, 1024, 42, 1000);
+        let pool_pubkey = [4u8; 32];
+        let data = ForwardReceipt::signable_data(&shard_id, &sender_pubkey, &receiver_pubkey, &pool_pubkey, 1024, 1000);
 
-        // 32 (request_id) + 32 (shard_id) + 32 (sender_pubkey) + 32 (receiver_pubkey) + 32 (user_proof) + 4 (payload_size) + 8 (epoch) + 8 (timestamp) = 180
-        assert_eq!(data.len(), 180);
-        assert_eq!(&data[0..32], &request_id);
-        assert_eq!(&data[32..64], &shard_id);
-        assert_eq!(&data[64..96], &sender_pubkey);
-        assert_eq!(&data[96..128], &receiver_pubkey);
-        assert_eq!(&data[128..160], &blind_token);
-        assert_eq!(&data[160..164], &1024u32.to_le_bytes());
-        assert_eq!(&data[164..172], &42u64.to_le_bytes());
-        assert_eq!(&data[172..180], &1000u64.to_le_bytes());
+        // 32 (shard_id) + 32 (sender_pubkey) + 32 (receiver_pubkey) + 32 (pool_pubkey) + 4 (payload_size) + 8 (timestamp) = 140
+        assert_eq!(data.len(), 140);
+        assert_eq!(&data[0..32], &shard_id);
+        assert_eq!(&data[32..64], &sender_pubkey);
+        assert_eq!(&data[64..96], &receiver_pubkey);
+        assert_eq!(&data[96..128], &pool_pubkey);
+        assert_eq!(&data[128..132], &1024u32.to_le_bytes());
+        assert_eq!(&data[132..140], &1000u64.to_le_bytes());
     }
 
     #[test]
     fn test_forward_receipt_signable_data_different_inputs() {
-        let blind_token = [5u8; 32];
+        let pool_pubkey = [5u8; 32];
         let sender = [9u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[11u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
+        let data1 = ForwardReceipt::signable_data(&[10u8; 32], &sender, &[2u8; 32], &pool_pubkey, 1024, 100);
+        let data2 = ForwardReceipt::signable_data(&[11u8; 32], &sender, &[2u8; 32], &pool_pubkey, 1024, 100);
         // Different shard_id should produce different data
         assert_ne!(data1, data2);
     }
 
     #[test]
     fn test_forward_receipt_same_relay_different_shards() {
-        // Same relay, same request — but different shard_ids (e.g. request vs response shard)
-        let blind_token = [5u8; 32];
+        let pool_pubkey = [5u8; 32];
         let sender = [9u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[20u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
+        let data1 = ForwardReceipt::signable_data(&[10u8; 32], &sender, &[2u8; 32], &pool_pubkey, 1024, 100);
+        let data2 = ForwardReceipt::signable_data(&[20u8; 32], &sender, &[2u8; 32], &pool_pubkey, 1024, 100);
         assert_ne!(data1, data2);
     }
 
     #[test]
-    fn test_forward_receipt_different_blind_tokens() {
+    fn test_forward_receipt_different_pool_pubkeys() {
         let sender = [9u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &[5u8; 32], 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &[6u8; 32], 1024, 0, 100);
+        let data1 = ForwardReceipt::signable_data(&[10u8; 32], &sender, &[2u8; 32], &[5u8; 32], 1024, 100);
+        let data2 = ForwardReceipt::signable_data(&[10u8; 32], &sender, &[2u8; 32], &[6u8; 32], 1024, 100);
         assert_ne!(data1, data2);
     }
 
     #[test]
     fn test_forward_receipt_different_senders() {
-        let blind_token = [5u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[9u8; 32], &[2u8; 32], &blind_token, 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[8u8; 32], &[2u8; 32], &blind_token, 1024, 0, 100);
+        let pool_pubkey = [5u8; 32];
+        let data1 = ForwardReceipt::signable_data(&[10u8; 32], &[9u8; 32], &[2u8; 32], &pool_pubkey, 1024, 100);
+        let data2 = ForwardReceipt::signable_data(&[10u8; 32], &[8u8; 32], &[2u8; 32], &pool_pubkey, 1024, 100);
         assert_ne!(data1, data2, "Different senders should produce different signable data");
-    }
-
-    #[test]
-    fn test_forward_receipt_different_epochs() {
-        let blind_token = [5u8; 32];
-        let sender = [9u8; 32];
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 0, 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &sender, &[2u8; 32], &blind_token, 1024, 1, 100);
-        assert_ne!(data1, data2, "Different epochs should produce different signable data");
     }
 
     // ==================== ExitInfo Tests ====================

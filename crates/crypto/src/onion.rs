@@ -228,10 +228,8 @@ mod tests {
 
     fn make_settlement(idx: u8) -> OnionSettlement {
         OnionSettlement {
-            blind_token: [idx; 32],
             shard_id: [idx + 100; 32],
             payload_size: 1024,
-            epoch: 42,
             pool_pubkey: [0u8; 32],
         }
     }
@@ -284,7 +282,6 @@ mod tests {
         let payload = ExitPayload {
             request_id: [1u8; 32],
             user_pubkey: [2u8; 32],
-            user_proof: [3u8; 32],
             lease_set: LeaseSet::new([4u8; 32]),
             total_hops: 2,
             shard_type: ShardType::Request,
@@ -486,7 +483,6 @@ mod tests {
         let payload = ExitPayload {
             request_id: [1u8; 32],
             user_pubkey: [2u8; 32],
-            user_proof: [3u8; 32],
             lease_set: LeaseSet::new([4u8; 32]),
             total_hops: 2,
             shard_type: ShardType::Request,

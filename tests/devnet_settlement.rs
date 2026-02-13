@@ -6,7 +6,6 @@
 //! Environment variables:
 //! - `DEVNET_KEYPAIR`    — path to funded Solana keypair JSON, or base58 secret key
 //! - `HELIUS_API_KEY`    — Photon RPC access for Light Protocol validity proofs
-//! - `DEVNET_TEST_EPOCH` — epoch number of a pre-existing expired subscription (for claim test)
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -117,17 +116,16 @@ async fn test_devnet_photon_validity_proof() -> anyhow::Result<()> {
 
     let photon = PhotonClient::from_config("https://api.devnet.solana.com", Some(&api_key));
 
-    // Derive a ClaimReceipt address for a random (user, epoch, relay) triple.
+    // Derive a ClaimReceipt address for a random (user, relay) pair.
     // This address almost certainly doesn't exist on-chain, so we should get
     // a valid non-inclusion proof.
     let user = [42u8; 32];
     let relay = [99u8; 32];
-    let epoch = 999_999u64;
     let address_tree = ADDRESS_TREE_V2;
     let program_id = SettlementConfig::DEVNET_PROGRAM_ID;
 
     let address =
-        derive_claim_receipt_address(&user, epoch, &relay, &address_tree, &program_id);
+        derive_claim_receipt_address(&user, &relay, &address_tree, &program_id);
 
     println!(
         "Derived ClaimReceipt address: {}",
@@ -176,29 +174,27 @@ async fn test_devnet_subscribe() -> anyhow::Result<()> {
     println!("SOL balance: {} lamports ({:.4} SOL)", balance, balance as f64 / 1e9);
     assert!(balance > 10_000, "Wallet needs SOL for transaction fees");
 
-    // Subscribe with 1 USDC (6 decimals)
-    let payment = 1_000_000u64; // 1 USDC
+    // Subscribe with 0.01 USDC (6 decimals)
+    let payment = 10_000u64; // 0.01 USDC
     println!("Subscribing with {} USDC...", payment as f64 / 1e6);
 
-    let (tx_sig, epoch) = client
+    let tx_sig = client
         .subscribe(Subscribe {
             user_pubkey,
             tier: tunnelcraft_core::SubscriptionTier::Standard,
             payment_amount: payment,
-            epoch_duration_secs: 30 * 24 * 3600,
+            duration_secs: 120, // 2 minutes for testing
         })
         .await?;
 
     println!("  tx: {}", bs58::encode(&tx_sig).into_string());
-    println!("  epoch: {}", epoch);
 
     // Read back subscription state
     let state = client
-        .get_subscription_state(user_pubkey, epoch)
+        .get_subscription_state(user_pubkey)
         .await?
         .expect("subscription should exist after subscribe()");
 
-    assert_eq!(state.epoch, epoch);
     assert_eq!(state.tier, tunnelcraft_core::SubscriptionTier::Standard);
     assert!(state.pool_balance > 0, "Pool should have balance");
     assert!(state.expires_at > state.created_at, "expires_at > created_at");
@@ -207,10 +203,6 @@ async fn test_devnet_subscribe() -> anyhow::Result<()> {
     println!("  pool_balance: {} USDC", state.pool_balance as f64 / 1e6);
     println!("  created_at: {}", state.created_at);
     println!("  expires_at: {}", state.expires_at);
-
-    println!();
-    println!("==> Use DEVNET_TEST_EPOCH={} for test_devnet_claim_with_light", epoch);
-    println!("    (after epoch expires + 1 day grace period)");
 
     println!("PASS: Subscription created on devnet");
     Ok(())
@@ -234,14 +226,11 @@ async fn test_devnet_subscribe() -> anyhow::Result<()> {
 async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
     let keypair_raw = skip_if_no_env!("DEVNET_KEYPAIR");
     let api_key = skip_if_no_env!("HELIUS_API_KEY");
-    let epoch_str = skip_if_no_env!("DEVNET_TEST_EPOCH");
 
     let keypair = load_keypair(&keypair_raw)?;
     let user_pubkey: [u8; 32] = keypair.pubkey().to_bytes();
-    let epoch: u64 = epoch_str.parse()?;
 
     println!("Wallet: {}", keypair.pubkey());
-    println!("Epoch:  {}", epoch);
 
     let mut config = SettlementConfig::devnet_default();
     config.helius_api_key = Some(api_key);
@@ -250,11 +239,10 @@ async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
     // 1. Load subscription state
     println!("Loading subscription state...");
     let state = client
-        .get_subscription_state(user_pubkey, epoch)
+        .get_subscription_state(user_pubkey)
         .await?
         .ok_or_else(|| anyhow::anyhow!(
-            "No subscription found for epoch {}. Run test_devnet_subscribe first.",
-            epoch,
+            "No subscription found. Run test_devnet_subscribe first.",
         ))?;
 
     let now = std::time::SystemTime::now()
@@ -288,8 +276,7 @@ async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
         println!("Posting distribution...");
         let tx_sig = client
             .post_distribution(PostDistribution {
-                user_pubkey,
-                epoch,
+                pool_pubkey: user_pubkey,
                 distribution_root: root,
                 total_bytes: relay_bytes,
                 groth16_proof: vec![],
@@ -300,7 +287,7 @@ async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
 
         // Re-read state to confirm
         let updated = client
-            .get_subscription_state(user_pubkey, epoch)
+            .get_subscription_state(user_pubkey)
             .await?
             .expect("subscription should still exist");
         assert!(updated.distribution_posted, "distribution should be posted now");
@@ -319,7 +306,7 @@ async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
 
     // 3. Claim rewards
     let balance_before = client
-        .get_subscription_state(user_pubkey, epoch)
+        .get_subscription_state(user_pubkey)
         .await?
         .map(|s| s.pool_balance)
         .unwrap_or(0);
@@ -329,8 +316,7 @@ async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
 
     let claim_tx = client
         .claim_rewards(ClaimRewards {
-            user_pubkey,
-            epoch,
+            pool_pubkey: user_pubkey,
             node_pubkey: relay_pubkey,
             relay_bytes,
             leaf_index: proof.leaf_index as u32,
@@ -343,7 +329,7 @@ async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
 
     // 4. Verify pool balance decreased
     let balance_after = client
-        .get_subscription_state(user_pubkey, epoch)
+        .get_subscription_state(user_pubkey)
         .await?
         .map(|s| s.pool_balance)
         .unwrap_or(0);
@@ -362,8 +348,7 @@ async fn test_devnet_claim_with_light() -> anyhow::Result<()> {
     println!("Attempting double-claim (should fail)...");
     let double_claim_result = client
         .claim_rewards(ClaimRewards {
-            user_pubkey,
-            epoch,
+            pool_pubkey: user_pubkey,
             node_pubkey: relay_pubkey,
             relay_bytes,
             leaf_index: proof.leaf_index as u32,

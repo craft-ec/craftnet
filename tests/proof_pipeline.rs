@@ -36,27 +36,10 @@ fn signed_proof(
     new_root: [u8; 32],
     timestamp: u64,
 ) -> ProofMessage {
-    signed_proof_epoch(keypair, pool, pool_type, 0, batch, cumulative, prev_root, new_root, timestamp)
-}
-
-/// Create a signed ProofMessage with explicit epoch
-#[allow(clippy::too_many_arguments)]
-fn signed_proof_epoch(
-    keypair: &SigningKeypair,
-    pool: [u8; 32],
-    pool_type: PoolType,
-    epoch: u64,
-    batch: u64,
-    cumulative: u64,
-    prev_root: [u8; 32],
-    new_root: [u8; 32],
-    timestamp: u64,
-) -> ProofMessage {
     let mut msg = ProofMessage {
         relay_pubkey: keypair.public_key_bytes(),
         pool_pubkey: pool,
         pool_type,
-        epoch,
         batch_bytes: batch,
         cumulative_bytes: cumulative,
         prev_root,
@@ -74,52 +57,50 @@ fn signed_proof_epoch(
 // 1. user_proof binding
 // ============================================================================
 
-/// Verify that user_proof is included in ForwardReceipt signature
+/// Verify that pool_pubkey is included in ForwardReceipt signature
 #[test]
-fn test_user_proof_included_in_receipt_signature() {
+fn test_pool_pubkey_included_in_receipt_signature() {
     let relay = SigningKeypair::generate();
-    let request_id = [1u8; 32];
     let shard_id = [2u8; 32];
 
-    let user_proof_a = [0xAA; 32];
-    let user_proof_b = [0xBB; 32];
+    let pool_pubkey_a = [0xAA; 32];
+    let pool_pubkey_b = [0xBB; 32];
 
     let sender_pubkey = [0xFFu8; 32];
-    let receipt_a = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof_a, 1024, 0);
-    let receipt_b = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof_b, 1024, 0);
+    let receipt_a = sign_forward_receipt(&relay, &shard_id, &sender_pubkey, &pool_pubkey_a, 1024);
+    let receipt_b = sign_forward_receipt(&relay, &shard_id, &sender_pubkey, &pool_pubkey_b, 1024);
 
     // Both verify
     assert!(verify_forward_receipt(&receipt_a));
     assert!(verify_forward_receipt(&receipt_b));
 
-    // But their signatures differ because user_proof is different
+    // But their signatures differ because pool_pubkey is different
     assert_ne!(
         receipt_a.signature, receipt_b.signature,
-        "Different user_proofs should produce different signatures"
+        "Different pool_pubkeys should produce different signatures"
     );
 
-    // And user_proof is stored
-    assert_eq!(receipt_a.blind_token, user_proof_a);
-    assert_eq!(receipt_b.blind_token, user_proof_b);
+    // And pool_pubkey is stored
+    assert_eq!(receipt_a.pool_pubkey, pool_pubkey_a);
+    assert_eq!(receipt_b.pool_pubkey, pool_pubkey_b);
 }
 
-/// Verify that tampering with user_proof breaks verification
+/// Verify that tampering with pool_pubkey breaks verification
 #[test]
-fn test_user_proof_tamper_breaks_verification() {
+fn test_pool_pubkey_tamper_breaks_verification() {
     let relay = SigningKeypair::generate();
-    let request_id = [1u8; 32];
     let shard_id = [2u8; 32];
-    let user_proof = [0xAA; 32];
+    let pool_pubkey = [0xAA; 32];
 
     let sender_pubkey = [0xFFu8; 32];
-    let mut receipt = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof, 1024, 0);
+    let mut receipt = sign_forward_receipt(&relay, &shard_id, &sender_pubkey, &pool_pubkey, 1024);
     assert!(verify_forward_receipt(&receipt));
 
-    // Tamper with user_proof
-    receipt.blind_token = [0xFF; 32];
+    // Tamper with pool_pubkey
+    receipt.pool_pubkey = [0xFF; 32];
     assert!(
         !verify_forward_receipt(&receipt),
-        "Tampered user_proof should fail verification"
+        "Tampered pool_pubkey should fail verification"
     );
 }
 
@@ -212,7 +193,7 @@ fn test_proof_message_chain_integrity() {
     agg.handle_proof(msg3).unwrap();
 
     // Verify final state
-    let usage = agg.get_pool_usage(&(pool, PoolType::Subscribed, 0));
+    let usage = agg.get_pool_usage(&(pool, PoolType::Subscribed));
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].1, 350);
 }
@@ -233,7 +214,7 @@ fn test_proof_chain_break_detected() {
     agg.handle_proof(msg_bad).unwrap();
 
     // Pool state should still reflect only batch 1 (chain break was buffered, not applied)
-    let usage = agg.get_pool_usage(&(pool, PoolType::Subscribed, 0));
+    let usage = agg.get_pool_usage(&(pool, PoolType::Subscribed));
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].1, 100, "Cumulative should still be 100 from batch 1");
 }
@@ -281,7 +262,7 @@ fn test_aggregator_multi_relay_distribution() {
         agg.handle_proof(msg).unwrap();
     }
 
-    let dist = agg.build_distribution(&(pool, PoolType::Subscribed, 0)).unwrap();
+    let dist = agg.build_distribution(&(pool, PoolType::Subscribed)).unwrap();
     assert_eq!(dist.total, 1000);
     assert_eq!(dist.entries.len(), 5);
     assert_ne!(dist.root, [0u8; 32]);
@@ -314,7 +295,7 @@ fn test_distribution_root_order_independent() {
         agg2.handle_proof(msg).unwrap();
     }
 
-    let pool_key = (pool, PoolType::Subscribed, 0);
+    let pool_key = (pool, PoolType::Subscribed);
     let dist1 = agg1.build_distribution(&pool_key).unwrap();
     let dist2 = agg2.build_distribution(&pool_key).unwrap();
 
@@ -341,7 +322,7 @@ async fn test_aggregator_to_settlement_claim_flow() {
         .as_secs();
 
     // Create expired subscription (past grace)
-    let epoch = settlement
+    settlement
         .add_mock_subscription_with_expiry(
             user_pubkey,
             tunnelcraft_core::SubscriptionTier::Standard,
@@ -367,14 +348,13 @@ async fn test_aggregator_to_settlement_claim_flow() {
     }
 
     // Build distribution
-    let dist = agg.build_distribution(&(user_pubkey, PoolType::Subscribed, 0)).unwrap();
+    let dist = agg.build_distribution(&(user_pubkey, PoolType::Subscribed)).unwrap();
     assert_eq!(dist.total, 1000);
 
     // Post distribution on-chain (mock)
     settlement
         .post_distribution(PostDistribution {
-            user_pubkey,
-            epoch,
+            pool_pubkey: user_pubkey,
             distribution_root: dist.root,
             total_bytes: dist.total,
             groth16_proof: vec![],
@@ -389,8 +369,7 @@ async fn test_aggregator_to_settlement_claim_flow() {
     for (relay, count) in &relay_counts {
         settlement
             .claim_rewards(ClaimRewards {
-                user_pubkey,
-                epoch,
+                pool_pubkey: user_pubkey,
                 node_pubkey: *relay,
                 relay_bytes: *count,
                 leaf_index: 0,
@@ -406,7 +385,7 @@ async fn test_aggregator_to_settlement_claim_flow() {
 
     // Pool should be fully drained
     let sub = settlement
-        .get_subscription_state(user_pubkey, epoch)
+        .get_subscription_state(user_pubkey)
         .await
         .unwrap()
         .unwrap();
@@ -427,7 +406,7 @@ async fn test_chained_proofs_to_settlement() {
         .unwrap()
         .as_secs();
 
-    let epoch = settlement
+    settlement
         .add_mock_subscription_with_expiry(
             user_pubkey,
             tunnelcraft_core::SubscriptionTier::Premium,
@@ -452,7 +431,7 @@ async fn test_chained_proofs_to_settlement() {
     agg.handle_proof(msg3).unwrap();
 
     // Build distribution — single relay with 300 total
-    let dist = agg.build_distribution(&(user_pubkey, PoolType::Subscribed, 0)).unwrap();
+    let dist = agg.build_distribution(&(user_pubkey, PoolType::Subscribed)).unwrap();
     assert_eq!(dist.total, 300);
     assert_eq!(dist.entries.len(), 1);
     assert_eq!(dist.entries[0], (relay, 300));
@@ -460,8 +439,7 @@ async fn test_chained_proofs_to_settlement() {
     // Post and claim
     settlement
         .post_distribution(PostDistribution {
-            user_pubkey,
-            epoch,
+            pool_pubkey: user_pubkey,
             distribution_root: dist.root,
             total_bytes: dist.total,
             groth16_proof: vec![],
@@ -472,8 +450,7 @@ async fn test_chained_proofs_to_settlement() {
 
     settlement
         .claim_rewards(ClaimRewards {
-            user_pubkey,
-            epoch,
+            pool_pubkey: user_pubkey,
             node_pubkey: relay,
             relay_bytes: 300,
             leaf_index: 0,
@@ -484,7 +461,7 @@ async fn test_chained_proofs_to_settlement() {
         .unwrap();
 
     // 300/300 * 500_000 = 500_000 (sole relay gets full pool)
-    let sub = settlement.get_subscription_state(user_pubkey, epoch).await.unwrap().unwrap();
+    let sub = settlement.get_subscription_state(user_pubkey).await.unwrap().unwrap();
     assert_eq!(sub.pool_balance, 0);
 }
 
@@ -499,20 +476,19 @@ async fn test_post_distribution_blocked_during_active() {
     let user = [1u8; 32];
 
     // Fresh subscription — active
-    let (_sig, epoch) = settlement
+    settlement
         .subscribe(Subscribe {
             user_pubkey: user,
             tier: tunnelcraft_core::SubscriptionTier::Standard,
             payment_amount: 1_000_000,
-            epoch_duration_secs: 30 * 24 * 3600,
+            duration_secs: 30 * 24 * 3600,
         })
         .await
         .unwrap();
 
     let result = settlement
         .post_distribution(PostDistribution {
-            user_pubkey: user,
-            epoch,
+            pool_pubkey: user,
             distribution_root: [0xAA; 32],
             total_bytes: 100,
             groth16_proof: vec![],
@@ -536,7 +512,7 @@ async fn test_claim_blocked_without_distribution() {
         .as_secs();
 
     // Expired subscription but no distribution posted
-    let epoch = settlement
+    settlement
         .add_mock_subscription_with_expiry(
             user,
             tunnelcraft_core::SubscriptionTier::Standard,
@@ -548,8 +524,7 @@ async fn test_claim_blocked_without_distribution() {
 
     let result = settlement
         .claim_rewards(ClaimRewards {
-            user_pubkey: user,
-            epoch,
+            pool_pubkey: user,
             node_pubkey: node,
             relay_bytes: 50,
             leaf_index: 0,
@@ -573,7 +548,7 @@ async fn test_double_claim_rejected_e2e() {
         .unwrap()
         .as_secs();
 
-    let epoch = settlement
+    settlement
         .add_mock_subscription_with_expiry(
             user,
             tunnelcraft_core::SubscriptionTier::Standard,
@@ -585,8 +560,7 @@ async fn test_double_claim_rejected_e2e() {
 
     settlement
         .post_distribution(PostDistribution {
-            user_pubkey: user,
-            epoch,
+            pool_pubkey: user,
             distribution_root: [0xDD; 32],
             total_bytes: 100,
             groth16_proof: vec![],
@@ -598,8 +572,7 @@ async fn test_double_claim_rejected_e2e() {
     // First claim succeeds
     settlement
         .claim_rewards(ClaimRewards {
-            user_pubkey: user,
-            epoch,
+            pool_pubkey: user,
             node_pubkey: node,
             relay_bytes: 50,
             leaf_index: 0,
@@ -612,8 +585,7 @@ async fn test_double_claim_rejected_e2e() {
     // Second claim fails
     let result = settlement
         .claim_rewards(ClaimRewards {
-            user_pubkey: user,
-            epoch,
+            pool_pubkey: user,
             node_pubkey: node,
             relay_bytes: 50,
             leaf_index: 0,
@@ -674,7 +646,6 @@ fn test_proof_message_gossip_roundtrip() {
         relay_pubkey: [42u8; 32],
         pool_pubkey: [7u8; 32],
         pool_type: PoolType::Subscribed,
-        epoch: 0,
         batch_bytes: 10_000,
         cumulative_bytes: 50_000,
         prev_root: [0xAA; 32],
@@ -723,9 +694,9 @@ async fn test_multi_pool_aggregation_and_claims() {
         .as_secs();
 
     // Both users have expired subscriptions
-    let mut user_epochs = Vec::new();
+    let mut users = Vec::new();
     for (user, balance) in [(user_a, 1_000_000u64), (user_b, 500_000)] {
-        let epoch = settlement
+        settlement
             .add_mock_subscription_with_expiry(
                 user,
                 tunnelcraft_core::SubscriptionTier::Standard,
@@ -734,7 +705,7 @@ async fn test_multi_pool_aggregation_and_claims() {
                 now - 10 * 24 * 3600,
             )
             .unwrap();
-        user_epochs.push((user, epoch));
+        users.push(user);
     }
 
     // Aggregator tracks both pools
@@ -745,15 +716,14 @@ async fn test_multi_pool_aggregation_and_claims() {
     agg.handle_proof(signed_proof(&relay_kp, user_b, PoolType::Subscribed, 300, 300, [0u8; 32], [0xBB; 32], now)).unwrap();
 
     // Post distribution and claim for each pool independently
-    for &(user, epoch) in &user_epochs {
+    for &user in &users {
         let expected_count = if user == user_a { 700u64 } else { 300 };
-        let dist = agg.build_distribution(&(user, PoolType::Subscribed, 0)).unwrap();
+        let dist = agg.build_distribution(&(user, PoolType::Subscribed)).unwrap();
         assert_eq!(dist.total, expected_count);
 
         settlement
             .post_distribution(PostDistribution {
-                user_pubkey: user,
-                epoch,
+                pool_pubkey: user,
                 distribution_root: dist.root,
                 total_bytes: dist.total,
                 groth16_proof: vec![],
@@ -764,8 +734,7 @@ async fn test_multi_pool_aggregation_and_claims() {
 
         settlement
             .claim_rewards(ClaimRewards {
-                user_pubkey: user,
-                epoch,
+                pool_pubkey: user,
                 node_pubkey: relay,
                 relay_bytes: expected_count,
                 leaf_index: 0,
@@ -777,9 +746,9 @@ async fn test_multi_pool_aggregation_and_claims() {
     }
 
     // Both pools drained
-    for &(user, epoch) in &user_epochs {
+    for &user in &users {
         let sub = settlement
-            .get_subscription_state(user, epoch)
+            .get_subscription_state(user)
             .await
             .unwrap()
             .unwrap();

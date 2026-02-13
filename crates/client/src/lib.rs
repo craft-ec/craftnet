@@ -59,7 +59,7 @@ pub use credits::CreditManager;
 pub use path::{PathHop, OnionPath, PathSelector, TopologyGraph, TopologyRelay, random_id};
 
 // Request builder
-pub use request::{RequestBuilder, compute_user_proof};
+pub use request::RequestBuilder;
 
 // Tunnel response
 pub use response::TunnelResponse;

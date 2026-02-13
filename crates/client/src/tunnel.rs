@@ -9,7 +9,7 @@ use sha2::{Sha256, Digest};
 use tunnelcraft_core::{
     Shard, Id, PublicKey, ExitPayload, ShardType, OnionSettlement,
     TunnelMetadata, PAYLOAD_MODE_TUNNEL,
-    compute_blind_token, lease_set::LeaseSet,
+    lease_set::LeaseSet,
 };
 use tunnelcraft_crypto::{
     SigningKeypair, build_onion_header, encrypt_exit_payload, encrypt_routing_tag,
@@ -18,7 +18,6 @@ use tunnelcraft_erasure::TOTAL_SHARDS;
 use tunnelcraft_erasure::chunker::chunk_and_encode;
 
 use crate::path::{OnionPath, PathHop, random_id};
-use crate::request::compute_user_proof;
 use crate::{ClientError, Result};
 
 /// Build tunnel-mode onion-routed shards from raw TCP bytes.
@@ -31,16 +30,11 @@ pub fn build_tunnel_shards(
     exit: &PathHop,
     paths: &[OnionPath],
     lease_set: &LeaseSet,
-    epoch: u64,
     pool_pubkey: PublicKey,
 ) -> Result<(Id, Vec<Shard>)> {
     let request_id = random_id();
     let assembly_id = random_id();
     let user_pubkey = keypair.public_key_bytes();
-
-    // Compute user_proof
-    let sig = tunnelcraft_crypto::sign_data(keypair, &request_id);
-    let user_proof = compute_user_proof(&request_id, &user_pubkey, &sig);
 
     // Build payload: [metadata_len: u32 BE] [metadata bincode] [tcp_data]
     // (mode byte is NOT in data — it's the ExitPayload.mode field)
@@ -56,7 +50,6 @@ pub fn build_tunnel_shards(
     let exit_payload = ExitPayload {
         request_id,
         user_pubkey,
-        user_proof,
         lease_set: lease_set.clone(),
         total_hops: paths.first().map(|p| p.hops.len() as u8).unwrap_or(0),
         shard_type: ShardType::Request,
@@ -89,15 +82,12 @@ pub fn build_tunnel_shards(
                 &paths[i % paths.len()]
             };
 
-            // Build per-hop settlement data with unique shard_id and blind_token per relay
+            // Build per-hop settlement data with unique shard_id per relay
             let settlement: Vec<OnionSettlement> = path.hops.iter().map(|hop| {
                 let shard_id = generate_shard_id(&request_id, chunk_index, i as u8, &hop.signing_pubkey);
-                let blind_token = compute_blind_token(&user_proof, &shard_id, &hop.signing_pubkey);
                 OnionSettlement {
-                    blind_token,
                     shard_id,
                     payload_size: shard_payload.len() as u32,
-                    epoch,
                     pool_pubkey,
                 }
             }).collect();
@@ -183,7 +173,6 @@ mod tests {
             &exit,
             &[], // direct mode
             &lease_set,
-            42,
             [0u8; 32],
         ).unwrap();
 

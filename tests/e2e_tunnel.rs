@@ -74,7 +74,6 @@ async fn test_full_tunnel_roundtrip_direct() {
             &exit_hop,
             &[],           // direct mode: no relay paths
             &lease_set,
-            0,             // epoch
             [0u8; 32],     // pool_pubkey (free tier)
         )
         .expect("build_onion should succeed");
@@ -141,15 +140,15 @@ async fn test_exit_settlement_integration() {
     let settlement_client = Arc::new(SettlementClient::new(settlement_config, exit_pubkey));
 
     // Subscribe the user (payment goes into their pool)
-    let (_sig, epoch) = settlement_client.subscribe(tunnelcraft_settlement::Subscribe {
+    settlement_client.subscribe(tunnelcraft_settlement::Subscribe {
         user_pubkey,
         tier: tunnelcraft_core::SubscriptionTier::Standard,
         payment_amount: 1000,
-        epoch_duration_secs: 30 * 24 * 3600,
+        duration_secs: 30 * 24 * 3600,
     }).await.expect("Subscribe should succeed");
 
     // Verify subscription exists
-    let state = settlement_client.get_subscription_state(user_pubkey, epoch).await
+    let state = settlement_client.get_subscription_state(user_pubkey).await
         .expect("Get state should succeed")
         .expect("Subscription should exist");
     assert_eq!(state.pool_balance, 1000);
@@ -205,7 +204,6 @@ fn test_erasure_reconstruction_from_subset() {
             &exit_hop,
             &[],           // direct mode
             &lease_set,
-            42,
             [0u8; 32],     // pool_pubkey (free tier)
         )
         .expect("build_onion should succeed");
@@ -263,13 +261,10 @@ fn test_onion_relay_forward() {
     let relay_handler = RelayHandler::new(relay_signing.clone(), relay_enc.clone());
 
     // === Build a shard with one relay hop ===
-    let blind_token = [42u8; 32];
     let shard_id = [99u8; 32];
     let settlement = vec![OnionSettlement {
-        blind_token,
         shard_id,
         payload_size: 1024,
-        epoch: 7,
         pool_pubkey: [0u8; 32],
     }];
 
@@ -303,7 +298,7 @@ fn test_onion_relay_forward() {
 
     // === Relay processes the shard ===
     let sender_pubkey = [10u8; 32]; // simulated sender
-    let (modified_shard, next_peer, receipt, _, _) = relay_handler
+    let (modified_shard, next_peer, receipt, _) = relay_handler
         .handle_shard(shard, sender_pubkey)
         .expect("Relay should successfully peel one layer");
 
@@ -329,9 +324,7 @@ fn test_onion_relay_forward() {
     // === Verify ForwardReceipt ===
     assert_eq!(receipt.sender_pubkey, sender_pubkey, "Receipt sender should match");
     assert_eq!(receipt.receiver_pubkey, relay_signing.public_key_bytes(), "Receipt receiver should be relay");
-    assert_eq!(receipt.blind_token, blind_token, "Receipt blind_token should match settlement data");
     assert_eq!(receipt.payload_size, 1024, "Receipt payload_size should match settlement");
-    assert_eq!(receipt.epoch, 7, "Receipt epoch should match settlement");
 
     // Verify receipt signature
     assert!(
@@ -362,17 +355,13 @@ fn test_onion_relay_two_hop_chain() {
     // === Build two-hop onion header ===
     let settlement = vec![
         OnionSettlement {
-            blind_token: [1u8; 32],
             shard_id: [101u8; 32],
             payload_size: 2048,
-            epoch: 5,
             pool_pubkey: [0u8; 32],
         },
         OnionSettlement {
-            blind_token: [2u8; 32],
             shard_id: [102u8; 32],
             payload_size: 2048,
-            epoch: 5,
             pool_pubkey: [0u8; 32],
         },
     ];
@@ -400,20 +389,20 @@ fn test_onion_relay_two_hop_chain() {
 
     // === Relay 1 peels ===
     let sender1 = [10u8; 32];
-    let (shard2, next1, receipt1, _, _) = handler1.handle_shard(shard, sender1).unwrap();
+    let (shard2, next1, receipt1, _) = handler1.handle_shard(shard, sender1).unwrap();
 
     assert_eq!(next1, b"r2", "Relay1 should forward to relay2");
     assert!(!shard2.header.is_empty(), "After first peel, header should still have data");
-    assert_eq!(receipt1.blind_token, [1u8; 32], "Receipt1 settlement data should be hop 1");
+    assert_eq!(receipt1.shard_id, [101u8; 32], "Receipt1 shard_id should be hop 1");
     assert!(verify_forward_receipt(&receipt1), "Receipt1 signature should verify");
 
     // === Relay 2 peels ===
     let sender2 = relay1_signing.public_key_bytes();
-    let (shard3, next2, receipt2, _, _) = handler2.handle_shard(shard2, sender2).unwrap();
+    let (shard3, next2, receipt2, _) = handler2.handle_shard(shard2, sender2).unwrap();
 
     assert_eq!(next2, b"exit", "Relay2 should forward to exit");
     assert!(shard3.header.is_empty(), "After final peel, header should be empty");
-    assert_eq!(receipt2.blind_token, [2u8; 32], "Receipt2 settlement data should be hop 2");
+    assert_eq!(receipt2.shard_id, [102u8; 32], "Receipt2 shard_id should be hop 2");
     assert!(verify_forward_receipt(&receipt2), "Receipt2 signature should verify");
 
     // Payload should be preserved through the chain
@@ -434,10 +423,8 @@ fn test_wrong_key_cannot_peel_onion() {
 
     // Build onion for the correct relay
     let settlement = vec![OnionSettlement {
-        blind_token: [0u8; 32],
         shard_id: [0u8; 32],
         payload_size: 100,
-        epoch: 0,
         pool_pubkey: [0u8; 32],
     }];
 
@@ -521,7 +508,6 @@ async fn test_client_relay_exit_integration() {
             &exit_hop,
             &[onion_path],
             &lease_set,
-            0,
             [0u8; 32],     // pool_pubkey (free tier)
         )
         .expect("build_onion with relay path should succeed");
@@ -538,7 +524,7 @@ async fn test_client_relay_exit_integration() {
     let sender_pubkey = user_keypair.public_key_bytes();
 
     for shard in shards {
-        let (modified_shard, next_peer, receipt, _, _) = relay_handler
+        let (modified_shard, next_peer, receipt, _) = relay_handler
             .handle_shard(shard, sender_pubkey)
             .expect("Relay should peel onion layer");
 

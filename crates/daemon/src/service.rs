@@ -566,13 +566,13 @@ impl DaemonService {
             user_pubkey: self.node_pubkey,
             tier,
             payment_amount: amount,
-            epoch_duration_secs: 30 * 24 * 3600, // 30 days
+            duration_secs: 30 * 24 * 3600, // 30 days
         };
-        let (_sig, epoch) = self.settlement_client.subscribe(subscribe).await
+        let _sig = self.settlement_client.subscribe(subscribe).await
             .map_err(|e| crate::DaemonError::SdkError(format!("Subscribe failed: {}", e)))?;
 
         // 3. Verify on-chain subscription state
-        let state = self.settlement_client.get_subscription_state(self.node_pubkey, epoch).await
+        let state = self.settlement_client.get_subscription_state(self.node_pubkey).await
             .map_err(|e| crate::DaemonError::SdkError(format!("Verify failed: {}", e)))?
             .ok_or_else(|| crate::DaemonError::SdkError("Subscription not found after subscribe".to_string()))?;
         let balance = state.pool_balance;

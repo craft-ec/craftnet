@@ -18,16 +18,14 @@ impl StubProver {
         Self
     }
 
-    /// Hash a receipt into a leaf: SHA256(request_id || shard_id || sender_pubkey || receiver_pubkey || blind_token || payload_size_le || epoch || timestamp)
+    /// Hash a receipt into a leaf: SHA256(shard_id || sender_pubkey || receiver_pubkey || pool_pubkey || payload_size_le || timestamp_le)
     fn receipt_leaf(receipt: &ForwardReceipt) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(receipt.request_id);
         hasher.update(receipt.shard_id);
         hasher.update(receipt.sender_pubkey);
         hasher.update(receipt.receiver_pubkey);
-        hasher.update(receipt.blind_token);
+        hasher.update(receipt.pool_pubkey);
         hasher.update(receipt.payload_size.to_le_bytes());
-        hasher.update(receipt.epoch.to_le_bytes());
         hasher.update(receipt.timestamp.to_le_bytes());
         let result = hasher.finalize();
         let mut out = [0u8; 32];
@@ -67,15 +65,13 @@ impl Prover for StubProver {
 mod tests {
     use super::*;
 
-    fn make_receipt(request_id: u8, shard_id: u8, receiver: u8) -> ForwardReceipt {
+    fn make_receipt(shard_id: u8, receiver: u8) -> ForwardReceipt {
         ForwardReceipt {
-            request_id: [request_id; 32],
             shard_id: [shard_id; 32],
             sender_pubkey: [0xFFu8; 32],
             receiver_pubkey: [receiver; 32],
-            blind_token: [0u8; 32],
+            pool_pubkey: [0u8; 32],
             payload_size: 1024,
-            epoch: 0,
             timestamp: 1700000000,
             signature: [0u8; 64],
         }
@@ -86,9 +82,9 @@ mod tests {
         let prover = StubProver::new();
 
         let batch = vec![
-            make_receipt(1, 10, 2),
-            make_receipt(1, 11, 3),
-            make_receipt(1, 12, 4),
+            make_receipt(10, 2),
+            make_receipt(11, 3),
+            make_receipt(12, 4),
         ];
 
         let output = prover.prove(&batch).unwrap();
@@ -109,7 +105,7 @@ mod tests {
     #[test]
     fn test_stub_prover_deterministic() {
         let prover = StubProver::new();
-        let batch = vec![make_receipt(1, 10, 2), make_receipt(1, 11, 3)];
+        let batch = vec![make_receipt(10, 2), make_receipt(11, 3)];
 
         let out1 = prover.prove(&batch).unwrap();
         let out2 = prover.prove(&batch).unwrap();
@@ -119,8 +115,8 @@ mod tests {
     #[test]
     fn test_stub_prover_different_batches() {
         let prover = StubProver::new();
-        let batch1 = vec![make_receipt(1, 10, 2)];
-        let batch2 = vec![make_receipt(2, 10, 2)];
+        let batch1 = vec![make_receipt(10, 2)];
+        let batch2 = vec![make_receipt(20, 2)];
 
         let out1 = prover.prove(&batch1).unwrap();
         let out2 = prover.prove(&batch2).unwrap();

@@ -41,7 +41,7 @@ pub enum SettlementError {
     NotAuthorized,
 
     #[error("Epoch not complete")]
-    EpochNotComplete,
+    PoolNotClaimable,
 
     #[error("Distribution not posted")]
     DistributionNotPosted,

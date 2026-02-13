@@ -16,31 +16,29 @@ pub enum PoolType {
     Free,
 }
 
-/// A ZK-proven summary of receipts for a single (relay, pool, epoch) triple.
+/// A proven summary of receipts for a single (relay, pool) pair.
 ///
 /// Relays generate these locally by batching ForwardReceipts into
-/// Merkle trees and producing ZK proofs. Each message extends a
-/// running chain of proofs (prev_root → new_root) so the aggregator
-/// can verify no receipts are double-counted.
+/// Merkle trees. Each message extends a running chain of proofs
+/// (prev_root → new_root) so the aggregator can verify no receipts
+/// are double-counted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofMessage {
     /// Relay that generated this proof
     pub relay_pubkey: [u8; 32],
-    /// User whose pool these receipts belong to
+    /// Ephemeral pool pubkey (subscribed) or persistent pubkey (free-tier)
     pub pool_pubkey: [u8; 32],
     /// Whether the user is subscribed or free-tier
     pub pool_type: PoolType,
-    /// Subscription epoch these receipts belong to (prevents cross-epoch replay)
-    pub epoch: u64,
     /// Total payload bytes in this batch of receipts
     pub batch_bytes: u64,
-    /// Running total of payload bytes for this (relay, pool, epoch) triple
+    /// Running total of payload bytes for this (relay, pool) pair
     pub cumulative_bytes: u64,
     /// Previous Merkle root (chained — verifies continuity)
     pub prev_root: [u8; 32],
     /// New Merkle root after adding this batch
     pub new_root: [u8; 32],
-    /// ZK proof bytes (stub initially — mock proof)
+    /// Proof bytes (stub — Merkle root only)
     pub proof: Vec<u8>,
     /// Unix timestamp when this proof was generated
     pub timestamp: u64,
@@ -61,20 +59,18 @@ impl ProofMessage {
 
     /// Data that gets signed by the relay (everything except signature)
     pub fn signable_data(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(32 + 32 + 1 + 8 + 8 + 8 + 32 + 32 + 8);
+        let mut data = Vec::with_capacity(32 + 32 + 1 + 8 + 8 + 32 + 32 + 8);
         data.extend_from_slice(&self.relay_pubkey);
         data.extend_from_slice(&self.pool_pubkey);
         data.push(match self.pool_type {
             PoolType::Subscribed => 0,
             PoolType::Free => 1,
         });
-        data.extend_from_slice(&self.epoch.to_le_bytes());
         data.extend_from_slice(&self.batch_bytes.to_le_bytes());
         data.extend_from_slice(&self.cumulative_bytes.to_le_bytes());
         data.extend_from_slice(&self.prev_root);
         data.extend_from_slice(&self.new_root);
         data.extend_from_slice(&self.timestamp.to_le_bytes());
-        // proof bytes are covered by the ZK proof itself, not the signature
         data
     }
 }
@@ -83,7 +79,7 @@ impl ProofMessage {
 ///
 /// Sent by relays that lost their proof state (e.g., disk corruption) and
 /// need to recover their chain. The aggregator responds with the latest
-/// root and cumulative count for the given (relay, pool, pool_type, epoch) quad.
+/// root and cumulative count for the given (relay, pool, pool_type) triple.
 ///
 /// This is **trustless**: if the aggregator lies (wrong root), the relay's
 /// next ProofMessage will fail at every other aggregator with `ChainBreak`.
@@ -95,8 +91,6 @@ pub struct ProofStateQuery {
     pub pool_pubkey: [u8; 32],
     /// Pool type (Subscribed or Free)
     pub pool_type: PoolType,
-    /// Subscription epoch
-    pub epoch: u64,
 }
 
 impl ProofStateQuery {
@@ -204,7 +198,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
-            epoch: 0,
+
             batch_bytes: 10_000,
             cumulative_bytes: 50_000,
             prev_root: [0xAA; 32],
@@ -235,7 +229,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [3u8; 32],
             pool_type: PoolType::Free,
-            epoch: 0,
+
             batch_bytes: 5_000,
             cumulative_bytes: 5_000,
             prev_root: [0u8; 32], // First batch — zero root
@@ -257,7 +251,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
-            epoch: 0,
+
             batch_bytes: 100,
             cumulative_bytes: 200,
             prev_root: [0xAA; 32],
@@ -283,7 +277,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
-            epoch: 0,
+
             batch_bytes: 100,
             cumulative_bytes: 200,
             prev_root: [0xAA; 32],
@@ -311,7 +305,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
-            epoch: 0,
+
         };
         let bytes = query.to_bytes();
         let decoded = ProofStateQuery::from_bytes(&bytes).unwrap();

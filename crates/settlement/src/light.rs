@@ -339,21 +339,18 @@ pub struct PhotonValidityProof {
 
 /// Derive the ClaimReceipt compressed address deterministically.
 ///
-/// Seeds: `["claim_receipt", user_pubkey, epoch_le, relay_pubkey]`
+/// Seeds: `["claim_receipt", pool_pubkey, relay_pubkey]`
 /// Must match the on-chain `derive_address` call in the claim instruction.
 pub fn derive_claim_receipt_address(
-    user_pubkey: &[u8; 32],
-    epoch: u64,
+    pool_pubkey: &[u8; 32],
     relay_pubkey: &[u8; 32],
     address_tree: &[u8; 32],
     program_id: &[u8; 32],
 ) -> [u8; 32] {
-    let epoch_le = epoch.to_le_bytes();
     let (address, _seed) = derive_address(
         &[
             CLAIM_RECEIPT_SEED,
-            user_pubkey.as_ref(),
-            epoch_le.as_ref(),
+            pool_pubkey.as_ref(),
             relay_pubkey.as_ref(),
         ],
         address_tree,
@@ -447,16 +444,14 @@ pub struct ClaimProofResult {
 /// 4. Assembles `ClaimLightParams`
 pub async fn prepare_claim_light_params(
     photon: &PhotonClient,
-    user_pubkey: &[u8; 32],
-    epoch: u64,
+    pool_pubkey: &[u8; 32],
     relay_pubkey: &[u8; 32],
     program_id: &[u8; 32],
     trees: &LightTreeConfig,
 ) -> Result<ClaimProofResult> {
     // 1. Derive address
     let address = derive_claim_receipt_address(
-        user_pubkey,
-        epoch,
+        pool_pubkey,
         relay_pubkey,
         &trees.address_tree,
         program_id,
@@ -503,32 +498,33 @@ mod tests {
 
     #[test]
     fn test_derive_claim_receipt_address_deterministic() {
-        let user = [1u8; 32];
+        let pool = [1u8; 32];
         let relay = [2u8; 32];
-        let epoch = 42u64;
         let tree = ADDRESS_TREE_V2;
         let program_id = [99u8; 32];
 
-        let addr1 = derive_claim_receipt_address(&user, epoch, &relay, &tree, &program_id);
-        let addr2 = derive_claim_receipt_address(&user, epoch, &relay, &tree, &program_id);
+        let addr1 = derive_claim_receipt_address(&pool, &relay, &tree, &program_id);
+        let addr2 = derive_claim_receipt_address(&pool, &relay, &tree, &program_id);
         assert_eq!(addr1, addr2);
         assert_ne!(addr1, [0u8; 32]); // non-trivial
     }
 
     #[test]
     fn test_derive_claim_receipt_address_different_inputs() {
-        let user = [1u8; 32];
+        let pool = [1u8; 32];
         let relay = [2u8; 32];
         let tree = ADDRESS_TREE_V2;
         let program_id = [99u8; 32];
 
-        let addr_epoch0 = derive_claim_receipt_address(&user, 0, &relay, &tree, &program_id);
-        let addr_epoch1 = derive_claim_receipt_address(&user, 1, &relay, &tree, &program_id);
-        assert_ne!(addr_epoch0, addr_epoch1);
+        let addr_pool1 = derive_claim_receipt_address(&pool, &relay, &tree, &program_id);
+
+        let pool2 = [4u8; 32];
+        let addr_pool2 = derive_claim_receipt_address(&pool2, &relay, &tree, &program_id);
+        assert_ne!(addr_pool1, addr_pool2);
 
         let relay2 = [3u8; 32];
-        let addr_relay2 = derive_claim_receipt_address(&user, 0, &relay2, &tree, &program_id);
-        assert_ne!(addr_epoch0, addr_relay2);
+        let addr_relay2 = derive_claim_receipt_address(&pool, &relay2, &tree, &program_id);
+        assert_ne!(addr_pool1, addr_relay2);
     }
 
     #[test]

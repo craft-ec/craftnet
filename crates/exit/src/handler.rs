@@ -16,7 +16,6 @@ use tracing::{debug, info, warn};
 use tunnelcraft_core::{
     Shard, Id, PublicKey, ExitPayload,
     TunnelMetadata, PAYLOAD_MODE_TUNNEL,
-    compute_blind_token,
 };
 use tunnelcraft_crypto::{
     SigningKeypair, EncryptionKeypair,
@@ -641,13 +640,10 @@ impl ExitHandler {
                         id.copy_from_slice(&hash);
                         id
                     };
-                    let blind_token = compute_blind_token(&exit_payload.user_proof, &shard_id, &gateway_pubkey);
 
                     let settlement = vec![OnionSettlement {
-                        blind_token,
                         shard_id,
                         payload_size: payload.len() as u32,
-                        epoch: 0,
                         pool_pubkey: exit_payload.user_pubkey,
                     }];
 

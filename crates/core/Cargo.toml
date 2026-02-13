@@ -13,4 +13,3 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
-sha2 = { workspace = true }

@@ -768,13 +768,11 @@ mod tests {
     #[tokio::test]
     async fn test_stream_ack_frame_with_receipt() {
         let receipt = ForwardReceipt {
-            request_id: [10u8; 32],
             shard_id: [11u8; 32],
             sender_pubkey: [12u8; 32],
             receiver_pubkey: [13u8; 32],
-            blind_token: [15u8; 32],
+            pool_pubkey: [15u8; 32],
             payload_size: 1234,
-            epoch: 1,
             timestamp: 1700000000,
             signature: [14u8; 64],
         };
@@ -792,7 +790,7 @@ mod tests {
             StreamFrame::Ack { seq_id, receipt: decoded } => {
                 assert_eq!(seq_id, 7);
                 let r = decoded.unwrap();
-                assert_eq!(r.request_id, [10u8; 32]);
+                assert_eq!(r.shard_id, [11u8; 32]);
                 assert_eq!(r.payload_size, 1234);
             }
             _ => panic!("Expected Ack frame"),
