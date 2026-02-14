@@ -11,7 +11,7 @@ use libp2p::{Multiaddr, PeerId};
 use tracing::info;
 
 use tunnelcraft_app::{AppBuilder, AppType, ImplementationMatrix};
-use tunnelcraft_client::{NodeConfig, NodeMode, NodeType, TunnelCraftNode};
+use tunnelcraft_client::{Capabilities, NodeConfig, TunnelCraftNode};
 use tunnelcraft_core::HopMode;
 use tunnelcraft_ipc_client::{IpcClient, DEFAULT_SOCKET_PATH};
 use tunnelcraft_keystore::{expand_path, load_or_generate_libp2p_keypair};
@@ -846,8 +846,7 @@ async fn run_daemon(bootstrap: bool, port: u16) -> Result<()> {
         let listen_addr: Multiaddr = listen.parse().context("Invalid listen address")?;
 
         let config = NodeConfig {
-            mode: NodeMode::Node,
-            node_type: NodeType::Relay,
+            capabilities: Capabilities::RELAY,
             listen_addr,
             bootstrap_peers: Vec::new(),
             allow_last_hop: false,
@@ -897,12 +896,7 @@ async fn run_daemon(bootstrap: bool, port: u16) -> Result<()> {
 async fn run_standalone(hops: u8, bootstrap: Option<String>, listen: String) -> Result<()> {
     info!("Running in standalone mode with {} hops", hops);
 
-    let hop_mode = match hops {
-        0 => HopMode::Single,
-        1 => HopMode::Double,
-        2 => HopMode::Triple,
-        _ => HopMode::Quad,
-    };
+    let hop_mode = HopMode::from_count(hops);
 
     let listen_addr: Multiaddr = listen.parse().context("Invalid listen address")?;
 
@@ -916,7 +910,7 @@ async fn run_standalone(hops: u8, bootstrap: Option<String>, listen: String) -> 
     }
 
     let config = NodeConfig {
-        mode: NodeMode::Client,
+        capabilities: Capabilities::CLIENT,
         hop_mode,
         listen_addr,
         bootstrap_peers,
@@ -938,12 +932,7 @@ async fn run_standalone(hops: u8, bootstrap: Option<String>, listen: String) -> 
 async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Result<()> {
     info!("Fetching {} with {} hops", url, hops);
 
-    let hop_mode = match hops {
-        0 => HopMode::Single,
-        1 => HopMode::Double,
-        2 => HopMode::Triple,
-        _ => HopMode::Quad,
-    };
+    let hop_mode = HopMode::from_count(hops);
 
     let mut bootstrap_peers = Vec::new();
     if let Some(peer_str) = bootstrap {
@@ -959,7 +948,7 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
     let _ = std::fs::create_dir_all(&client_data_dir);
 
     let config = NodeConfig {
-        mode: NodeMode::Client,
+        capabilities: Capabilities::CLIENT,
         hop_mode,
         bootstrap_peers,
         data_dir: Some(client_data_dir),
@@ -1001,7 +990,9 @@ async fn run_node(mode: NodeSubcommand) -> Result<()> {
             allow_last_hop,
             aggregator,
         } => {
-            run_node_with_config(NodeType::Relay, &listen, &bootstrap, &keyfile, allow_last_hop, 30, aggregator)
+            let mut caps = Capabilities::RELAY;
+            if aggregator { caps |= Capabilities::AGGREGATOR; }
+            run_node_with_config(caps, &listen, &bootstrap, &keyfile, allow_last_hop, 30)
                 .await
         }
         NodeSubcommand::Exit {
@@ -1010,14 +1001,22 @@ async fn run_node(mode: NodeSubcommand) -> Result<()> {
             keyfile,
             timeout,
             aggregator,
-        } => run_node_with_config(NodeType::Exit, &listen, &bootstrap, &keyfile, true, timeout, aggregator).await,
+        } => {
+            let mut caps = Capabilities::EXIT;
+            if aggregator { caps |= Capabilities::AGGREGATOR; }
+            run_node_with_config(caps, &listen, &bootstrap, &keyfile, true, timeout).await
+        }
         NodeSubcommand::Full {
             listen,
             bootstrap,
             keyfile,
             timeout,
             aggregator,
-        } => run_node_with_config(NodeType::Full, &listen, &bootstrap, &keyfile, true, timeout, aggregator).await,
+        } => {
+            let mut caps = Capabilities::RELAY | Capabilities::EXIT;
+            if aggregator { caps |= Capabilities::AGGREGATOR; }
+            run_node_with_config(caps, &listen, &bootstrap, &keyfile, true, timeout).await
+        }
         NodeSubcommand::Info { keyfile } => show_node_info(&keyfile),
     }
 }
@@ -1036,15 +1035,14 @@ fn show_node_info(keyfile: &Path) -> Result<()> {
 }
 
 async fn run_node_with_config(
-    node_type: NodeType,
+    capabilities: Capabilities,
     listen: &str,
     bootstrap: &[String],
     keyfile: &Path,
     allow_last_hop: bool,
     timeout_secs: u64,
-    enable_aggregator: bool,
 ) -> Result<()> {
-    info!("Starting TunnelCraft node in {:?} mode", node_type);
+    info!("Starting TunnelCraft node with capabilities {:?}", capabilities);
 
     // Load or generate libp2p keypair using shared keystore
     let libp2p_keypair = load_or_generate_libp2p_keypair(keyfile)
@@ -1058,9 +1056,6 @@ async fn run_node_with_config(
     // Parse bootstrap peers
     let bootstrap_peers = parse_bootstrap_peers(bootstrap)?;
 
-    // Map NodeType to enable_exit flag
-    let enable_exit = matches!(node_type, NodeType::Exit | NodeType::Full);
-
     // Derive data directory from keyfile location (sibling directory)
     let data_dir = expand_path(keyfile)
         .parent()
@@ -1069,16 +1064,13 @@ async fn run_node_with_config(
 
     // Create node config using TunnelCraftNode
     let config = NodeConfig {
-        mode: NodeMode::Node,
-        node_type,
+        capabilities,
         listen_addr,
         bootstrap_peers,
         allow_last_hop,
-        enable_exit,
         request_timeout: Duration::from_secs(timeout_secs),
         libp2p_keypair: Some(libp2p_keypair),
         data_dir,
-        enable_aggregator,
         ..Default::default()
     };
 

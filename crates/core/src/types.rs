@@ -1,5 +1,60 @@
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
+use bitflags::bitflags;
+
+bitflags! {
+    /// Composable node capabilities.
+    ///
+    /// Each capability is independent and can be combined freely:
+    /// - `CLIENT`     — Route personal VPN traffic (spend credits)
+    /// - `RELAY`      — Forward shards for others (earn credits)
+    /// - `EXIT`       — Execute requests at edge (earn credits)
+    /// - `AGGREGATOR` — Collect proofs, build distributions
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Capabilities: u8 {
+        /// Route personal VPN traffic
+        const CLIENT     = 0b0001;
+        /// Forward shards for others
+        const RELAY      = 0b0010;
+        /// Execute requests at edge
+        const EXIT       = 0b0100;
+        /// Collect proofs, build distributions
+        const AGGREGATOR = 0b1000;
+    }
+}
+
+impl Capabilities {
+    /// Whether this node routes personal VPN traffic.
+    pub fn is_client(self) -> bool {
+        self.contains(Capabilities::CLIENT)
+    }
+
+    /// Whether this node provides any service (relay, exit, or aggregator).
+    pub fn is_service_node(self) -> bool {
+        self.intersects(Capabilities::RELAY | Capabilities::EXIT | Capabilities::AGGREGATOR)
+    }
+
+    /// Whether this node relays shards for others.
+    pub fn is_relay(self) -> bool {
+        self.contains(Capabilities::RELAY)
+    }
+
+    /// Whether this node acts as an exit.
+    pub fn is_exit(self) -> bool {
+        self.contains(Capabilities::EXIT)
+    }
+
+    /// Whether this node runs the aggregator.
+    pub fn is_aggregator(self) -> bool {
+        self.contains(Capabilities::AGGREGATOR)
+    }
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Capabilities::CLIENT
+    }
+}
 
 /// 32-byte identifier
 pub type Id = [u8; 32];
@@ -19,6 +74,47 @@ pub enum SubscriptionTier {
     Standard,
     /// 1 TB + best-effort beyond / month
     Premium,
+}
+
+impl SubscriptionTier {
+    /// Maximum hop mode allowed for this tier.
+    pub fn max_hop_mode(&self) -> HopMode {
+        match self {
+            SubscriptionTier::Basic => HopMode::Single,
+            SubscriptionTier::Standard => HopMode::Double,
+            SubscriptionTier::Premium => HopMode::Quad,
+        }
+    }
+
+    /// Convert a u8 tier value to SubscriptionTier (255 = free/unsubscribed).
+    pub fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(SubscriptionTier::Basic),
+            1 => Some(SubscriptionTier::Standard),
+            2 => Some(SubscriptionTier::Premium),
+            _ => None,
+        }
+    }
+
+    /// Convert to u8 for on-chain representation.
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            SubscriptionTier::Basic => 0,
+            SubscriptionTier::Standard => 1,
+            SubscriptionTier::Premium => 2,
+        }
+    }
+}
+
+/// Resolve the effective hop mode based on subscription tier.
+///
+/// - Free users (no tier) are forced to `HopMode::Direct`.
+/// - Paid users get the requested hop mode clamped to their tier's maximum.
+pub fn resolve_hop_mode(tier: Option<SubscriptionTier>, requested: HopMode) -> HopMode {
+    match tier {
+        None => HopMode::Direct,
+        Some(t) => requested.clamp_to(t.max_hop_mode()),
+    }
 }
 
 /// A single entry in the signature chain
@@ -41,19 +137,19 @@ impl ChainEntry {
 
 /// Minimum hop count for privacy levels.
 ///
-/// Every path always starts with a gateway relay (base 1). There is no
-/// direct client → exit connection. The hop count includes the gateway.
-///
-/// | Mode     | Total hops | Path                                        |
-/// |----------|-----------|---------------------------------------------|
-/// | Direct   | 1         | client → gateway → exit                     |
-/// | Single | 1         | client → gateway → exit                       |
-/// | Double | 2         | client → gateway → relay → exit               |
-/// | Triple | 3         | client → gateway → relay → relay → exit       |
-/// | Quad   | 4         | client → gateway → relay → relay → relay → exit |
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// | Mode   | Relay hops | Path                                            |
+/// |--------|-----------|--------------------------------------------------|
+/// | Direct | 0         | client → exit (no relays, exit sees client IP)   |
+/// | Single | 1         | client → gateway → exit                          |
+/// | Double | 2         | client → gateway → relay → exit                  |
+/// | Triple | 3         | client → gateway → relay → relay → exit          |
+/// | Quad   | 4         | client → gateway → relay → relay → relay → exit  |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HopMode {
-    /// 1 hop (gateway only) - fastest, exit sees gateway IP
+    /// 0 hops — client sends directly to exit. Free tier only.
+    /// Exit sees client IP. Trades privacy for zero-cost access.
+    Direct,
+    /// 1 hop (gateway only) - fastest with a relay, exit sees gateway IP
     Single,
     /// 2 hops - basic privacy, no single node sees both client and exit
     Double,
@@ -64,10 +160,11 @@ pub enum HopMode {
 }
 
 impl HopMode {
-    /// Total number of relay hops (including the gateway).
-    /// Always >= 1. The gateway is always present.
+    /// Total number of relay hops in the path.
+    /// Direct=0, Single=1, Double=2, Triple=3, Quad=4.
     pub fn min_relays(&self) -> u8 {
         match self {
+            HopMode::Direct => 0,
             HopMode::Single => 1,
             HopMode::Double => 2,
             HopMode::Triple => 3,
@@ -76,9 +173,12 @@ impl HopMode {
     }
 
     /// Extra relay hops beyond the gateway.
-    /// Single=0, Double=1, Triple=2, Quad=3.
+    /// Direct=0, Single=0, Double=1, Triple=2, Quad=3.
     pub fn extra_hops(&self) -> u8 {
-        self.min_relays() - 1
+        match self {
+            HopMode::Direct => 0,
+            _ => self.min_relays() - 1,
+        }
     }
 
     /// Deprecated: use `min_relays()` instead.
@@ -88,11 +188,17 @@ impl HopMode {
 
     pub fn from_count(count: u8) -> Self {
         match count {
-            0 | 1 => HopMode::Single,
+            0 => HopMode::Direct,
+            1 => HopMode::Single,
             2 => HopMode::Double,
             3 => HopMode::Triple,
             _ => HopMode::Quad,
         }
+    }
+
+    /// Clamp this hop mode to at most the given maximum.
+    pub fn clamp_to(self, max: HopMode) -> HopMode {
+        if self > max { max } else { self }
     }
 }
 
@@ -260,6 +366,7 @@ mod tests {
 
     #[test]
     fn test_hop_mode_min_relays() {
+        assert_eq!(HopMode::Direct.min_relays(), 0);
         assert_eq!(HopMode::Single.min_relays(), 1);
         assert_eq!(HopMode::Double.min_relays(), 2);
         assert_eq!(HopMode::Triple.min_relays(), 3);
@@ -268,6 +375,7 @@ mod tests {
 
     #[test]
     fn test_hop_mode_extra_hops() {
+        assert_eq!(HopMode::Direct.extra_hops(), 0);
         assert_eq!(HopMode::Single.extra_hops(), 0);
         assert_eq!(HopMode::Double.extra_hops(), 1);
         assert_eq!(HopMode::Triple.extra_hops(), 2);
@@ -283,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_hop_mode_from_count() {
-        assert_eq!(HopMode::from_count(0), HopMode::Single);
+        assert_eq!(HopMode::from_count(0), HopMode::Direct);
         assert_eq!(HopMode::from_count(1), HopMode::Single);
         assert_eq!(HopMode::from_count(2), HopMode::Double);
         assert_eq!(HopMode::from_count(3), HopMode::Triple);
@@ -299,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_hop_mode_roundtrip() {
-        for mode in [HopMode::Single, HopMode::Double, HopMode::Triple, HopMode::Quad] {
+        for mode in [HopMode::Direct, HopMode::Single, HopMode::Double, HopMode::Triple, HopMode::Quad] {
             let count = mode.min_relays();
             assert_eq!(HopMode::from_count(count), mode);
         }
@@ -307,10 +415,28 @@ mod tests {
 
     #[test]
     fn test_hop_mode_equality() {
+        assert_eq!(HopMode::Direct, HopMode::Direct);
         assert_eq!(HopMode::Single, HopMode::Single);
+        assert_ne!(HopMode::Direct, HopMode::Single);
         assert_ne!(HopMode::Single, HopMode::Double);
         assert_ne!(HopMode::Double, HopMode::Triple);
         assert_ne!(HopMode::Triple, HopMode::Quad);
+    }
+
+    #[test]
+    fn test_hop_mode_ordering() {
+        assert!(HopMode::Direct < HopMode::Single);
+        assert!(HopMode::Single < HopMode::Double);
+        assert!(HopMode::Double < HopMode::Triple);
+        assert!(HopMode::Triple < HopMode::Quad);
+    }
+
+    #[test]
+    fn test_hop_mode_clamp_to() {
+        assert_eq!(HopMode::Quad.clamp_to(HopMode::Double), HopMode::Double);
+        assert_eq!(HopMode::Single.clamp_to(HopMode::Quad), HopMode::Single);
+        assert_eq!(HopMode::Direct.clamp_to(HopMode::Single), HopMode::Direct);
+        assert_eq!(HopMode::Triple.clamp_to(HopMode::Triple), HopMode::Triple);
     }
 
     // ==================== ChainEntry Tests ====================
@@ -354,6 +480,50 @@ mod tests {
             let restored: SubscriptionTier = serde_json::from_str(&json).unwrap();
             assert_eq!(tier, restored);
         }
+    }
+
+    #[test]
+    fn test_subscription_tier_max_hop_mode() {
+        assert_eq!(SubscriptionTier::Basic.max_hop_mode(), HopMode::Single);
+        assert_eq!(SubscriptionTier::Standard.max_hop_mode(), HopMode::Double);
+        assert_eq!(SubscriptionTier::Premium.max_hop_mode(), HopMode::Quad);
+    }
+
+    #[test]
+    fn test_subscription_tier_from_u8() {
+        assert_eq!(SubscriptionTier::from_u8(0), Some(SubscriptionTier::Basic));
+        assert_eq!(SubscriptionTier::from_u8(1), Some(SubscriptionTier::Standard));
+        assert_eq!(SubscriptionTier::from_u8(2), Some(SubscriptionTier::Premium));
+        assert_eq!(SubscriptionTier::from_u8(3), None);
+        assert_eq!(SubscriptionTier::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_subscription_tier_as_u8() {
+        assert_eq!(SubscriptionTier::Basic.as_u8(), 0);
+        assert_eq!(SubscriptionTier::Standard.as_u8(), 1);
+        assert_eq!(SubscriptionTier::Premium.as_u8(), 2);
+    }
+
+    #[test]
+    fn test_resolve_hop_mode() {
+        // Free user → always Direct
+        assert_eq!(resolve_hop_mode(None, HopMode::Quad), HopMode::Direct);
+        assert_eq!(resolve_hop_mode(None, HopMode::Direct), HopMode::Direct);
+
+        // Basic → clamped to Single
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Basic), HopMode::Quad), HopMode::Single);
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Basic), HopMode::Single), HopMode::Single);
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Basic), HopMode::Direct), HopMode::Direct);
+
+        // Standard → clamped to Double
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Standard), HopMode::Quad), HopMode::Double);
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Standard), HopMode::Double), HopMode::Double);
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Standard), HopMode::Single), HopMode::Single);
+
+        // Premium → up to Quad
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Premium), HopMode::Quad), HopMode::Quad);
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Premium), HopMode::Triple), HopMode::Triple);
     }
 
     // ==================== ForwardReceipt Tests ====================
@@ -526,4 +696,64 @@ mod tests {
         assert_eq!(exit.latency_ms, restored.latency_ms);
     }
 
+    // ==================== Capabilities Tests ====================
+
+    #[test]
+    fn test_capabilities_default() {
+        assert_eq!(Capabilities::default(), Capabilities::CLIENT);
+    }
+
+    #[test]
+    fn test_capabilities_helpers() {
+        let client = Capabilities::CLIENT;
+        assert!(client.is_client());
+        assert!(!client.is_relay());
+        assert!(!client.is_exit());
+        assert!(!client.is_aggregator());
+        assert!(!client.is_service_node());
+
+        let relay = Capabilities::RELAY;
+        assert!(!relay.is_client());
+        assert!(relay.is_relay());
+        assert!(relay.is_service_node());
+
+        let exit = Capabilities::EXIT;
+        assert!(exit.is_exit());
+        assert!(exit.is_service_node());
+
+        let agg = Capabilities::AGGREGATOR;
+        assert!(agg.is_aggregator());
+        assert!(agg.is_service_node());
+    }
+
+    #[test]
+    fn test_capabilities_composition() {
+        let full = Capabilities::RELAY | Capabilities::EXIT;
+        assert!(full.is_relay());
+        assert!(full.is_exit());
+        assert!(!full.is_client());
+        assert!(full.is_service_node());
+
+        let both = Capabilities::CLIENT | Capabilities::RELAY;
+        assert!(both.is_client());
+        assert!(both.is_relay());
+        assert!(both.is_service_node());
+
+        let all = Capabilities::CLIENT | Capabilities::RELAY | Capabilities::EXIT | Capabilities::AGGREGATOR;
+        assert!(all.is_client());
+        assert!(all.is_relay());
+        assert!(all.is_exit());
+        assert!(all.is_aggregator());
+        assert!(all.is_service_node());
+    }
+
+    #[test]
+    fn test_capabilities_empty() {
+        let empty = Capabilities::empty();
+        assert!(!empty.is_client());
+        assert!(!empty.is_relay());
+        assert!(!empty.is_exit());
+        assert!(!empty.is_aggregator());
+        assert!(!empty.is_service_node());
+    }
 }

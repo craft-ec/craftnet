@@ -55,6 +55,12 @@ pub enum SettlementError {
     #[error("Invalid Merkle proof")]
     InvalidMerkleProof,
 
+    #[error("Pricing plan not found")]
+    PlanNotFound,
+
+    #[error("Price mismatch: expected {expected}, got {actual}")]
+    PriceMismatch { expected: u64, actual: u64 },
+
     #[error("Serialization error: {0}")]
     SerializationError(String),
 }

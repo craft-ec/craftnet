@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 /// All routing metadata is inside the encrypted `header` (onion layers).
 /// The `routing_tag` lets the exit group shards by assembly_id for reconstruction.
 /// Shard/chunk metadata is encrypted inside the routing_tag (only exit/client needs it).
+///
+/// `total_hops` and `hops_remaining` are public fields for tier enforcement:
+/// - `total_hops`: total relay hops in the path (set by client, never changes)
+/// - `hops_remaining`: decremented by each relay before forwarding
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shard {
     /// Ephemeral X25519 pubkey for ECDH with the current hop
@@ -22,6 +26,14 @@ pub struct Shard {
     /// Exit-encrypted routing tag containing assembly_id + shard/chunk metadata
     /// Format: [ephemeral_pubkey: 32][nonce: 12][encrypted(RoutingTag)]
     pub routing_tag: Vec<u8>,
+    /// Total relay hops in the path (set by client, never modified in transit).
+    /// Used by relays for tier enforcement: `total_hops <= max_for_tier(pool_pubkey)`.
+    #[serde(default)]
+    pub total_hops: u8,
+    /// Remaining relay hops. Decremented by each relay before forwarding.
+    /// When 0, no honest relay will process the shard further.
+    #[serde(default)]
+    pub hops_remaining: u8,
 }
 
 impl Shard {
@@ -31,12 +43,16 @@ impl Shard {
         header: Vec<u8>,
         payload: Vec<u8>,
         routing_tag: Vec<u8>,
+        total_hops: u8,
+        hops_remaining: u8,
     ) -> Self {
         Self {
             ephemeral_pubkey,
             header,
             payload,
             routing_tag,
+            total_hops,
+            hops_remaining,
         }
     }
 
@@ -68,12 +84,16 @@ mod tests {
             vec![2, 3, 4],      // header
             vec![5, 6, 7, 8],   // payload
             vec![9; 98],        // routing_tag (larger now with metadata)
+            3,                   // total_hops
+            3,                   // hops_remaining
         );
 
         assert_eq!(shard.ephemeral_pubkey, [1u8; 32]);
         assert_eq!(shard.header, vec![2, 3, 4]);
         assert_eq!(shard.payload, vec![5, 6, 7, 8]);
         assert_eq!(shard.routing_tag.len(), 98);
+        assert_eq!(shard.total_hops, 3);
+        assert_eq!(shard.hops_remaining, 3);
     }
 
     #[test]
@@ -84,6 +104,7 @@ mod tests {
             vec![],
             vec![1, 2, 3],
             vec![0; 98],
+            0, 0,
         );
         // These fields no longer exist on Shard — all metadata is in encrypted routing_tag
         let json = serde_json::to_string(&shard).unwrap();
@@ -100,6 +121,7 @@ mod tests {
             vec![2, 3, 4],
             vec![5, 6, 7, 8],
             vec![9; 98],
+            2, 2,
         );
 
         let bytes = shard.to_bytes().unwrap();
@@ -130,6 +152,7 @@ mod tests {
             vec![],         // empty header = direct mode (0 hops)
             vec![1, 2, 3],
             vec![0; 98],
+            0, 0,
         );
 
         assert!(shard.header.is_empty());
@@ -160,6 +183,7 @@ mod tests {
             vec![1; 540],       // 3-hop header
             large_payload.clone(),
             vec![0; 98],
+            3, 3,
         );
 
         assert_eq!(shard.payload.len(), 1024 * 1024);
@@ -175,6 +199,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            0, 0,
         );
 
         assert!(shard.payload.is_empty());

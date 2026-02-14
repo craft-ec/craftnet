@@ -7,7 +7,7 @@
 //! Tracks both subscribed and free-tier traffic — free-tier stats feed
 //! a future ecosystem reward pool.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read as _, Write};
 use std::path::Path;
 
@@ -245,6 +245,267 @@ fn parse_chain_key(s: &str) -> Option<ChainKey> {
     Some((relay, pool, pool_type))
 }
 
+// =========================================================================
+// Bandwidth aggregation by date/time
+// =========================================================================
+
+/// Time-series granularity for bandwidth queries
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Granularity {
+    /// Hourly buckets (kept for 30 days)
+    Hourly,
+    /// Daily buckets (kept indefinitely)
+    Daily,
+}
+
+/// A single bandwidth time bucket
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BandwidthBucket {
+    /// Bucket start timestamp (floored to hour or day boundary, unix seconds)
+    pub timestamp: u64,
+    /// Total payload bytes in this bucket
+    pub bytes: u64,
+    /// Number of proof batches aggregated into this bucket
+    pub batch_count: u32,
+}
+
+/// Time-series bandwidth data for a single (relay, pool, pool_type) key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct BandwidthTimeSeries {
+    /// Hourly buckets (last 30 days, compacted to daily after)
+    hourly: BTreeMap<u64, BandwidthBucket>,
+    /// Daily buckets (indefinite retention)
+    daily: BTreeMap<u64, BandwidthBucket>,
+}
+
+/// In-memory bandwidth index for fast time-series queries.
+///
+/// Records bandwidth per (relay, pool, pool_type) and at the network level.
+/// Hourly buckets older than 30 days are compacted into daily buckets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BandwidthIndex {
+    /// Per-(relay, pool, pool_type) time series
+    #[serde(skip)]
+    series: HashMap<(PublicKey, PublicKey, PoolType), BandwidthTimeSeries>,
+    /// Network-wide hourly buckets
+    network_hourly: BTreeMap<u64, BandwidthBucket>,
+    /// Network-wide daily buckets
+    network_daily: BTreeMap<u64, BandwidthBucket>,
+}
+
+impl BandwidthIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Floor a timestamp to the start of its hour (3600-second boundary).
+    fn floor_hour(ts: u64) -> u64 {
+        ts - (ts % 3600)
+    }
+
+    /// Floor a timestamp to the start of its day (86400-second boundary).
+    fn floor_day(ts: u64) -> u64 {
+        ts - (ts % 86400)
+    }
+
+    /// Record a proof's bandwidth into the index.
+    pub fn record_proof(
+        &mut self,
+        relay: &PublicKey,
+        pool: &PublicKey,
+        pool_type: PoolType,
+        batch_bytes: u64,
+        proof_timestamp: u64,
+    ) {
+        let hour = Self::floor_hour(proof_timestamp);
+
+        // Update per-key series (hourly only; daily is populated via compact())
+        let series = self.series.entry((*relay, *pool, pool_type))
+            .or_default();
+        Self::upsert_bucket(&mut series.hourly, hour, batch_bytes);
+
+        // Update network-wide (hourly only)
+        Self::upsert_bucket(&mut self.network_hourly, hour, batch_bytes);
+    }
+
+    /// Upsert a bucket: increment bytes + batch_count if exists, create otherwise.
+    fn upsert_bucket(map: &mut BTreeMap<u64, BandwidthBucket>, ts: u64, bytes: u64) {
+        let bucket = map.entry(ts).or_insert(BandwidthBucket {
+            timestamp: ts,
+            bytes: 0,
+            batch_count: 0,
+        });
+        bucket.bytes += bytes;
+        bucket.batch_count += 1;
+    }
+
+    /// Compact hourly buckets older than `cutoff` into daily buckets.
+    /// Removes compacted hourly entries.
+    pub fn compact(&mut self, cutoff: u64) {
+        for series in self.series.values_mut() {
+            Self::compact_series(&mut series.hourly, &mut series.daily, cutoff);
+        }
+        Self::compact_series(&mut self.network_hourly, &mut self.network_daily, cutoff);
+    }
+
+    fn compact_series(
+        hourly: &mut BTreeMap<u64, BandwidthBucket>,
+        daily: &mut BTreeMap<u64, BandwidthBucket>,
+        cutoff: u64,
+    ) {
+        let old_keys: Vec<u64> = hourly.range(..cutoff).map(|(&k, _)| k).collect();
+        for key in old_keys {
+            if let Some(bucket) = hourly.remove(&key) {
+                let day = Self::floor_day(key);
+                let daily_bucket = daily.entry(day).or_insert(BandwidthBucket {
+                    timestamp: day,
+                    bytes: 0,
+                    batch_count: 0,
+                });
+                daily_bucket.bytes += bucket.bytes;
+                daily_bucket.batch_count += bucket.batch_count;
+            }
+        }
+    }
+
+    /// Query bandwidth for a specific (pool, relay) combination.
+    /// If relay is None, aggregates across all relays for the pool.
+    pub fn get_bandwidth_by_period(
+        &self,
+        pool: &PublicKey,
+        relay: Option<&PublicKey>,
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+    ) -> Vec<BandwidthBucket> {
+        let mut result: BTreeMap<u64, BandwidthBucket> = BTreeMap::new();
+
+        for ((r, p, _), series) in &self.series {
+            if p != pool {
+                continue;
+            }
+            if let Some(relay_key) = relay {
+                if r != relay_key {
+                    continue;
+                }
+            }
+            Self::merge_series_into(&series.hourly, &series.daily, granularity, start, end, &mut result);
+        }
+
+        result.into_values().collect()
+    }
+
+    /// Query network-wide bandwidth over a time range.
+    pub fn get_network_bandwidth(
+        &self,
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+    ) -> Vec<BandwidthBucket> {
+        let mut result: BTreeMap<u64, BandwidthBucket> = BTreeMap::new();
+        Self::merge_series_into(&self.network_hourly, &self.network_daily, granularity, start, end, &mut result);
+        result.into_values().collect()
+    }
+
+    /// Query per-pool bandwidth breakdown by relay.
+    pub fn get_pool_bandwidth_breakdown(
+        &self,
+        pool: &PublicKey,
+        pool_type: PoolType,
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+    ) -> HashMap<PublicKey, Vec<BandwidthBucket>> {
+        let mut result: HashMap<PublicKey, Vec<BandwidthBucket>> = HashMap::new();
+
+        for ((relay, p, pt), series) in &self.series {
+            if p != pool || *pt != pool_type {
+                continue;
+            }
+            let mut merged: BTreeMap<u64, BandwidthBucket> = BTreeMap::new();
+            Self::merge_series_into(&series.hourly, &series.daily, granularity, start, end, &mut merged);
+            let buckets: Vec<BandwidthBucket> = merged.into_values().collect();
+            if !buckets.is_empty() {
+                result.insert(*relay, buckets);
+            }
+        }
+
+        result
+    }
+
+    /// Query a single relay's total bandwidth across all pools.
+    pub fn get_relay_total_bandwidth(
+        &self,
+        relay: &PublicKey,
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+    ) -> Vec<BandwidthBucket> {
+        let mut result: BTreeMap<u64, BandwidthBucket> = BTreeMap::new();
+
+        for ((r, _, _), series) in &self.series {
+            if r != relay {
+                continue;
+            }
+            Self::merge_series_into(&series.hourly, &series.daily, granularity, start, end, &mut result);
+        }
+
+        result.into_values().collect()
+    }
+
+    /// Merge hourly + daily data into a result map for the requested granularity.
+    /// For Hourly: returns hourly buckets directly.
+    /// For Daily: merges compacted daily buckets with non-compacted hourly (aggregated by day).
+    fn merge_series_into(
+        hourly: &BTreeMap<u64, BandwidthBucket>,
+        daily: &BTreeMap<u64, BandwidthBucket>,
+        granularity: Granularity,
+        start: u64,
+        end: u64,
+        result: &mut BTreeMap<u64, BandwidthBucket>,
+    ) {
+        match granularity {
+            Granularity::Hourly => {
+                for (_, bucket) in hourly.range(start..=end) {
+                    let entry = result.entry(bucket.timestamp).or_insert(BandwidthBucket {
+                        timestamp: bucket.timestamp,
+                        bytes: 0,
+                        batch_count: 0,
+                    });
+                    entry.bytes += bucket.bytes;
+                    entry.batch_count += bucket.batch_count;
+                }
+            }
+            Granularity::Daily => {
+                // First: compacted daily buckets
+                for (_, bucket) in daily.range(start..=end) {
+                    let entry = result.entry(bucket.timestamp).or_insert(BandwidthBucket {
+                        timestamp: bucket.timestamp,
+                        bytes: 0,
+                        batch_count: 0,
+                    });
+                    entry.bytes += bucket.bytes;
+                    entry.batch_count += bucket.batch_count;
+                }
+                // Then: non-compacted hourly buckets, aggregated by day
+                for (_, bucket) in hourly.range(start..=end) {
+                    let day = Self::floor_day(bucket.timestamp);
+                    if day < start || day > end {
+                        continue;
+                    }
+                    let entry = result.entry(day).or_insert(BandwidthBucket {
+                        timestamp: day,
+                        bytes: 0,
+                        batch_count: 0,
+                    });
+                    entry.bytes += bucket.bytes;
+                    entry.batch_count += bucket.batch_count;
+                }
+            }
+        }
+    }
+}
+
 /// The aggregator service
 ///
 /// Collects signed summaries from relays via gossipsub, builds
@@ -262,6 +523,8 @@ pub struct Aggregator {
     pending_total: usize,
     /// Append-only history log (the aggregator's "blockchain")
     history: HistoryLog,
+    /// In-memory bandwidth time-series index (hourly + daily buckets)
+    bandwidth: BandwidthIndex,
 }
 
 impl Aggregator {
@@ -272,6 +535,7 @@ impl Aggregator {
             pending: HashMap::new(),
             pending_total: 0,
             history: HistoryLog::new(),
+            bandwidth: BandwidthIndex::new(),
         }
     }
 
@@ -405,6 +669,15 @@ impl Aggregator {
             new_root: msg.new_root,
             proof_timestamp: msg.timestamp,
         });
+
+        // Record bandwidth in time-series index
+        self.bandwidth.record_proof(
+            &msg.relay_pubkey,
+            &msg.pool_pubkey,
+            msg.pool_type,
+            msg.batch_bytes,
+            msg.timestamp,
+        );
 
         debug!(
             "Updated proof for relay {} on pool {} ({:?}): cumulative={}",
@@ -584,6 +857,70 @@ impl Aggregator {
         }
 
         relay_totals.into_iter().collect()
+    }
+
+    // =========================================================================
+    // Bandwidth time-series queries
+    // =========================================================================
+
+    /// Get bandwidth for a pool (optionally filtered by relay) over a time range.
+    pub fn get_bandwidth_by_period(
+        &self,
+        pool: &PublicKey,
+        relay: Option<&PublicKey>,
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+    ) -> Vec<BandwidthBucket> {
+        self.bandwidth.get_bandwidth_by_period(pool, relay, start, end, granularity)
+    }
+
+    /// Get network-wide bandwidth over a time range.
+    pub fn get_network_bandwidth(
+        &self,
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+    ) -> Vec<BandwidthBucket> {
+        self.bandwidth.get_network_bandwidth(start, end, granularity)
+    }
+
+    /// Get per-relay bandwidth breakdown for a pool.
+    pub fn get_pool_bandwidth_breakdown(
+        &self,
+        pool: &PublicKey,
+        pool_type: PoolType,
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+    ) -> HashMap<PublicKey, Vec<BandwidthBucket>> {
+        self.bandwidth.get_pool_bandwidth_breakdown(pool, pool_type, start, end, granularity)
+    }
+
+    /// Get a relay's total bandwidth across all pools.
+    pub fn get_relay_total_bandwidth(
+        &self,
+        relay: &PublicKey,
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+    ) -> Vec<BandwidthBucket> {
+        self.bandwidth.get_relay_total_bandwidth(relay, start, end, granularity)
+    }
+
+    /// Compact hourly bandwidth buckets older than 30 days into daily buckets.
+    pub fn compact_bandwidth(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff = now.saturating_sub(30 * 24 * 3600); // 30 days ago
+        self.bandwidth.compact(cutoff);
+    }
+
+    /// Get a reference to the bandwidth index (for direct access).
+    pub fn bandwidth_index(&self) -> &BandwidthIndex {
+        &self.bandwidth
     }
 
     // =========================================================================
@@ -927,6 +1264,7 @@ impl Aggregator {
             pending,
             pending_total,
             history: HistoryLog::new(),
+            bandwidth: BandwidthIndex::new(),
         };
 
         Ok((agg, posted))
@@ -1551,5 +1889,187 @@ mod tests {
             }
             _ => panic!("Wrong event type"),
         }
+    }
+
+    // =========================================================================
+    // Bandwidth index tests
+    // =========================================================================
+
+    #[test]
+    fn test_bandwidth_floor_hour() {
+        assert_eq!(BandwidthIndex::floor_hour(1700000000), 1699999200); // 2023-11-14T22:00:00
+        assert_eq!(BandwidthIndex::floor_hour(1700003599), 1700002800);
+        assert_eq!(BandwidthIndex::floor_hour(3600), 3600);
+        assert_eq!(BandwidthIndex::floor_hour(0), 0);
+    }
+
+    #[test]
+    fn test_bandwidth_floor_day() {
+        assert_eq!(BandwidthIndex::floor_day(1700000000), 1699920000);
+        assert_eq!(BandwidthIndex::floor_day(0), 0);
+        assert_eq!(BandwidthIndex::floor_day(86399), 0);
+        assert_eq!(BandwidthIndex::floor_day(86400), 86400);
+    }
+
+    #[test]
+    fn test_bandwidth_record_and_query() {
+        let mut idx = BandwidthIndex::new();
+        let relay = [1u8; 32];
+        let pool = [2u8; 32];
+        let ts = 1700000000u64;
+
+        idx.record_proof(&relay, &pool, PoolType::Subscribed, 100, ts);
+        idx.record_proof(&relay, &pool, PoolType::Subscribed, 200, ts + 60);
+
+        // Same hour — should be aggregated into one bucket
+        let hourly = idx.get_bandwidth_by_period(&pool, Some(&relay), 0, u64::MAX, Granularity::Hourly);
+        assert_eq!(hourly.len(), 1);
+        assert_eq!(hourly[0].bytes, 300);
+        assert_eq!(hourly[0].batch_count, 2);
+
+        // Daily should also have one bucket
+        let daily = idx.get_bandwidth_by_period(&pool, Some(&relay), 0, u64::MAX, Granularity::Daily);
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].bytes, 300);
+    }
+
+    #[test]
+    fn test_bandwidth_multiple_hours() {
+        let mut idx = BandwidthIndex::new();
+        let relay = [1u8; 32];
+        let pool = [2u8; 32];
+        let ts = 1700000000u64;
+
+        idx.record_proof(&relay, &pool, PoolType::Subscribed, 100, ts);
+        idx.record_proof(&relay, &pool, PoolType::Subscribed, 200, ts + 3600); // next hour
+
+        let hourly = idx.get_bandwidth_by_period(&pool, Some(&relay), 0, u64::MAX, Granularity::Hourly);
+        assert_eq!(hourly.len(), 2);
+        assert_eq!(hourly[0].bytes, 100);
+        assert_eq!(hourly[1].bytes, 200);
+    }
+
+    #[test]
+    fn test_bandwidth_network_wide() {
+        let mut idx = BandwidthIndex::new();
+        let ts = 1700000000u64;
+
+        idx.record_proof(&[1u8; 32], &[10u8; 32], PoolType::Subscribed, 100, ts);
+        idx.record_proof(&[2u8; 32], &[20u8; 32], PoolType::Free, 50, ts);
+
+        let network = idx.get_network_bandwidth(0, u64::MAX, Granularity::Hourly);
+        assert_eq!(network.len(), 1);
+        assert_eq!(network[0].bytes, 150);
+        assert_eq!(network[0].batch_count, 2);
+    }
+
+    #[test]
+    fn test_bandwidth_compact() {
+        let mut idx = BandwidthIndex::new();
+        let relay = [1u8; 32];
+        let pool = [2u8; 32];
+
+        // Record proofs across multiple hours of a single day
+        let day_start = 1700006400u64; // a day boundary
+        for hour in 0..5u64 {
+            idx.record_proof(&relay, &pool, PoolType::Subscribed, 100, day_start + hour * 3600);
+        }
+
+        // Before compaction: 5 hourly buckets
+        let hourly = idx.get_bandwidth_by_period(&pool, Some(&relay), 0, u64::MAX, Granularity::Hourly);
+        assert_eq!(hourly.len(), 5);
+
+        // Compact with cutoff far in the future — all hourly become daily
+        idx.compact(u64::MAX);
+
+        let hourly_after = idx.get_bandwidth_by_period(&pool, Some(&relay), 0, u64::MAX, Granularity::Hourly);
+        assert_eq!(hourly_after.len(), 0);
+
+        let daily = idx.get_bandwidth_by_period(&pool, Some(&relay), 0, u64::MAX, Granularity::Daily);
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].bytes, 500);
+        assert_eq!(daily[0].batch_count, 5);
+    }
+
+    #[test]
+    fn test_bandwidth_pool_breakdown() {
+        let mut idx = BandwidthIndex::new();
+        let pool = [10u8; 32];
+        let ts = 1700000000u64;
+
+        idx.record_proof(&[1u8; 32], &pool, PoolType::Subscribed, 70, ts);
+        idx.record_proof(&[2u8; 32], &pool, PoolType::Subscribed, 30, ts);
+
+        let breakdown = idx.get_pool_bandwidth_breakdown(&pool, PoolType::Subscribed, 0, u64::MAX, Granularity::Hourly);
+        assert_eq!(breakdown.len(), 2);
+
+        let total: u64 = breakdown.values()
+            .flat_map(|buckets| buckets.iter().map(|b| b.bytes))
+            .sum();
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn test_bandwidth_relay_total() {
+        let mut idx = BandwidthIndex::new();
+        let relay = [1u8; 32];
+        let ts = 1700000000u64;
+
+        // Same relay, different pools
+        idx.record_proof(&relay, &[10u8; 32], PoolType::Subscribed, 70, ts);
+        idx.record_proof(&relay, &[20u8; 32], PoolType::Free, 30, ts);
+
+        let total = idx.get_relay_total_bandwidth(&relay, 0, u64::MAX, Granularity::Hourly);
+        assert_eq!(total.len(), 1);
+        assert_eq!(total[0].bytes, 100);
+    }
+
+    #[test]
+    fn test_bandwidth_integrated_with_aggregator() {
+        let mut agg = new_agg();
+
+        let msg1 = make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32]);
+        let msg2 = make_proof(2, 10, PoolType::Subscribed, 30, 30, [0u8; 32], [0xBB; 32]);
+        agg.handle_proof(msg1).unwrap();
+        agg.handle_proof(msg2).unwrap();
+
+        // Network bandwidth should reflect the proofs
+        let network = agg.get_network_bandwidth(0, u64::MAX, Granularity::Hourly);
+        assert!(!network.is_empty());
+        let total_bytes: u64 = network.iter().map(|b| b.bytes).sum();
+        assert_eq!(total_bytes, 100); // 70 + 30
+
+        // Pool breakdown
+        let breakdown = agg.get_pool_bandwidth_breakdown(
+            &[10u8; 32], PoolType::Subscribed,
+            0, u64::MAX, Granularity::Hourly,
+        );
+        assert_eq!(breakdown.len(), 2); // 2 relays
+
+        // Compact should not error
+        agg.compact_bandwidth();
+    }
+
+    #[test]
+    fn test_bandwidth_time_range_filter() {
+        let mut idx = BandwidthIndex::new();
+        let relay = [1u8; 32];
+        let pool = [2u8; 32];
+
+        let ts1 = 1700000000u64;
+        let ts2 = ts1 + 7200; // 2 hours later
+        let ts3 = ts1 + 14400; // 4 hours later
+
+        idx.record_proof(&relay, &pool, PoolType::Subscribed, 100, ts1);
+        idx.record_proof(&relay, &pool, PoolType::Subscribed, 200, ts2);
+        idx.record_proof(&relay, &pool, PoolType::Subscribed, 300, ts3);
+
+        // Query only the middle range
+        let hour1 = BandwidthIndex::floor_hour(ts1);
+        let hour2 = BandwidthIndex::floor_hour(ts2);
+        let result = idx.get_bandwidth_by_period(&pool, Some(&relay), hour1, hour2, Granularity::Hourly);
+        assert_eq!(result.len(), 2);
+        let bytes: u64 = result.iter().map(|b| b.bytes).sum();
+        assert_eq!(bytes, 300); // 100 + 200
     }
 }

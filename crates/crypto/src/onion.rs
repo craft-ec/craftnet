@@ -3,7 +3,7 @@
 //! Builds and peels multi-layer onion headers using X25519 ECDH + ChaCha20-Poly1305.
 //! Each relay peels one layer to learn the next hop and settlement data.
 
-use tunnelcraft_core::{ExitPayload, OnionLayer, OnionSettlement, RoutingTag, Id};
+use tunnelcraft_core::{ExitPayload, OnionLayer, OnionSettlement, PublicKey, RoutingTag, Id};
 
 use crate::encrypt::{encrypt_for_recipient, decrypt_from_sender, EncryptError};
 use crate::keys::EncryptionKeypair;
@@ -172,6 +172,7 @@ pub fn encrypt_routing_tag(
     total_shards: u8,
     chunk_index: u16,
     total_chunks: u16,
+    pool_pubkey: &PublicKey,
 ) -> Result<Vec<u8>, EncryptError> {
     let tag = RoutingTag {
         assembly_id: *assembly_id,
@@ -179,6 +180,7 @@ pub fn encrypt_routing_tag(
         total_shards,
         chunk_index,
         total_chunks,
+        pool_pubkey: *pool_pubkey,
     };
     let tag_bytes = tag.to_bytes()
         .map_err(|_| EncryptError::EncryptionFailed)?;
@@ -239,10 +241,12 @@ mod tests {
         let exit_keys = EncryptionKeypair::generate();
         let assembly_id = [77u8; 32];
 
+        let pool_pubkey = [55u8; 32];
         let encrypted = encrypt_routing_tag(
             &exit_keys.public_key_bytes(),
             &assembly_id,
             2, 5, 1, 3,
+            &pool_pubkey,
         ).unwrap();
 
         let tag = decrypt_routing_tag(
@@ -255,6 +259,7 @@ mod tests {
         assert_eq!(tag.total_shards, 5);
         assert_eq!(tag.chunk_index, 1);
         assert_eq!(tag.total_chunks, 3);
+        assert_eq!(tag.pool_pubkey, pool_pubkey);
     }
 
     #[test]
@@ -262,8 +267,9 @@ mod tests {
         let exit_keys = EncryptionKeypair::generate();
         let assembly_id = [77u8; 32];
 
-        let tag1 = encrypt_routing_tag(&exit_keys.public_key_bytes(), &assembly_id, 0, 5, 0, 1).unwrap();
-        let tag2 = encrypt_routing_tag(&exit_keys.public_key_bytes(), &assembly_id, 0, 5, 0, 1).unwrap();
+        let pool_pubkey = [0u8; 32];
+        let tag1 = encrypt_routing_tag(&exit_keys.public_key_bytes(), &assembly_id, 0, 5, 0, 1, &pool_pubkey).unwrap();
+        let tag2 = encrypt_routing_tag(&exit_keys.public_key_bytes(), &assembly_id, 0, 5, 0, 1, &pool_pubkey).unwrap();
 
         // Different ephemeral keys → different ciphertext (no correlation)
         assert_ne!(tag1, tag2);
@@ -512,6 +518,7 @@ mod tests {
             &exit_keys.public_key_bytes(),
             &[1u8; 32],
             0, 5, 0, 1,
+            &[0u8; 32],
         ).unwrap();
 
         let result = decrypt_routing_tag(

@@ -105,10 +105,12 @@ impl Default for NetworkSettings {
     }
 }
 
-/// Hop mode for connections (number of relay hops including gateway)
+/// Hop mode for connections (number of relay hops)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HopMode {
+    /// 0 hops - direct to exit (free tier, exit sees client IP)
+    Direct,
     /// 1 hop (gateway only) - fastest
     Single,
     /// 2 hops - basic privacy
@@ -124,6 +126,7 @@ impl HopMode {
     /// Get the number of hops for this mode
     pub fn hops(&self) -> u8 {
         match self {
+            Self::Direct => 0,
             Self::Single => 1,
             Self::Double => 2,
             Self::Triple => 3,
@@ -134,7 +137,8 @@ impl HopMode {
     /// Create a hop mode from a hop count
     pub fn from_hops(hops: u8) -> Self {
         match hops {
-            0 | 1 => Self::Single,
+            0 => Self::Direct,
+            1 => Self::Single,
             2 => Self::Double,
             3 => Self::Triple,
             _ => Self::Quad,
@@ -258,12 +262,13 @@ mod tests {
 
     #[test]
     fn test_hop_mode_conversion() {
+        assert_eq!(HopMode::Direct.hops(), 0);
         assert_eq!(HopMode::Single.hops(), 1);
         assert_eq!(HopMode::Double.hops(), 2);
         assert_eq!(HopMode::Triple.hops(), 3);
         assert_eq!(HopMode::Quad.hops(), 4);
 
-        assert_eq!(HopMode::from_hops(0), HopMode::Single);
+        assert_eq!(HopMode::from_hops(0), HopMode::Direct);
         assert_eq!(HopMode::from_hops(1), HopMode::Single);
         assert_eq!(HopMode::from_hops(2), HopMode::Double);
         assert_eq!(HopMode::from_hops(3), HopMode::Triple);

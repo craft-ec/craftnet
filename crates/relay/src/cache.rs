@@ -2,7 +2,7 @@
 //!
 //! Caches request_id → user_pubkey mappings to verify response destinations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tunnelcraft_core::{Id, PublicKey};
 
@@ -21,8 +21,10 @@ struct CacheEntry {
 /// LRU cache for request → user_pubkey mappings
 ///
 /// Used by relays to verify that response destinations match the original requester.
+/// Uses a VecDeque for O(1) eviction of the oldest entry when at capacity.
 pub struct RequestCache {
     entries: HashMap<Id, CacheEntry>,
+    insertion_order: VecDeque<Id>,
     ttl: Duration,
     max_size: usize,
 }
@@ -32,6 +34,7 @@ impl RequestCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
             ttl: DEFAULT_TTL,
             max_size: DEFAULT_MAX_SIZE,
         }
@@ -41,6 +44,7 @@ impl RequestCache {
     pub fn with_config(ttl: Duration, max_size: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
             ttl,
             max_size,
         }
@@ -48,14 +52,30 @@ impl RequestCache {
 
     /// Store a request_id → user_pubkey mapping
     pub fn insert(&mut self, request_id: Id, user_pubkey: PublicKey) {
+        // If this key already exists, update in place without pushing to deque
+        if self.entries.contains_key(&request_id) {
+            self.entries.insert(
+                request_id,
+                CacheEntry {
+                    user_pubkey,
+                    created_at: Instant::now(),
+                },
+            );
+            return;
+        }
+
         // Evict expired entries if at capacity
         if self.entries.len() >= self.max_size {
             self.evict_expired();
         }
 
-        // If still at capacity, remove oldest entry
-        if self.entries.len() >= self.max_size {
-            self.evict_oldest();
+        // If still at capacity, pop oldest from deque (O(1))
+        while self.entries.len() >= self.max_size {
+            if let Some(oldest_id) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest_id);
+            } else {
+                break;
+            }
         }
 
         self.entries.insert(
@@ -65,6 +85,7 @@ impl RequestCache {
                 created_at: Instant::now(),
             },
         );
+        self.insertion_order.push_back(request_id);
     }
 
     /// Get the user_pubkey for a request_id
@@ -85,6 +106,8 @@ impl RequestCache {
 
     /// Remove a request_id from the cache
     pub fn remove(&mut self, request_id: &Id) -> Option<PublicKey> {
+        // Note: we don't remove from insertion_order (would be O(n)).
+        // Stale deque entries are harmlessly skipped during eviction.
         self.entries.remove(request_id).map(|e| e.user_pubkey)
     }
 
@@ -98,28 +121,26 @@ impl RequestCache {
         self.entries.is_empty()
     }
 
-    /// Remove all expired entries
+    /// Remove all expired entries and drain stale front entries from deque
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
         self.entries
             .retain(|_, entry| now.duration_since(entry.created_at) < self.ttl);
-    }
 
-    /// Remove the oldest entry
-    fn evict_oldest(&mut self) {
-        if let Some(oldest_key) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.created_at)
-            .map(|(k, _)| *k)
-        {
-            self.entries.remove(&oldest_key);
+        // Drain stale front entries from deque (already removed from map or expired)
+        while let Some(front) = self.insertion_order.front() {
+            if !self.entries.contains_key(front) {
+                self.insertion_order.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
     /// Clear all entries
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.insertion_order.clear();
     }
 }
 
@@ -223,5 +244,38 @@ mod tests {
 
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_insert_does_not_grow_deque() {
+        let mut cache = RequestCache::with_config(DEFAULT_TTL, 3);
+
+        cache.insert(test_id(1), test_pubkey(1));
+        cache.insert(test_id(2), test_pubkey(2));
+        // Re-insert same key with different value
+        cache.insert(test_id(1), test_pubkey(10));
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&test_id(1)), Some(test_pubkey(10)));
+        // Deque should still have only 2 entries
+        assert_eq!(cache.insertion_order.len(), 2);
+    }
+
+    #[test]
+    fn test_eviction_skips_removed_entries() {
+        let mut cache = RequestCache::with_config(DEFAULT_TTL, 3);
+
+        cache.insert(test_id(1), test_pubkey(1));
+        cache.insert(test_id(2), test_pubkey(2));
+        cache.insert(test_id(3), test_pubkey(3));
+
+        // Remove entry 1 (still in deque but not in map)
+        cache.remove(&test_id(1));
+
+        // Insert entry 4 — should skip stale deque entry and evict entry 2
+        cache.insert(test_id(4), test_pubkey(4));
+        assert_eq!(cache.len(), 3);
+        assert!(cache.contains(&test_id(4)));
+        assert!(cache.contains(&test_id(3)));
     }
 }

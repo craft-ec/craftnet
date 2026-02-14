@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, info, warn, error};
 
-use tunnelcraft_client::{NodeConfig, NodeMode, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse, Socks5Server};
+use tunnelcraft_client::{Capabilities, NodeConfig, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse, Socks5Server};
 use tunnelcraft_core::{ExitRegion, HopMode};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig, Subscribe};
 use tunnelcraft_core::SubscriptionTier;
@@ -138,7 +138,7 @@ enum NodeCommand {
     },
     GetStatus(oneshot::Sender<NodeStatusInfo>),
     GetStats(oneshot::Sender<ClientNodeStats>),
-    SetMode(NodeMode, oneshot::Sender<std::result::Result<(), String>>),
+    SetCapabilities(Capabilities, oneshot::Sender<std::result::Result<(), String>>),
     SetExitGeo {
         region: String,
         country_code: Option<String>,
@@ -183,8 +183,8 @@ pub struct DaemonService {
     node_status: Arc<RwLock<NodeStatusInfo>>,
     /// Privacy level for next connection
     privacy_level: Arc<RwLock<HopMode>>,
-    /// Current node mode
-    node_mode: Arc<RwLock<NodeMode>>,
+    /// Current node capabilities
+    node_capabilities: Arc<RwLock<Capabilities>>,
     /// Local discovery preference
     local_discovery: Arc<RwLock<bool>>,
     /// Event broadcast channel
@@ -285,16 +285,17 @@ impl DaemonService {
 
         // Apply loaded settings to initial state
         let hop_mode = match settings.network.hop_mode {
+            tunnelcraft_settings::HopMode::Direct => HopMode::Direct,
             tunnelcraft_settings::HopMode::Single => HopMode::Single,
             tunnelcraft_settings::HopMode::Double => HopMode::Double,
             tunnelcraft_settings::HopMode::Triple => HopMode::Triple,
             tunnelcraft_settings::HopMode::Quad => HopMode::Quad,
         };
-        let node_mode = match settings.node.mode {
-            tunnelcraft_settings::NodeMode::Disabled => NodeMode::Client,
-            tunnelcraft_settings::NodeMode::Relay => NodeMode::Node,
-            tunnelcraft_settings::NodeMode::Exit => NodeMode::Node,
-            tunnelcraft_settings::NodeMode::Full => NodeMode::Both,
+        let node_caps = match settings.node.mode {
+            tunnelcraft_settings::NodeMode::Disabled => Capabilities::CLIENT,
+            tunnelcraft_settings::NodeMode::Relay => Capabilities::RELAY,
+            tunnelcraft_settings::NodeMode::Exit => Capabilities::EXIT,
+            tunnelcraft_settings::NodeMode::Full => Capabilities::RELAY | Capabilities::EXIT,
         };
 
         Ok(Self {
@@ -302,7 +303,7 @@ impl DaemonService {
             cmd_tx: Arc::new(RwLock::new(None)),
             node_status: Arc::new(RwLock::new(NodeStatusInfo::default())),
             privacy_level: Arc::new(RwLock::new(hop_mode)),
-            node_mode: Arc::new(RwLock::new(node_mode)),
+            node_capabilities: Arc::new(RwLock::new(node_caps)),
             local_discovery: Arc::new(RwLock::new(true)),
             event_tx,
             settlement_client,
@@ -344,7 +345,7 @@ impl DaemonService {
 
         let privacy_level = *self.privacy_level.read().await;
         let config = NodeConfig {
-            mode: NodeMode::Both,
+            capabilities: Capabilities::CLIENT | Capabilities::RELAY,
             hop_mode: privacy_level,
             ..Default::default()
         };
@@ -372,8 +373,16 @@ impl DaemonService {
     /// Get status
     pub async fn status(&self) -> StatusResponse {
         let state = *self.state.read().await;
-        let mode = format!("{:?}", *self.node_mode.read().await).to_lowercase();
+        let caps = *self.node_capabilities.read().await;
+        let mode = if caps.is_client() && caps.is_service_node() {
+            "both"
+        } else if caps.is_client() {
+            "client"
+        } else {
+            "node"
+        }.to_string();
         let privacy = match *self.privacy_level.read().await {
+            HopMode::Direct => "direct",
             HopMode::Single => "single",
             HopMode::Double => "double",
             HopMode::Triple => "triple",
@@ -440,12 +449,7 @@ impl DaemonService {
 
         // Apply hops param to privacy level if provided
         if let Some(hops) = params.hops {
-            let hop_mode = match hops {
-                0 => HopMode::Single,
-                1 => HopMode::Double,
-                2 => HopMode::Triple,
-                _ => HopMode::Quad,
-            };
+            let hop_mode = HopMode::from_count(hops);
             *self.privacy_level.write().await = hop_mode;
         }
 
@@ -567,6 +571,7 @@ impl DaemonService {
             tier,
             payment_amount: amount,
             duration_secs: 30 * 24 * 3600, // 30 days
+            start_date: 0,
         };
         let _sig = self.settlement_client.subscribe(subscribe).await
             .map_err(|e| crate::DaemonError::SdkError(format!("Subscribe failed: {}", e)))?;
@@ -589,10 +594,10 @@ impl DaemonService {
 
     /// Set node mode at runtime
     pub async fn set_mode(&self, mode_str: &str) -> Result<()> {
-        let mode = match mode_str {
-            "client" => NodeMode::Client,
-            "node" => NodeMode::Node,
-            "both" => NodeMode::Both,
+        let caps = match mode_str {
+            "client" => Capabilities::CLIENT,
+            "node" => Capabilities::RELAY,
+            "both" => Capabilities::CLIENT | Capabilities::RELAY,
             _ => return Err(crate::DaemonError::InvalidRequest(
                 format!("Unknown mode: {}. Use client, node, or both", mode_str)
             )),
@@ -601,7 +606,7 @@ impl DaemonService {
         let cmd_tx = self.cmd_tx.read().await;
         if let Some(ref tx) = *cmd_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            tx.send(NodeCommand::SetMode(mode, reply_tx)).await
+            tx.send(NodeCommand::SetCapabilities(caps, reply_tx)).await
                 .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
 
             drop(cmd_tx);
@@ -611,15 +616,19 @@ impl DaemonService {
                 .map_err(crate::DaemonError::SdkError)?;
         }
 
-        *self.node_mode.write().await = mode;
+        *self.node_capabilities.write().await = caps;
 
         // Persist mode to settings
         {
             let mut settings = self.settings.write().await;
-            settings.node.mode = match mode {
-                NodeMode::Client => tunnelcraft_settings::NodeMode::Disabled,
-                NodeMode::Node => tunnelcraft_settings::NodeMode::Relay,
-                NodeMode::Both => tunnelcraft_settings::NodeMode::Full,
+            settings.node.mode = if caps.is_client() && !caps.is_service_node() {
+                tunnelcraft_settings::NodeMode::Disabled
+            } else if caps.is_relay() && caps.is_exit() {
+                tunnelcraft_settings::NodeMode::Full
+            } else if caps.is_exit() {
+                tunnelcraft_settings::NodeMode::Exit
+            } else {
+                tunnelcraft_settings::NodeMode::Relay
             };
             if let Err(e) = settings.save() {
                 debug!("Failed to save settings: {}", e);
@@ -648,12 +657,13 @@ impl DaemonService {
     /// Set privacy level for the next connection
     pub async fn set_privacy_level(&self, level: &str) -> Result<()> {
         let hop_mode = match level {
+            "direct" => HopMode::Direct,
             "single" => HopMode::Single,
             "double" => HopMode::Double,
             "triple" => HopMode::Triple,
             "quad" => HopMode::Quad,
             _ => return Err(crate::DaemonError::InvalidRequest(
-                format!("Unknown privacy level: {}. Use single, double, triple, or quad", level)
+                format!("Unknown privacy level: {}. Use direct, single, double, triple, or quad", level)
             )),
         };
 
@@ -663,6 +673,7 @@ impl DaemonService {
         {
             let mut settings = self.settings.write().await;
             settings.network.hop_mode = match hop_mode {
+                HopMode::Direct => tunnelcraft_settings::HopMode::Direct,
                 HopMode::Single => tunnelcraft_settings::HopMode::Single,
                 HopMode::Double => tunnelcraft_settings::HopMode::Double,
                 HopMode::Triple => tunnelcraft_settings::HopMode::Triple,
@@ -874,10 +885,14 @@ impl DaemonService {
         None
     }
 
-    /// Export private key (encrypted with password)
+    /// Export private key (encrypted with Argon2id-derived key + ChaCha20-Poly1305)
+    ///
+    /// File format: salt (16 bytes) || nonce (12 bytes) || ciphertext (48 bytes)
+    /// Total: 76 bytes minimum
     pub async fn export_key(&self, path: &str, password: &str) -> Result<(String, String)> {
-        use sha2::{Sha256, Digest};
+        use argon2::Argon2;
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
+        use rand::RngCore;
 
         // Load the current key from keystore
         let key_path = tunnelcraft_keystore::default_key_path();
@@ -887,43 +902,69 @@ impl DaemonService {
         let secret_bytes = keypair.secret_key_bytes();
         let public_hex = hex::encode(keypair.public_key_bytes());
 
-        // Derive encryption key from password
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let key_bytes = hasher.finalize();
+        // Generate random salt and nonce
+        let mut salt = [0u8; 16];
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut salt);
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+        // Derive encryption key from password using Argon2id
+        let mut key_bytes = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), &salt, &mut key_bytes)
+            .map_err(|e| crate::DaemonError::SdkError(format!("KDF failed: {}", e)))?;
 
         // Encrypt with ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
-        let nonce = chacha20poly1305::Nonce::from([0u8; 12]); // deterministic nonce is fine for key export
+        let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
         let encrypted = cipher.encrypt(&nonce, secret_bytes.as_ref())
             .map_err(|e| crate::DaemonError::SdkError(format!("Encryption failed: {}", e)))?;
 
-        // Write to file
-        std::fs::write(path, &encrypted)
+        // Write: salt (16) || nonce (12) || ciphertext
+        let mut output = Vec::with_capacity(16 + 12 + encrypted.len());
+        output.extend_from_slice(&salt);
+        output.extend_from_slice(&nonce_bytes);
+        output.extend_from_slice(&encrypted);
+
+        std::fs::write(path, &output)
             .map_err(|e| crate::DaemonError::SdkError(format!("Failed to write file: {}", e)))?;
 
         info!("Key exported to: {}", path);
         Ok((path.to_string(), public_hex))
     }
 
-    /// Import private key (decrypted with password)
+    /// Import private key (decrypted with Argon2id-derived key + ChaCha20-Poly1305)
+    ///
+    /// File format: salt (16 bytes) || nonce (12 bytes) || ciphertext (48 bytes)
     pub async fn import_key(&self, path: &str, password: &str) -> Result<String> {
-        use sha2::{Sha256, Digest};
+        use argon2::Argon2;
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
 
         // Read encrypted file
-        let encrypted = std::fs::read(path)
+        let data = std::fs::read(path)
             .map_err(|e| crate::DaemonError::SdkError(format!("Failed to read file: {}", e)))?;
 
-        // Derive decryption key from password
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let key_bytes = hasher.finalize();
+        // Validate minimum size: salt(16) + nonce(12) + ciphertext(32+16 poly1305 tag) = 76
+        if data.len() < 76 {
+            return Err(crate::DaemonError::SdkError(
+                format!("Invalid key file: too short ({} bytes, need at least 76)", data.len())
+            ));
+        }
+
+        let salt = &data[..16];
+        let nonce_bytes = &data[16..28];
+        let ciphertext = &data[28..];
+
+        // Derive decryption key from password using Argon2id
+        let mut key_bytes = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), salt, &mut key_bytes)
+            .map_err(|e| crate::DaemonError::SdkError(format!("KDF failed: {}", e)))?;
 
         // Decrypt with ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
-        let nonce = chacha20poly1305::Nonce::from([0u8; 12]);
-        let decrypted = cipher.decrypt(&nonce, encrypted.as_ref())
+        let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
+        let decrypted = cipher.decrypt(nonce, ciphertext)
             .map_err(|_| crate::DaemonError::SdkError("Decryption failed - wrong password?".to_string()))?;
 
         if decrypted.len() != 32 {
@@ -1021,8 +1062,8 @@ async fn run_node_task(
                     Some(NodeCommand::GetStats(reply)) => {
                         let _ = reply.send(node.stats());
                     }
-                    Some(NodeCommand::SetMode(mode, reply)) => {
-                        node.set_mode(mode);
+                    Some(NodeCommand::SetCapabilities(caps, reply)) => {
+                        node.set_capabilities(caps);
                         let _ = reply.send(Ok(()));
                     }
                     Some(NodeCommand::SetExitGeo { region, country_code, city, reply }) => {
@@ -1571,7 +1612,7 @@ mod tests {
         let service = mock_service();
 
         // Valid levels
-        for level in ["single", "double", "triple", "quad"] {
+        for level in ["direct", "single", "double", "triple", "quad"] {
             let result = service.handle(
                 "set_privacy_level",
                 Some(serde_json::json!({"level": level})),

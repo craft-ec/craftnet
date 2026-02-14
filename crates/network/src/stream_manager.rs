@@ -426,6 +426,14 @@ impl StreamManager {
         }
     }
 
+    /// Get a peer's subscription tier (0=free, 1+=subscribed).
+    pub fn get_peer_tier(&self, peer: &PeerId) -> u8 {
+        self.peers
+            .get(peer)
+            .map(|pc| pc.tier.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// Check if we have an outbound stream to a peer (can send).
     pub fn has_stream(&self, peer: &PeerId) -> bool {
         self.peers.get(peer).map_or(false, |pc| pc.outbound.is_some())
@@ -721,6 +729,12 @@ impl StreamManager {
         }
     }
 
+    /// Check if an outbound open is in progress for a peer.
+    #[cfg(test)]
+    fn is_opening(&self, peer: &PeerId) -> bool {
+        self.opening.contains(peer)
+    }
+
     /// Reader loop for a peer's inbound stream.
     ///
     /// Reads frames in a loop. Shard frames dispatch to priority channels.
@@ -792,5 +806,84 @@ impl StreamManager {
         }
 
         debug!("Reader loop ended for peer {}", peer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tunnelcraft_core::Shard;
+
+    fn test_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    fn test_shard() -> Shard {
+        Shard::new([1u8; 32], vec![], vec![42], vec![0; 98], 0, 0)
+    }
+
+    fn make_manager() -> (StreamManager, mpsc::Receiver<InboundShard>, mpsc::Receiver<InboundShard>, mpsc::Receiver<ForwardReceipt>, mpsc::Sender<OutboundShard>) {
+        let behaviour = libp2p_stream::Behaviour::new();
+        let control = behaviour.new_control();
+        StreamManager::new(control)
+    }
+
+    #[tokio::test]
+    async fn test_send_shard_without_stream_returns_would_block() {
+        let (mut mgr, _, _, _, _) = make_manager();
+        let peer = test_peer();
+        let shard = test_shard();
+
+        let result = mgr.send_shard(peer, &shard, false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn test_initial_state() {
+        let (mgr, _, _, _, _) = make_manager();
+        let peer = test_peer();
+
+        assert!(!mgr.has_stream(&peer));
+        assert_eq!(mgr.stream_count(), 0);
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(mgr.stream_peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_opening_deduplicates() {
+        let (mut mgr, _, _, _, _) = make_manager();
+        let peer = test_peer();
+
+        // First call should start opening
+        mgr.ensure_opening(peer);
+        assert!(mgr.is_opening(&peer));
+
+        // Second call should be a no-op (already opening)
+        mgr.ensure_opening(peer);
+        // Still opening (not duplicated)
+        assert!(mgr.is_opening(&peer));
+    }
+
+    #[tokio::test]
+    async fn test_on_peer_disconnected_cleans_up() {
+        let (mut mgr, _, _, _, _) = make_manager();
+        let peer = test_peer();
+
+        // Simulate opening state
+        mgr.ensure_opening(peer);
+        assert!(mgr.is_opening(&peer));
+
+        // Disconnect should clean up
+        mgr.on_peer_disconnected(&peer);
+        assert!(!mgr.is_opening(&peer));
+        assert!(!mgr.has_stream(&peer));
+    }
+
+    #[tokio::test]
+    async fn test_stream_peers_returns_empty_initially() {
+        let (mgr, _, _, _, _) = make_manager();
+        assert!(mgr.stream_peers().is_empty());
     }
 }

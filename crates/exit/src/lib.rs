@@ -54,6 +54,12 @@ pub enum ExitError {
 
     #[error("Tunnel I/O error: {0}")]
     TunnelIoError(String),
+
+    #[error("Response too large: exceeds {0} byte limit")]
+    ResponseTooLarge(usize),
+
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
 }
 
 pub type Result<T> = std::result::Result<T, ExitError>;

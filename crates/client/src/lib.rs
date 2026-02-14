@@ -47,6 +47,7 @@ mod node;
 pub mod path;
 mod request;
 mod response;
+pub mod shard_builder;
 pub mod socks5;
 mod tunnel;
 

@@ -81,6 +81,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # IPC
 jsonrpc-core = "18.0"
 
+# Bitflags
+bitflags = "2"
+
 # Utils
 bytes = "1.5"
 hex = "0.4"

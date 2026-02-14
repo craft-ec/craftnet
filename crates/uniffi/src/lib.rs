@@ -13,9 +13,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Runtime;
 use tracing::{debug, info};
 
-use tunnelcraft_client::{
-    NodeMode as ClientNodeMode, TunnelCraftNode,
-};
+use tunnelcraft_client::{Capabilities, TunnelCraftNode};
 use tunnelcraft_core::HopMode;
 
 // Export UniFFI scaffolding
@@ -59,60 +57,60 @@ pub enum ConnectionState {
     Error,
 }
 
-/// Privacy level (number of relay hops including gateway)
+/// Privacy level (number of relay hops)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum PrivacyLevel {
+    Direct,    // 0 hops (client → exit, free tier)
     Single,    // 1 hop (gateway only)
     Double,    // 2 hops
     Triple,    // 3 hops
     Quad,      // 4 hops
 }
 
-/// Operating mode for the unified node
+/// Individual capability flags exposed to FFI.
+///
+/// UniFFI doesn't support bitflags, so capabilities are represented as
+/// a list of individual flags that get composed into `Capabilities` internally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum NodeMode {
-    /// Use VPN only (spend credits, route personal traffic)
+pub enum Capability {
+    /// Route personal VPN traffic (spend credits)
     Client,
-    /// Help network only (earn credits, relay/exit for others)
-    Node,
-    /// Both: Use VPN + help network simultaneously
-    Both,
-}
-
-impl From<NodeMode> for ClientNodeMode {
-    fn from(mode: NodeMode) -> Self {
-        match mode {
-            NodeMode::Client => ClientNodeMode::Client,
-            NodeMode::Node => ClientNodeMode::Node,
-            NodeMode::Both => ClientNodeMode::Both,
-        }
-    }
-}
-
-impl From<ClientNodeMode> for NodeMode {
-    fn from(mode: ClientNodeMode) -> Self {
-        match mode {
-            ClientNodeMode::Client => NodeMode::Client,
-            ClientNodeMode::Node => NodeMode::Node,
-            ClientNodeMode::Both => NodeMode::Both,
-        }
-    }
-}
-
-/// Type of node services to run
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum NodeType {
-    /// Only relay shards (lower bandwidth, lower earnings)
+    /// Forward shards for others (earn credits)
     Relay,
-    /// Only exit (fetch HTTP, higher earnings, more risk)
+    /// Execute requests at edge (earn credits)
     Exit,
-    /// Both relay and exit (maximum earnings)
-    Full,
+    /// Collect proofs, build distributions
+    Aggregator,
+}
+
+/// Convert a list of FFI capability flags to the internal `Capabilities` bitflags.
+fn capabilities_from_ffi(caps: &[Capability]) -> Capabilities {
+    let mut result = Capabilities::empty();
+    for cap in caps {
+        match cap {
+            Capability::Client => result |= Capabilities::CLIENT,
+            Capability::Relay => result |= Capabilities::RELAY,
+            Capability::Exit => result |= Capabilities::EXIT,
+            Capability::Aggregator => result |= Capabilities::AGGREGATOR,
+        }
+    }
+    result
+}
+
+/// Convert internal `Capabilities` to a list of FFI capability flags.
+fn capabilities_to_ffi(caps: Capabilities) -> Vec<Capability> {
+    let mut result = Vec::new();
+    if caps.is_client() { result.push(Capability::Client); }
+    if caps.is_relay() { result.push(Capability::Relay); }
+    if caps.is_exit() { result.push(Capability::Exit); }
+    if caps.is_aggregator() { result.push(Capability::Aggregator); }
+    result
 }
 
 impl From<PrivacyLevel> for HopMode {
     fn from(level: PrivacyLevel) -> Self {
         match level {
+            PrivacyLevel::Direct => HopMode::Direct,
             PrivacyLevel::Single => HopMode::Single,
             PrivacyLevel::Double => HopMode::Double,
             PrivacyLevel::Triple => HopMode::Triple,
@@ -124,12 +122,10 @@ impl From<PrivacyLevel> for HopMode {
 /// Configuration for the unified TunnelCraft node
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UnifiedNodeConfig {
-    /// Operating mode
-    pub mode: NodeMode,
-    /// Privacy level for VPN traffic (Client/Both modes)
+    /// Node capabilities (list of individual flags)
+    pub capabilities: Vec<Capability>,
+    /// Privacy level for VPN traffic
     pub privacy_level: PrivacyLevel,
-    /// Type of node services (Node/Both modes)
-    pub node_type: NodeType,
     /// Bootstrap peer address (optional)
     pub bootstrap_peer: Option<String>,
     /// Request timeout in seconds
@@ -139,9 +135,8 @@ pub struct UnifiedNodeConfig {
 impl Default for UnifiedNodeConfig {
     fn default() -> Self {
         Self {
-            mode: NodeMode::Both,
+            capabilities: vec![Capability::Client, Capability::Relay],
             privacy_level: PrivacyLevel::Triple,
-            node_type: NodeType::Full,
             bootstrap_peer: None,
             request_timeout_secs: 30,
         }
@@ -226,15 +221,13 @@ pub fn create_default_unified_config() -> UnifiedNodeConfig {
 /// Create a unified node configuration with custom settings
 #[uniffi::export]
 pub fn create_unified_config(
-    mode: NodeMode,
+    capabilities: Vec<Capability>,
     privacy_level: PrivacyLevel,
-    node_type: NodeType,
     bootstrap_peer: Option<String>,
 ) -> UnifiedNodeConfig {
     UnifiedNodeConfig {
-        mode,
+        capabilities,
         privacy_level,
-        node_type,
         bootstrap_peer,
         request_timeout_secs: 30,
     }
@@ -244,7 +237,7 @@ pub fn create_unified_config(
 struct UnifiedNodeState {
     node: Option<TunnelCraftNode>,
     state: ConnectionState,
-    mode: NodeMode,
+    capabilities: Capabilities,
     error: Option<String>,
     stats: UnifiedNodeStats,
     start_time: Option<Instant>,
@@ -255,7 +248,7 @@ impl Default for UnifiedNodeState {
         Self {
             node: None,
             state: ConnectionState::Disconnected,
-            mode: NodeMode::Both,
+            capabilities: Capabilities::CLIENT | Capabilities::RELAY,
             error: None,
             stats: UnifiedNodeStats::default(),
             start_time: None,
@@ -265,12 +258,15 @@ impl Default for UnifiedNodeState {
 
 unsafe impl Send for UnifiedNodeState {}
 
-/// Unified TunnelCraft node supporting Client, Node, or Both modes
+/// Unified TunnelCraft node supporting composable capabilities
 ///
 /// This is the recommended interface for mobile apps. It provides:
-/// - Client mode: Route your traffic through VPN (spend credits)
-/// - Node mode: Help the network by relaying/exiting (earn credits)
-/// - Both mode: Use VPN + help network simultaneously
+/// - CLIENT capability: Route your traffic through VPN (spend credits)
+/// - RELAY capability: Forward shards for others (earn credits)
+/// - EXIT capability: Execute requests at edge (earn credits)
+/// - AGGREGATOR capability: Collect proofs, build distributions
+///
+/// Capabilities are composable — combine any set of flags.
 #[derive(uniffi::Object)]
 pub struct TunnelCraftUnifiedNode {
     config: RwLock<UnifiedNodeConfig>,
@@ -286,9 +282,10 @@ impl TunnelCraftUnifiedNode {
             return Err(TunnelCraftError::NotInitialized);
         }
 
-        info!("Creating TunnelCraftUnifiedNode with mode: {:?}", config.mode);
+        let caps = capabilities_from_ffi(&config.capabilities);
+        info!("Creating TunnelCraftUnifiedNode with capabilities: {:?}", caps);
 
-        let state = UnifiedNodeState { mode: config.mode, ..Default::default() };
+        let state = UnifiedNodeState { capabilities: caps, ..Default::default() };
 
         Ok(Arc::new(Self {
             config: RwLock::new(config),
@@ -309,10 +306,11 @@ impl TunnelCraftUnifiedNode {
         state.error = None;
 
         let config = self.config.read().clone();
+        let caps = capabilities_from_ffi(&config.capabilities);
 
         // Build node config
         let node_config = tunnelcraft_client::NodeConfig {
-            mode: config.mode.into(),
+            capabilities: caps,
             hop_mode: config.privacy_level.into(),
             ..Default::default()
         };
@@ -377,39 +375,39 @@ impl TunnelCraftUnifiedNode {
         Ok(())
     }
 
-    /// Get current operating mode
-    pub fn get_mode(&self) -> NodeMode {
-        self.state.lock().mode
+    /// Get current capabilities as FFI-friendly list
+    pub fn get_capabilities(&self) -> Vec<Capability> {
+        capabilities_to_ffi(self.state.lock().capabilities)
     }
 
-    /// Set operating mode (can be changed while running)
-    pub fn set_mode(&self, mode: NodeMode) -> Result<(), TunnelCraftError> {
+    /// Set capabilities (can be changed while running)
+    pub fn set_capabilities(&self, capabilities: Vec<Capability>) -> Result<(), TunnelCraftError> {
+        let new_caps = capabilities_from_ffi(&capabilities);
+
         let mut state = self.state.lock();
-        let old_mode = state.mode;
-        state.mode = mode;
+        let old_caps = state.capabilities;
+        state.capabilities = new_caps;
 
         if let Some(ref mut node) = state.node {
-            node.set_mode(mode.into());
-            info!("Mode changed from {:?} to {:?}", old_mode, mode);
+            node.set_capabilities(new_caps);
+            info!("Capabilities changed from {:?} to {:?}", old_caps, new_caps);
         }
 
         // Update config too
         drop(state);
-        self.config.write().mode = mode;
+        self.config.write().capabilities = capabilities;
 
         Ok(())
     }
 
-    /// Check if VPN routing is active (Client or Both mode)
+    /// Check if VPN routing is active (CLIENT capability)
     pub fn is_vpn_active(&self) -> bool {
-        let mode = self.state.lock().mode;
-        matches!(mode, NodeMode::Client | NodeMode::Both)
+        self.state.lock().capabilities.is_client()
     }
 
-    /// Check if node services are active (Node or Both mode)
+    /// Check if node services are active (any service capability)
     pub fn is_node_active(&self) -> bool {
-        let mode = self.state.lock().mode;
-        matches!(mode, NodeMode::Node | NodeMode::Both)
+        self.state.lock().capabilities.is_service_node()
     }
 
     /// Check if connected to the network
@@ -501,7 +499,7 @@ impl TunnelCraftUnifiedNode {
 
     /// Make an HTTP request through the tunnel
     ///
-    /// Only works in Client or Both mode.
+    /// Only works when CLIENT capability is active.
     pub fn request(
         &self,
         method: String,
@@ -635,6 +633,7 @@ mod tests {
 
     #[test]
     fn test_privacy_level_conversion() {
+        assert_eq!(HopMode::from(PrivacyLevel::Direct), HopMode::Direct);
         assert_eq!(HopMode::from(PrivacyLevel::Single), HopMode::Single);
         assert_eq!(HopMode::from(PrivacyLevel::Double), HopMode::Double);
         assert_eq!(HopMode::from(PrivacyLevel::Triple), HopMode::Triple);
@@ -645,7 +644,7 @@ mod tests {
     fn test_default_unified_config() {
         let config = UnifiedNodeConfig::default();
         assert_eq!(config.privacy_level, PrivacyLevel::Triple);
-        assert_eq!(config.mode, NodeMode::Both);
+        assert_eq!(config.capabilities, vec![Capability::Client, Capability::Relay]);
         assert_eq!(config.request_timeout_secs, 30);
         assert!(config.bootstrap_peer.is_none());
     }
@@ -653,14 +652,26 @@ mod tests {
     #[test]
     fn test_create_unified_config() {
         let config = create_unified_config(
-            NodeMode::Client,
+            vec![Capability::Client],
             PrivacyLevel::Quad,
-            NodeType::Relay,
             Some("peer@/ip4/127.0.0.1/tcp/9000".to_string()),
         );
         assert_eq!(config.privacy_level, PrivacyLevel::Quad);
-        assert_eq!(config.mode, NodeMode::Client);
+        assert_eq!(config.capabilities, vec![Capability::Client]);
         assert_eq!(config.request_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_capabilities_conversion() {
+        let ffi_caps = vec![Capability::Client, Capability::Relay, Capability::Exit];
+        let internal = capabilities_from_ffi(&ffi_caps);
+        assert!(internal.is_client());
+        assert!(internal.is_relay());
+        assert!(internal.is_exit());
+        assert!(!internal.is_aggregator());
+
+        let back = capabilities_to_ffi(internal);
+        assert_eq!(back.len(), 3);
     }
 
     #[test]
@@ -679,7 +690,8 @@ mod tests {
         let node = node.unwrap();
         assert!(!node.is_connected());
         assert_eq!(node.get_state(), ConnectionState::Disconnected);
-        assert_eq!(node.get_mode(), NodeMode::Both);
+        assert!(node.is_vpn_active());
+        assert!(node.is_node_active());
     }
 
     #[test]

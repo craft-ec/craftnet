@@ -34,7 +34,7 @@ use crate::{
     SettlementError, Result,
     Subscribe, PostDistribution, ClaimRewards,
     SubscriptionState, TransactionSignature,
-    EpochPhase,
+    EpochPhase, PricingPlanState,
     USDC_MINT_DEVNET, USDC_MINT_MAINNET,
     LightTreeConfig,
 };
@@ -149,6 +149,10 @@ struct MockState {
     /// Claimed relays: (pool_pubkey, relay_pubkey) — simulates
     /// Light Protocol compressed ClaimReceipt uniqueness
     claimed_relays: HashSet<(PublicKey, PublicKey)>,
+    /// Pricing plans: (tier, billing_period) → plan state
+    pricing_plans: HashMap<(u8, u8), PricingPlanState>,
+    /// Whether config has been initialized (admin set)
+    config_admin: Option<PublicKey>,
     /// Transaction counter for generating mock signatures
     tx_counter: u64,
 }
@@ -156,9 +160,13 @@ struct MockState {
 /// Anchor instruction discriminators for the TunnelCraft settlement program.
 /// Each is the first 8 bytes of SHA256("global:<instruction_name>").
 mod instruction {
-    pub const SUBSCRIBE:          [u8; 8] = [0xfe, 0x1c, 0xbf, 0x8a, 0x9c, 0xb3, 0xb7, 0x35];
-    pub const POST_DISTRIBUTION:  [u8; 8] = [0x0e, 0xa8, 0xf7, 0x4a, 0xbf, 0x7b, 0x15, 0xe8];
-    pub const CLAIM:              [u8; 8] = [0x3e, 0xc6, 0xd6, 0xc1, 0xd5, 0x9f, 0x6c, 0xd2];
+    pub const SUBSCRIBE:            [u8; 8] = [0xfe, 0x1c, 0xbf, 0x8a, 0x9c, 0xb3, 0xb7, 0x35];
+    pub const POST_DISTRIBUTION:    [u8; 8] = [0x0e, 0xa8, 0xf7, 0x4a, 0xbf, 0x7b, 0x15, 0xe8];
+    pub const CLAIM:                [u8; 8] = [0x3e, 0xc6, 0xd6, 0xc1, 0xd5, 0x9f, 0x6c, 0xd2];
+    pub const INITIALIZE_CONFIG:    [u8; 8] = [0xd0, 0x7f, 0x15, 0x01, 0x3a, 0x2c, 0x7c, 0x0e];
+    pub const CREATE_PLAN:          [u8; 8] = [0xb2, 0x4d, 0x97, 0x60, 0xf3, 0x1e, 0xa5, 0x42];
+    pub const UPDATE_PLAN:          [u8; 8] = [0xc8, 0x53, 0x1a, 0xde, 0x47, 0x8b, 0xf2, 0x19];
+    pub const DELETE_PLAN:          [u8; 8] = [0xa1, 0x6e, 0x3b, 0xcc, 0x59, 0xd4, 0x80, 0x73];
 }
 
 /// Settlement client for on-chain operations
@@ -318,6 +326,22 @@ impl SettlementClient {
         )
     }
 
+    /// Derive PDA for global config: ["config"]
+    fn config_pda(&self) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[b"config"],
+            &self.program_id(),
+        )
+    }
+
+    /// Derive PDA for pricing plan: ["plan", &[tier], &[billing_period]]
+    fn pricing_plan_pda(&self, tier: u8, billing_period: u8) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[b"plan", &[tier], &[billing_period]],
+            &self.program_id(),
+        )
+    }
+
     /// Derive associated token account address for a given wallet and mint.
     ///
     /// ATA PDA = find_program_address(
@@ -392,6 +416,275 @@ impl SettlementClient {
         Ok(sig_bytes)
     }
 
+    // ==================== Config & Pricing Plans ====================
+
+    /// Initialize the global config PDA (sets admin). One-time call.
+    pub async fn initialize_config(&self) -> Result<TransactionSignature> {
+        info!("Initializing config with admin {}", hex_encode(&self.signer_pubkey[..8]));
+
+        if self.is_mock() {
+            let mut state = self.mock_state.write().expect("settlement lock poisoned");
+            if state.config_admin.is_some() {
+                return Err(SettlementError::TransactionFailed(
+                    "Config already initialized".to_string()
+                ));
+            }
+            state.config_admin = Some(self.signer_pubkey);
+            info!("[MOCK] Config initialized, admin: {}", hex_encode(&self.signer_pubkey[..8]));
+            return Ok(Self::generate_mock_signature(&mut state));
+        }
+
+        // Live mode
+        let (config_pda, _) = self.config_pda();
+        let signer = Pubkey::new_from_array(self.signer_pubkey);
+
+        let instruction = Instruction {
+            program_id: self.program_id(),
+            accounts: vec![
+                AccountMeta::new(signer, true),                         // admin (signer + payer)
+                AccountMeta::new(config_pda, false),                    // config PDA (init)
+                AccountMeta::new_readonly(system_program::id(), false), // system_program
+            ],
+            data: instruction::INITIALIZE_CONFIG.to_vec(),
+        };
+
+        self.send_transaction(instruction).await
+    }
+
+    /// Create a new pricing plan. Requires admin signer.
+    pub async fn create_plan(
+        &self,
+        tier: u8,
+        billing_period: u8,
+        price_usdc: u64,
+    ) -> Result<TransactionSignature> {
+        info!(
+            "Creating plan: tier={}, period={}, price={}",
+            tier, billing_period, price_usdc,
+        );
+
+        if tier > 2 {
+            return Err(SettlementError::TransactionFailed("tier must be 0-2".to_string()));
+        }
+        if billing_period > 1 {
+            return Err(SettlementError::TransactionFailed("billing_period must be 0-1".to_string()));
+        }
+        if price_usdc == 0 {
+            return Err(SettlementError::TransactionFailed("price must be > 0".to_string()));
+        }
+
+        if self.is_mock() {
+            let mut state = self.mock_state.write().expect("settlement lock poisoned");
+            // Verify admin
+            match state.config_admin {
+                Some(admin) if admin == self.signer_pubkey => {}
+                Some(_) => return Err(SettlementError::NotAuthorized),
+                None => return Err(SettlementError::TransactionFailed("Config not initialized".to_string())),
+            }
+
+            let key = (tier, billing_period);
+            if state.pricing_plans.contains_key(&key) {
+                return Err(SettlementError::TransactionFailed(
+                    format!("Plan ({}, {}) already exists", tier, billing_period)
+                ));
+            }
+
+            let now = Self::now() as i64;
+            state.pricing_plans.insert(key, PricingPlanState {
+                tier,
+                billing_period,
+                price_usdc,
+                active: true,
+                updated_at: now,
+            });
+            info!("[MOCK] Plan created: tier={}, period={}, price={}", tier, billing_period, price_usdc);
+            return Ok(Self::generate_mock_signature(&mut state));
+        }
+
+        // Live mode
+        let (config_pda, _) = self.config_pda();
+        let (plan_pda, _) = self.pricing_plan_pda(tier, billing_period);
+        let signer = Pubkey::new_from_array(self.signer_pubkey);
+
+        let mut data = instruction::CREATE_PLAN.to_vec();
+        data.push(tier);
+        data.push(billing_period);
+        data.extend_from_slice(&price_usdc.to_le_bytes());
+
+        let instruction = Instruction {
+            program_id: self.program_id(),
+            accounts: vec![
+                AccountMeta::new(signer, true),                         // admin
+                AccountMeta::new_readonly(config_pda, false),           // config (has_one admin)
+                AccountMeta::new(plan_pda, false),                      // pricing_plan (init)
+                AccountMeta::new_readonly(system_program::id(), false), // system_program
+            ],
+            data,
+        };
+
+        self.send_transaction(instruction).await
+    }
+
+    /// Update a pricing plan's price. Requires admin signer.
+    pub async fn update_plan(
+        &self,
+        tier: u8,
+        billing_period: u8,
+        new_price_usdc: u64,
+    ) -> Result<TransactionSignature> {
+        info!(
+            "Updating plan: tier={}, period={}, new_price={}",
+            tier, billing_period, new_price_usdc,
+        );
+
+        if new_price_usdc == 0 {
+            return Err(SettlementError::TransactionFailed("price must be > 0".to_string()));
+        }
+
+        if self.is_mock() {
+            let mut state = self.mock_state.write().expect("settlement lock poisoned");
+            match state.config_admin {
+                Some(admin) if admin == self.signer_pubkey => {}
+                Some(_) => return Err(SettlementError::NotAuthorized),
+                None => return Err(SettlementError::TransactionFailed("Config not initialized".to_string())),
+            }
+
+            let key = (tier, billing_period);
+            let plan = state.pricing_plans.get_mut(&key)
+                .ok_or(SettlementError::PlanNotFound)?;
+            plan.price_usdc = new_price_usdc;
+            plan.updated_at = Self::now() as i64;
+            info!("[MOCK] Plan updated: tier={}, period={}, price={}", tier, billing_period, new_price_usdc);
+            return Ok(Self::generate_mock_signature(&mut state));
+        }
+
+        // Live mode
+        let (config_pda, _) = self.config_pda();
+        let (plan_pda, _) = self.pricing_plan_pda(tier, billing_period);
+        let signer = Pubkey::new_from_array(self.signer_pubkey);
+
+        let mut data = instruction::UPDATE_PLAN.to_vec();
+        data.extend_from_slice(&new_price_usdc.to_le_bytes());
+
+        let instruction = Instruction {
+            program_id: self.program_id(),
+            accounts: vec![
+                AccountMeta::new(signer, true),                // admin
+                AccountMeta::new_readonly(config_pda, false),  // config (has_one admin)
+                AccountMeta::new(plan_pda, false),             // pricing_plan (mut)
+            ],
+            data,
+        };
+
+        self.send_transaction(instruction).await
+    }
+
+    /// Delete (deactivate) a pricing plan. Requires admin signer.
+    pub async fn delete_plan(
+        &self,
+        tier: u8,
+        billing_period: u8,
+    ) -> Result<TransactionSignature> {
+        info!("Deleting plan: tier={}, period={}", tier, billing_period);
+
+        if self.is_mock() {
+            let mut state = self.mock_state.write().expect("settlement lock poisoned");
+            match state.config_admin {
+                Some(admin) if admin == self.signer_pubkey => {}
+                Some(_) => return Err(SettlementError::NotAuthorized),
+                None => return Err(SettlementError::TransactionFailed("Config not initialized".to_string())),
+            }
+
+            let key = (tier, billing_period);
+            let plan = state.pricing_plans.get_mut(&key)
+                .ok_or(SettlementError::PlanNotFound)?;
+            plan.active = false;
+            plan.updated_at = Self::now() as i64;
+            info!("[MOCK] Plan deactivated: tier={}, period={}", tier, billing_period);
+            return Ok(Self::generate_mock_signature(&mut state));
+        }
+
+        // Live mode
+        let (config_pda, _) = self.config_pda();
+        let (plan_pda, _) = self.pricing_plan_pda(tier, billing_period);
+        let signer = Pubkey::new_from_array(self.signer_pubkey);
+
+        let instruction = Instruction {
+            program_id: self.program_id(),
+            accounts: vec![
+                AccountMeta::new(signer, true),                // admin
+                AccountMeta::new_readonly(config_pda, false),  // config (has_one admin)
+                AccountMeta::new(plan_pda, false),             // pricing_plan (mut)
+            ],
+            data: instruction::DELETE_PLAN.to_vec(),
+        };
+
+        self.send_transaction(instruction).await
+    }
+
+    /// Get a pricing plan by tier and billing period
+    pub async fn get_pricing_plan(
+        &self,
+        tier: u8,
+        billing_period: u8,
+    ) -> Result<Option<PricingPlanState>> {
+        if self.is_mock() {
+            let state = self.mock_state.read().expect("settlement lock poisoned");
+            return Ok(state.pricing_plans.get(&(tier, billing_period)).cloned());
+        }
+
+        let rpc = self.rpc_client.as_ref()
+            .ok_or_else(|| SettlementError::RpcError("RPC client not initialized".to_string()))?;
+
+        let (plan_pda, _) = self.pricing_plan_pda(tier, billing_period);
+
+        match rpc.get_account(&plan_pda).await {
+            Ok(account) => {
+                let data = &account.data;
+                // PricingPlan layout (after 8-byte discriminator):
+                //  0..1:  tier u8
+                //  1..2:  billing_period u8
+                //  2..10: price_usdc u64
+                // 10..11: active bool
+                // 11..19: updated_at i64
+                const MIN_LEN: usize = 8 + 1 + 1 + 8 + 1 + 8; // = 27
+                if data.len() < MIN_LEN {
+                    return Ok(None);
+                }
+                let d = &data[8..]; // skip discriminator
+
+                Ok(Some(PricingPlanState {
+                    tier: d[0],
+                    billing_period: d[1],
+                    price_usdc: u64::from_le_bytes(d[2..10].try_into().expect("8 bytes")),
+                    active: d[10] != 0,
+                    updated_at: i64::from_le_bytes(d[11..19].try_into().expect("8 bytes")),
+                }))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Get all active pricing plans.
+    ///
+    /// Queries all 6 possible (tier, billing_period) combinations: 3 tiers x 2 periods.
+    pub async fn get_all_plans(&self) -> Result<Vec<PricingPlanState>> {
+        if self.is_mock() {
+            let state = self.mock_state.read().expect("settlement lock poisoned");
+            return Ok(state.pricing_plans.values().cloned().collect());
+        }
+
+        let mut plans = Vec::new();
+        for tier in 0..=2u8 {
+            for period in 0..=1u8 {
+                if let Some(plan) = self.get_pricing_plan(tier, period).await? {
+                    plans.push(plan);
+                }
+            }
+        }
+        Ok(plans)
+    }
+
     // ==================== Subscribe ====================
 
     /// Subscribe a user (creates pool subscription PDA)
@@ -410,11 +703,14 @@ impl SettlementClient {
             let mut state = self.mock_state.write().expect("settlement lock poisoned");
 
             let now = Self::now();
-            let expires_at = now + sub.duration_secs;
+            // start_date: 0 means use current time, positive means future-dated (yearly months)
+            let start_date = if sub.start_date <= 0 { now } else { sub.start_date as u64 };
+            let expires_at = start_date + sub.duration_secs;
 
             let subscription = SubscriptionState {
                 pool_pubkey: sub.user_pubkey,
                 tier: sub.tier,
+                start_date,
                 created_at: now,
                 expires_at,
                 pool_balance: sub.payment_amount,
@@ -426,10 +722,11 @@ impl SettlementClient {
             state.subscriptions.insert(sub.user_pubkey, subscription);
 
             info!(
-                "[MOCK] User {} subscribed ({:?}, pool: {}, expires: {})",
+                "[MOCK] User {} subscribed ({:?}, pool: {}, start: {}, expires: {})",
                 hex_encode(&sub.user_pubkey[..8]),
                 sub.tier,
                 sub.payment_amount,
+                start_date,
                 expires_at,
             );
             return Ok(Self::generate_mock_signature(&mut state));
@@ -454,6 +751,7 @@ impl SettlementClient {
         data.push(tier_byte);
         data.extend_from_slice(&sub.payment_amount.to_le_bytes());
         data.extend_from_slice(&sub.duration_secs.to_le_bytes());
+        data.extend_from_slice(&sub.start_date.to_le_bytes());
 
         // SPL Token and ATA program IDs
         let token_program_id = Pubkey::new_from_array([
@@ -481,6 +779,65 @@ impl SettlementClient {
         };
 
         self.send_transaction(instruction).await
+    }
+
+    /// Subscribe for a full year as 12 independent monthly pool PDAs.
+    ///
+    /// Each month gets its own pool keypair and SubscriptionAccount.
+    /// Month 0 starts at `now`, month N starts at `now + N*30d`.
+    /// Payment per month: `yearly_price / 12` (month 11 gets remainder).
+    ///
+    /// Returns 12 (pool_pubkey, tx_signature) pairs.
+    pub async fn subscribe_yearly(
+        &self,
+        user_pubkey: PublicKey,
+        tier: SubscriptionTier,
+        yearly_price: u64,
+    ) -> Result<Vec<(PublicKey, TransactionSignature)>> {
+        info!(
+            "Creating yearly subscription for {} ({:?}, total: {})",
+            hex_encode(&user_pubkey[..8]),
+            tier,
+            yearly_price,
+        );
+
+        let monthly_amount = yearly_price / 12;
+        let duration_secs: u64 = 30 * 24 * 3600; // 30 days per month
+        let now = Self::now() as i64;
+
+        let mut results = Vec::with_capacity(12);
+
+        for month in 0u8..12 {
+            // Each month gets its own deterministic "pool" pubkey.
+            // In production, generate ephemeral keypairs. For mock, derive from user+month.
+            let mut pool_pubkey = user_pubkey;
+            pool_pubkey[31] = pool_pubkey[31].wrapping_add(month);
+
+            let payment = if month == 11 {
+                yearly_price - monthly_amount * 11 // remainder
+            } else {
+                monthly_amount
+            };
+
+            let start_date = now + (month as i64) * (duration_secs as i64);
+
+            let sig = self.subscribe(Subscribe {
+                user_pubkey: pool_pubkey,
+                tier,
+                payment_amount: payment,
+                duration_secs,
+                start_date,
+            }).await?;
+
+            results.push((pool_pubkey, sig));
+        }
+
+        info!(
+            "[YEARLY] Created 12 monthly pools for {} ({:?})",
+            hex_encode(&user_pubkey[..8]),
+            tier,
+        );
+        Ok(results)
     }
 
     // ==================== Post Distribution ====================
@@ -822,6 +1179,7 @@ impl SettlementClient {
                 Ok(Some(SubscriptionState {
                     pool_pubkey: pubkey,
                     tier,
+                    start_date: created_at as u64,
                     created_at: created_at as u64,
                     expires_at: expires_at as u64,
                     pool_balance,
@@ -857,6 +1215,21 @@ impl SettlementClient {
         }
     }
 
+    /// Get verified subscription info for gossip verification.
+    ///
+    /// Returns the on-chain tier and active window (start_date, expires_at).
+    /// Used by relays to verify that a peer's gossiped subscription claim
+    /// matches what's actually on-chain.
+    pub async fn get_subscription(
+        &self,
+        pool_pubkey: PublicKey,
+    ) -> Result<Option<(SubscriptionTier, u64, u64)>> {
+        match self.get_latest_subscription(pool_pubkey).await? {
+            Some(sub) => Ok(Some((sub.tier, sub.start_date, sub.expires_at))),
+            None => Ok(None),
+        }
+    }
+
     // ==================== Mock Helpers ====================
 
     /// Add a mock subscription directly (mock mode only, for testing)
@@ -877,6 +1250,7 @@ impl SettlementClient {
         state.subscriptions.insert(user_pubkey, SubscriptionState {
             pool_pubkey: user_pubkey,
             tier,
+            start_date: now,
             created_at: now,
             expires_at,
             pool_balance,
@@ -912,6 +1286,7 @@ impl SettlementClient {
         state.subscriptions.insert(user_pubkey, SubscriptionState {
             pool_pubkey: user_pubkey,
             tier,
+            start_date: created_at,
             created_at,
             expires_at,
             pool_balance,
@@ -1028,6 +1403,7 @@ mod tests {
             tier: SubscriptionTier::Standard,
             payment_amount: 15_000_000,
             duration_secs: 30 * 24 * 3600,
+            start_date: 0,
         };
 
         let sig = client.subscribe(sub).await.unwrap();
@@ -1049,6 +1425,7 @@ mod tests {
             tier: SubscriptionTier::Premium,
             payment_amount: 40_000_000,
             duration_secs: 30 * 24 * 3600,
+            start_date: 0,
         }).await.unwrap();
 
         let state2 = client.get_subscription_state(user_pubkey).await.unwrap().unwrap();
@@ -1354,5 +1731,196 @@ mod tests {
         assert_eq!(hex_encode(&[0x00, 0xFF, 0xAB]), "00ffab");
         assert_eq!(hex_encode(&[]), "");
         assert_eq!(hex_encode(&[0x12, 0x34, 0x56, 0x78]), "12345678");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_config() {
+        let config = SettlementConfig::mock();
+        let admin_pubkey = [10u8; 32];
+        let client = SettlementClient::new(config, admin_pubkey);
+
+        // First init succeeds
+        client.initialize_config().await.unwrap();
+
+        // Second init fails
+        let result = client.initialize_config().await;
+        assert!(matches!(result, Err(SettlementError::TransactionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_plan() {
+        let config = SettlementConfig::mock();
+        let admin = [10u8; 32];
+        let client = SettlementClient::new(config, admin);
+        client.initialize_config().await.unwrap();
+
+        // Create a Basic Monthly plan at 5 USDC
+        client.create_plan(0, 0, 5_000_000).await.unwrap();
+
+        let plan = client.get_pricing_plan(0, 0).await.unwrap();
+        assert!(plan.is_some());
+        let plan = plan.unwrap();
+        assert_eq!(plan.tier, 0);
+        assert_eq!(plan.billing_period, 0);
+        assert_eq!(plan.price_usdc, 5_000_000);
+        assert!(plan.active);
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_requires_admin() {
+        let config = SettlementConfig::mock();
+        let admin = [10u8; 32];
+        let client = SettlementClient::new(config.clone(), admin);
+        client.initialize_config().await.unwrap();
+
+        // Different signer should fail
+        let non_admin = [20u8; 32];
+        let client2 = SettlementClient::new(config, non_admin);
+        // client2 shares no mock state with client, so it has no config
+        let result = client2.create_plan(0, 0, 5_000_000).await;
+        assert!(matches!(result, Err(SettlementError::TransactionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_validation() {
+        let config = SettlementConfig::mock();
+        let admin = [10u8; 32];
+        let client = SettlementClient::new(config, admin);
+        client.initialize_config().await.unwrap();
+
+        // Invalid tier
+        assert!(client.create_plan(3, 0, 5_000_000).await.is_err());
+        // Invalid period
+        assert!(client.create_plan(0, 2, 5_000_000).await.is_err());
+        // Zero price
+        assert!(client.create_plan(0, 0, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_plan() {
+        let config = SettlementConfig::mock();
+        let admin = [10u8; 32];
+        let client = SettlementClient::new(config, admin);
+        client.initialize_config().await.unwrap();
+        client.create_plan(1, 0, 15_000_000).await.unwrap();
+
+        // Update price
+        client.update_plan(1, 0, 20_000_000).await.unwrap();
+
+        let plan = client.get_pricing_plan(1, 0).await.unwrap().unwrap();
+        assert_eq!(plan.price_usdc, 20_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_delete_plan() {
+        let config = SettlementConfig::mock();
+        let admin = [10u8; 32];
+        let client = SettlementClient::new(config, admin);
+        client.initialize_config().await.unwrap();
+        client.create_plan(2, 1, 400_000_000).await.unwrap();
+
+        // Delete (deactivate)
+        client.delete_plan(2, 1).await.unwrap();
+
+        let plan = client.get_pricing_plan(2, 1).await.unwrap().unwrap();
+        assert!(!plan.active);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_plans() {
+        let config = SettlementConfig::mock();
+        let admin = [10u8; 32];
+        let client = SettlementClient::new(config, admin);
+        client.initialize_config().await.unwrap();
+
+        client.create_plan(0, 0, 5_000_000).await.unwrap();
+        client.create_plan(1, 0, 15_000_000).await.unwrap();
+        client.create_plan(2, 0, 40_000_000).await.unwrap();
+        client.create_plan(0, 1, 50_000_000).await.unwrap();
+
+        let plans = client.get_all_plans().await.unwrap();
+        assert_eq!(plans.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_yearly() {
+        let config = SettlementConfig::mock();
+        let client = SettlementClient::new(config, [0u8; 32]);
+
+        let user_pubkey = [5u8; 32];
+        let yearly_price: u64 = 120_000_000; // 120 USDC total
+
+        let results = client.subscribe_yearly(
+            user_pubkey,
+            SubscriptionTier::Standard,
+            yearly_price,
+        ).await.unwrap();
+
+        assert_eq!(results.len(), 12);
+
+        // Each month should have its own pool
+        let mut pool_pubkeys: Vec<PublicKey> = results.iter().map(|(pk, _)| *pk).collect();
+        pool_pubkeys.sort();
+        pool_pubkeys.dedup();
+        assert_eq!(pool_pubkeys.len(), 12); // all unique
+
+        // Check month 0 starts now-ish
+        let month0 = client.get_subscription_state(results[0].0).await.unwrap().unwrap();
+        assert_eq!(month0.tier, SubscriptionTier::Standard);
+        assert_eq!(month0.pool_balance, 10_000_000); // 120M / 12
+
+        // Check month 11 gets remainder
+        let month11 = client.get_subscription_state(results[11].0).await.unwrap().unwrap();
+        let expected_remainder = yearly_price - (yearly_price / 12) * 11;
+        assert_eq!(month11.pool_balance, expected_remainder);
+
+        // Month 6 should start ~180 days in the future
+        let month6 = client.get_subscription_state(results[6].0).await.unwrap().unwrap();
+        let six_months_secs: u64 = 6 * 30 * 24 * 3600;
+        assert!(month6.start_date > month0.start_date);
+        assert!(month6.start_date >= month0.start_date + six_months_secs - 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_subscription() {
+        let config = SettlementConfig::mock();
+        let client = SettlementClient::new(config, [0u8; 32]);
+
+        let user_pubkey = [1u8; 32];
+        client.add_mock_subscription(user_pubkey, SubscriptionTier::Premium, 40_000_000).unwrap();
+
+        let result = client.get_subscription(user_pubkey).await.unwrap();
+        assert!(result.is_some());
+        let (tier, start_date, expires_at) = result.unwrap();
+        assert_eq!(tier, SubscriptionTier::Premium);
+        assert!(start_date > 0);
+        assert!(expires_at > start_date);
+
+        // Non-existent returns None
+        assert!(client.get_subscription([99u8; 32]).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_with_start_date() {
+        let config = SettlementConfig::mock();
+        let client = SettlementClient::new(config, [0u8; 32]);
+
+        let user_pubkey = [1u8; 32];
+        let future_start = (SettlementClient::now() + 30 * 24 * 3600) as i64;
+        let duration = 30 * 24 * 3600;
+
+        client.subscribe(Subscribe {
+            user_pubkey,
+            tier: SubscriptionTier::Standard,
+            payment_amount: 15_000_000,
+            duration_secs: duration,
+            start_date: future_start,
+        }).await.unwrap();
+
+        let state = client.get_subscription_state(user_pubkey).await.unwrap().unwrap();
+        assert_eq!(state.start_date, future_start as u64);
+        assert_eq!(state.expires_at, future_start as u64 + duration);
+        // created_at should be ~now, not start_date
+        assert!(state.created_at < state.start_date);
     }
 }

@@ -100,6 +100,7 @@ async fn start_test_server() -> (SocketAddr, oneshot::Sender<()>) {
 fn test_exit_config() -> ExitConfig {
     ExitConfig {
         blocked_domains: vec![],
+        allow_private_ips: true,
         ..Default::default()
     }
 }

@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use tunnelcraft_core::{Id, TunnelMetadata};
+use tunnelcraft_core::{Id, PublicKey, TunnelMetadata};
 
 use crate::{ExitError, Result};
 
@@ -26,6 +26,8 @@ const READ_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 struct TcpSession {
     stream: TcpStream,
     last_activity: Instant,
+    /// Pool pubkey of the user who owns this session (for resource tracking)
+    pool_pubkey: PublicKey,
 }
 
 /// TCP tunnel handler managing session pool
@@ -44,11 +46,14 @@ impl TunnelHandler {
     /// Process tunnel data: connect, write, read, return raw response bytes.
     ///
     /// The caller (ExitHandler) is responsible for creating response shards.
+    /// Returns `(response_bytes, zombie)` where `zombie` is true if the session
+    /// was removed due to EOF/error (caller should decrement concurrent_tunnels).
     pub async fn process_tunnel_bytes(
         &mut self,
         metadata: &TunnelMetadata,
         data: Vec<u8>,
-    ) -> Result<Vec<u8>> {
+        pool_pubkey: PublicKey,
+    ) -> Result<(Vec<u8>, bool)> {
         let session_id = metadata.session_id;
 
         // Handle close signal
@@ -59,7 +64,7 @@ impl TunnelHandler {
                     hex::encode(&session_id[..8])
                 );
             }
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         // Get or create session
@@ -79,6 +84,7 @@ impl TunnelHandler {
             self.sessions.insert(session_id, TcpSession {
                 stream,
                 last_activity: Instant::now(),
+                pool_pubkey,
             });
 
             info!("Tunnel session {} established to {}", hex::encode(&session_id[..8]), addr);
@@ -96,6 +102,7 @@ impl TunnelHandler {
         // Read response bytes with idle timeout
         let mut response_buf = vec![0u8; MAX_RESPONSE_BYTES];
         let mut total_read = 0usize;
+        let mut eof = false;
 
         loop {
             if total_read >= MAX_RESPONSE_BYTES {
@@ -108,6 +115,7 @@ impl TunnelHandler {
             ).await {
                 Ok(Ok(0)) => {
                     debug!("Tunnel destination closed connection for session {}", hex::encode(&session_id[..8]));
+                    eof = true;
                     break;
                 }
                 Ok(Ok(n)) => {
@@ -115,6 +123,7 @@ impl TunnelHandler {
                 }
                 Ok(Err(e)) => {
                     warn!("Tunnel read error for session {}: {}", hex::encode(&session_id[..8]), e);
+                    eof = true;
                     break;
                 }
                 Err(_) => {
@@ -123,21 +132,44 @@ impl TunnelHandler {
             }
         }
 
+        // Remove zombie sessions (EOF or read error means destination closed)
+        if eof {
+            self.sessions.remove(&session_id);
+            debug!("Removed zombie session {}", hex::encode(&session_id[..8]));
+        }
+
         response_buf.truncate(total_read);
-        Ok(response_buf)
+        Ok((response_buf, eof))
     }
 
-    /// Remove sessions idle longer than `max_age`
-    pub fn clear_stale(&mut self, max_age: Duration) {
-        let before = self.sessions.len();
+    /// Remove sessions idle longer than `max_age`.
+    ///
+    /// Returns pool_pubkeys of evicted sessions so the caller can decrement
+    /// per-user concurrent_tunnels counters.
+    pub fn clear_stale(&mut self, max_age: Duration) -> Vec<PublicKey> {
         let now = Instant::now();
-        self.sessions.retain(|_, session| {
-            now.duration_since(session.last_activity) < max_age
-        });
-        let removed = before - self.sessions.len();
-        if removed > 0 {
-            warn!("Cleared {} stale tunnel sessions", removed);
+        let stale_ids: Vec<Id> = self.sessions.iter()
+            .filter(|(_, session)| now.duration_since(session.last_activity) >= max_age)
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut evicted_owners = Vec::with_capacity(stale_ids.len());
+        for id in &stale_ids {
+            if let Some(session) = self.sessions.remove(id) {
+                evicted_owners.push(session.pool_pubkey);
+            }
         }
+
+        if !evicted_owners.is_empty() {
+            warn!("Cleared {} stale tunnel sessions", evicted_owners.len());
+        }
+
+        evicted_owners
+    }
+
+    /// Check if a session exists
+    pub fn has_session(&self, session_id: &Id) -> bool {
+        self.sessions.contains_key(session_id)
     }
 
     /// Number of active tunnel sessions

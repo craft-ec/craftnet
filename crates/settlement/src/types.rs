@@ -37,6 +37,44 @@ pub enum EpochPhase {
     Closed,
 }
 
+/// Billing period for pricing plans
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BillingPeriod {
+    /// Monthly billing (30 days)
+    Monthly = 0,
+    /// Yearly billing (12 x 30-day months)
+    Yearly = 1,
+}
+
+impl BillingPeriod {
+    pub fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(BillingPeriod::Monthly),
+            1 => Some(BillingPeriod::Yearly),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// On-chain pricing plan state
+#[derive(Debug, Clone)]
+pub struct PricingPlanState {
+    /// Subscription tier (0=Basic, 1=Standard, 2=Premium)
+    pub tier: u8,
+    /// Billing period (0=Monthly, 1=Yearly)
+    pub billing_period: u8,
+    /// Price in USDC (6 decimals). Monthly: per-month. Yearly: total yearly price.
+    pub price_usdc: u64,
+    /// Whether this plan is active
+    pub active: bool,
+    /// When this plan was last updated
+    pub updated_at: i64,
+}
+
 /// Subscribe instruction data
 #[derive(Debug, Clone)]
 pub struct Subscribe {
@@ -48,6 +86,10 @@ pub struct Subscribe {
     pub payment_amount: u64,
     /// Duration in seconds (minimum 60)
     pub duration_secs: u64,
+    /// When the subscription becomes active (0 = use current time).
+    /// Can be in the future for yearly pre-paid months.
+    #[allow(dead_code)]
+    pub start_date: i64,
 }
 
 /// Post a Merkle distribution root for a pool.
@@ -115,6 +157,9 @@ pub struct SubscriptionState {
     pub pool_pubkey: PublicKey,
     /// Active subscription tier
     pub tier: SubscriptionTier,
+    /// When the subscription becomes active (unix seconds).
+    /// Can differ from created_at for yearly pre-paid months.
+    pub start_date: u64,
     /// When the subscription was created (unix seconds)
     pub created_at: u64,
     /// Subscription expiry timestamp (unix seconds)
@@ -190,6 +235,7 @@ mod tests {
             tier: SubscriptionTier::Standard,
             payment_amount: 15_000_000,
             duration_secs: 30 * 24 * 3600,
+            start_date: 0,
         };
 
         assert_eq!(sub.user_pubkey, [1u8; 32]);
@@ -236,6 +282,7 @@ mod tests {
         let state = SubscriptionState {
             pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Premium,
+            start_date: 1700000000,
             created_at: 1700000000,
             expires_at: 1700000000 + duration,
             pool_balance: 40_000_000,
@@ -257,6 +304,7 @@ mod tests {
         let state = SubscriptionState {
             pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
+            start_date: now,
             created_at: now,
             expires_at: now + duration,
             pool_balance: 1_000_000,
@@ -277,6 +325,7 @@ mod tests {
         let state = SubscriptionState {
             pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
+            start_date: now,
             created_at: now,
             expires_at,
             pool_balance: 1_000_000,
@@ -300,6 +349,7 @@ mod tests {
         let state = SubscriptionState {
             pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
+            start_date: now,
             created_at: now,
             expires_at,
             pool_balance: 1_000_000,
@@ -321,6 +371,7 @@ mod tests {
         let state = SubscriptionState {
             pool_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
+            start_date: now,
             created_at: now,
             expires_at,
             pool_balance: 0, // Fully drained

@@ -709,6 +709,7 @@ async fn ten_node_live_network() {
                 tier: tunnelcraft_core::SubscriptionTier::Basic,
                 payment_amount: payment,
                 duration_secs: 120, // 2-minute epoch for E2E test
+                start_date: 0,
             })
             .await
         {

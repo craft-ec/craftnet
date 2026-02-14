@@ -292,6 +292,8 @@ mod tests {
         let shard = Shard::new(
             ephemeral, header, vec![1, 2, 3],
             vec![0; 92],
+            0,
+            0,
         );
 
         let sender = [9u8; 32];
@@ -327,6 +329,8 @@ mod tests {
         let shard = Shard::new(
             ephemeral, header, vec![1, 2, 3],
             vec![0; 92],
+            0,
+            0,
         );
 
         // Relay 1 peels
@@ -362,6 +366,8 @@ mod tests {
         let shard = Shard::new(
             ephemeral, header, vec![1, 2, 3],
             vec![0; 92],
+            0,
+            0,
         );
 
         let result = handler.handle_shard(shard, [0u8; 32]);
@@ -399,6 +405,8 @@ mod tests {
         let shard = Shard::new(
             ephemeral, header, vec![1, 2, 3],
             vec![0; 92],
+            0,
+            0,
         );
 
         let (_, next_peer, _, _) = handler.handle_shard(shard, [0u8; 32]).unwrap();

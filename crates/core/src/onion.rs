@@ -75,6 +75,8 @@ pub struct ExitPayload {
 ///
 /// Contains assembly grouping ID plus shard/chunk metadata that was
 /// previously plaintext on Shard. Now only the exit/client can see this.
+/// Includes `pool_pubkey` so the exit can enforce per-user pending assembly
+/// limits at collect_shard time, before full assembly reconstruction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingTag {
     /// Assembly ID for grouping shards at the exit
@@ -87,6 +89,11 @@ pub struct RoutingTag {
     pub chunk_index: u16,
     /// Total number of chunks in this request/response
     pub total_chunks: u16,
+    /// User's pool pubkey for per-user resource tracking at the exit.
+    /// Subscribed users: their pool PDA key. Free users: their user_pubkey.
+    /// This is encrypted inside the routing tag — only the exit can see it.
+    #[serde(default)]
+    pub pool_pubkey: PublicKey,
 }
 
 impl OnionLayer {
@@ -228,6 +235,7 @@ mod tests {
             total_shards: 5,
             chunk_index: 1,
             total_chunks: 3,
+            pool_pubkey: [99u8; 32],
         };
         let bytes = tag.to_bytes().unwrap();
         let restored = RoutingTag::from_bytes(&bytes).unwrap();
@@ -236,5 +244,6 @@ mod tests {
         assert_eq!(restored.total_shards, 5);
         assert_eq!(restored.chunk_index, 1);
         assert_eq!(restored.total_chunks, 3);
+        assert_eq!(restored.pool_pubkey, [99u8; 32]);
     }
 }

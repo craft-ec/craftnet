@@ -554,6 +554,8 @@ mod tests {
         let shard = Shard::new(
             [1u8; 32], vec![2, 3], vec![4, 5, 6],
             vec![0; 92],
+            0,
+            0,
         );
         let request = ShardRequest { shard };
         let _cloned = request.clone();
@@ -580,6 +582,8 @@ mod tests {
         let shard = Shard::new(
             [1u8; 32], vec![2, 3], vec![0xAB, 0xCD, 0xEF],
             vec![0; 92],
+            0,
+            0,
         );
         let request = ShardRequest { shard };
 
@@ -724,6 +728,8 @@ mod tests {
             vec![2u8; 64],
             b"stream payload".to_vec(),
             vec![3u8; 92],
+            0,
+            0,
         );
 
         let mut buffer = Vec::new();

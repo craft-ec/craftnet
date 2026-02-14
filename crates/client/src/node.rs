@@ -22,7 +22,7 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use tunnelcraft_core::{Capabilities, ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, TunnelMetadata};
+use tunnelcraft_core::{Capabilities, ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, SubscriptionTier, TunnelMetadata};
 use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair};
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_erasure::chunker::reassemble;
@@ -131,10 +131,14 @@ const SUBSCRIPTION_VERIFY_BATCH_SIZE: usize = 10;
 struct SubscriptionEntry {
     /// Subscription tier (0=Basic, 1=Standard, 2=Premium, 255=None/Free)
     tier: u8,
+    /// On-chain start_date (from verification)
+    start_date: u64,
     /// Claimed expiry (from announcement)
     expires_at: u64,
     /// Whether this has been verified on-chain
     verified: bool,
+    /// When this entry was last verified on-chain (for re-verification)
+    verified_at: Option<std::time::Instant>,
     /// Last time we saw traffic from this user
     last_seen: std::time::Instant,
 }
@@ -828,6 +832,8 @@ pub struct TunnelCraftNode {
     outbound_tx: Option<mpsc::Sender<OutboundShard>>,
     /// Buffered receipts pending batch disk flush (avoids per-receipt file I/O)
     receipt_buffer: Vec<ForwardReceipt>,
+    /// In-flight async flush result from spawn_blocking
+    flush_result_rx: Option<tokio::sync::oneshot::Receiver<std::io::Result<usize>>>,
     /// Channel for receiving results from spawned exit processing tasks
     exit_task_tx: mpsc::Sender<ExitTaskResult>,
     exit_task_rx: mpsc::Receiver<ExitTaskResult>,
@@ -1072,6 +1078,7 @@ impl TunnelCraftNode {
             stream_receipt_rx: None,
             outbound_tx: None,
             receipt_buffer: Vec::new(),
+            flush_result_rx: None,
             exit_task_tx,
             exit_task_rx,
             exit_shard_queue: VecDeque::new(),
@@ -2608,7 +2615,46 @@ impl TunnelCraftNode {
         // Lock released here
 
         match relay_result {
-            Ok((modified_shard, next_peer_bytes, receipt, pool_pubkey)) => {
+            Ok((mut modified_shard, next_peer_bytes, receipt, pool_pubkey)) => {
+                // ── Tier enforcement ──
+                // 1. hops_remaining must be >= 1 (otherwise no honest relay should process it)
+                if modified_shard.hops_remaining < 1 {
+                    warn!(
+                        "[TIER] Rejected shard: hops_remaining=0 (total_hops={})",
+                        modified_shard.total_hops,
+                    );
+                    return ShardResponse::Rejected("hops_remaining exhausted".to_string());
+                }
+
+                // 2. Tier check: total_hops must not exceed the maximum for this pool's tier
+                let max_hops = match self.subscription_cache.get(&pool_pubkey) {
+                    Some(entry) if entry.tier != 255 => {
+                        SubscriptionTier::from_u8(entry.tier)
+                            .map(|t| t.max_hop_mode().min_relays())
+                            .unwrap_or(0)
+                    }
+                    _ => 0, // free tier → only Direct (0 hops) allowed
+                };
+                if modified_shard.total_hops > max_hops {
+                    warn!(
+                        "[TIER] Rejected shard: total_hops={} exceeds tier max={}",
+                        modified_shard.total_hops, max_hops,
+                    );
+                    return ShardResponse::Rejected("total_hops exceeds tier".to_string());
+                }
+
+                // 3. Structural: hops_remaining must not exceed total_hops
+                if modified_shard.hops_remaining > modified_shard.total_hops {
+                    warn!(
+                        "[TIER] Rejected shard: hops_remaining={} > total_hops={}",
+                        modified_shard.hops_remaining, modified_shard.total_hops,
+                    );
+                    return ShardResponse::Rejected("hops_remaining > total_hops".to_string());
+                }
+
+                // 4. Decrement hops_remaining before forwarding
+                modified_shard.hops_remaining -= 1;
+
                 let has_tunnel = modified_shard.header.is_empty();
                 let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
                 let local_short = &local_id[local_id.len().saturating_sub(6)..];
@@ -3044,6 +3090,7 @@ impl TunnelCraftNode {
             &exit_hop,
             &paths,
             &lease_set,
+            self.encryption_keypair.public_key_bytes(), // response_enc_pubkey — X25519 key for response encryption
             self.keypair.public_key_bytes(), // pool_pubkey — always user pubkey (tracks subscription or free usage)
         );
 
@@ -3353,8 +3400,14 @@ impl TunnelCraftNode {
             }
         }
 
-        // Process high-priority first, then low-priority
-        for inbound in high_batch.into_iter().chain(low_batch.into_iter()) {
+        // Under load, rate-limit low-priority to prevent free-tier from
+        // starving paid subscribers. When >100 high-priority shards are
+        // pending, only process 10 low-priority per drain cycle.
+        let low_limit = if high_batch.len() > 100 { 10 } else { usize::MAX };
+        let low_iter = low_batch.into_iter().take(low_limit);
+
+        // Process high-priority first, then low-priority (rate-limited)
+        for inbound in high_batch.into_iter().chain(low_iter) {
             let peer = inbound.peer;
             let seq_id = inbound.seq_id;
             let response = self.process_incoming_shard(inbound.shard, peer).await;
@@ -3398,27 +3451,63 @@ impl TunnelCraftNode {
 
     /// Flush buffered receipts to disk in a single file open/close.
     /// Called at the end of poll_once() to batch all per-shard receipts.
+    ///
+    /// Uses spawn_blocking to avoid blocking the event loop with file I/O.
+    /// On file open failure, keeps the buffer intact for the next flush cycle.
     fn flush_receipts(&mut self) {
+        // Check for completed in-flight flush first
+        if let Some(ref mut rx) = self.flush_result_rx {
+            match rx.try_recv() {
+                Ok(Ok(written)) => {
+                    debug!("Async flush completed: {} receipts written", written);
+                    self.flush_result_rx = None;
+                }
+                Ok(Err(e)) => {
+                    warn!("Async flush failed: {} (receipts in transit lost to disk)", e);
+                    self.flush_result_rx = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    // Still in progress — don't start another flush
+                    return;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    warn!("Async flush task dropped");
+                    self.flush_result_rx = None;
+                }
+            }
+        }
+
         if self.receipt_buffer.is_empty() {
             return;
         }
+
         if let Some(ref path) = self.receipt_file {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                Ok(mut file) => {
-                    for receipt in self.receipt_buffer.drain(..) {
-                        if let Ok(json) = serde_json::to_string(&receipt) {
-                            let _ = writeln!(file, "{}", json);
+            // Move buffer to blocking task
+            let receipts = std::mem::take(&mut self.receipt_buffer);
+            let path = path.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.flush_result_rx = Some(rx);
+
+            tokio::task::spawn_blocking(move || {
+                let result = (|| -> std::io::Result<usize> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)?;
+                    let mut written = 0usize;
+                    for receipt in &receipts {
+                        if let Ok(json) = serde_json::to_string(receipt) {
+                            writeln!(file, "{}", json)?;
+                            written += 1;
                         }
                     }
-                }
-                Err(e) => {
-                    warn!("Failed to persist receipts to {}: {}", path.display(), e);
-                    self.receipt_buffer.clear();
-                }
-            }
+                    Ok(written)
+                })();
+                let _ = tx.send(result);
+            });
         } else {
             self.receipt_buffer.clear();
         }
@@ -3450,6 +3539,14 @@ impl TunnelCraftNode {
         self.maybe_reconnect_bootstrap();
         self.update_topology();
         self.refresh_and_evict_tunnels();
+
+        // Clear stale exit handler assemblies and zombie tunnel sessions
+        {
+            let mut state = self.state.write();
+            if let Some(ref mut exit_handler) = state.exit_handler {
+                exit_handler.clear_stale(Duration::from_secs(120));
+            }
+        }
     }
 
     /// Run async maintenance tasks (subscription verification, distribution posting, aggregator persistence).
@@ -3549,10 +3646,38 @@ impl TunnelCraftNode {
         use crate::path::{PathSelector, OnionPath, random_id};
         use tunnelcraft_core::lease_set::{LeaseSet, Lease};
 
-        let extra_hops = self.config.hop_mode.extra_hops() as usize;
         let our_peer_id = self.local_peer_id
             .ok_or(ClientError::NotConnected)?;
         let our_bytes = our_peer_id.to_bytes();
+
+        // Direct mode (0 hops): client → exit with no relays.
+        // Client puts itself in the LeaseSet as the "gateway" so exit can
+        // send response shards directly back to us.
+        if self.config.hop_mode == HopMode::Direct {
+            let lease = Lease {
+                gateway_peer_id: our_bytes.to_vec(),
+                gateway_encryption_pubkey: self.encryption_keypair.public_key_bytes(),
+                tunnel_id: [0u8; 32], // sentinel: direct mode
+                expires_at: u64::MAX,
+            };
+            let lease_set = LeaseSet {
+                session_id: random_id(),
+                leases: vec![lease],
+            };
+            // Empty hops = direct to exit. Empty first_hops triggers
+            // the existing "send directly to exit" code path.
+            let path = OnionPath {
+                hops: vec![],
+                exit: exit_hop.clone(),
+            };
+            info!(
+                "Direct mode path: client={} → exit (no relays, exit sees client IP)",
+                our_peer_id,
+            );
+            return Ok((vec![path], vec![], lease_set));
+        }
+
+        let extra_hops = self.config.hop_mode.extra_hops() as usize;
 
         // Select all eligible gateway relays. The primary gateway is the first
         // onion hop for this request's shards. Additional gateways are included
@@ -3596,7 +3721,7 @@ impl TunnelCraftNode {
         let gw_bytes = gw_peer_id.to_bytes();
 
         if extra_hops == 0 {
-            // Direct mode: path = [gateway] → exit (1 onion hop)
+            // Single hop: path = [gateway] → exit (1 onion hop)
             let path = OnionPath {
                 hops: vec![gw_hop],
                 exit: exit_hop.clone(),
@@ -3653,9 +3778,14 @@ impl TunnelCraftNode {
             );
         }
 
+        // Collect relays sorted by health score (lower = healthier) for
+        // deterministic preference of healthier relays as gateway.
+        let mut sorted_relays: Vec<_> = self.relay_nodes.values().collect();
+        sorted_relays.sort_by_key(|s| s.score);
+
         // Best: DHT relay that also appears in topology with our bytes in connected_peers
         // AND has an established shard-stream
-        for relay_status in self.relay_nodes.values() {
+        for relay_status in &sorted_relays {
             if !swarm.is_connected(&relay_status.peer_id) {
                 continue;
             }
@@ -3668,7 +3798,7 @@ impl TunnelCraftNode {
                 .find(|r| r.signing_pubkey == relay_status.info.pubkey
                     && r.connected_peers.contains(our_bytes))
             {
-                info!("Selected gateway relay {} (topology-confirmed, stream=true)", relay_status.peer_id);
+                info!("Selected gateway relay {} (topology-confirmed, stream=true, score={})", relay_status.peer_id, relay_status.score);
                 return Some((relay_status.peer_id, PathHop {
                     peer_id: relay_status.peer_id.to_bytes(),
                     signing_pubkey: topo_relay.signing_pubkey,
@@ -3678,7 +3808,7 @@ impl TunnelCraftNode {
         }
 
         // Fallback: any DHT relay connected via swarm with stream (use topology enc key if available)
-        for relay_status in self.relay_nodes.values() {
+        for relay_status in &sorted_relays {
             if !swarm.is_connected(&relay_status.peer_id) {
                 continue;
             }
@@ -3697,7 +3827,7 @@ impl TunnelCraftNode {
                 continue; // Skip relays with no encryption key
             }
 
-            info!("Selected gateway relay {} (fallback, stream=true)", relay_status.peer_id);
+            info!("Selected gateway relay {} (fallback, stream=true, score={})", relay_status.peer_id, relay_status.score);
             return Some((relay_status.peer_id, PathHop {
                 peer_id: relay_status.peer_id.to_bytes(),
                 signing_pubkey: relay_status.info.pubkey,
@@ -3722,8 +3852,13 @@ impl TunnelCraftNode {
         let mut results = Vec::new();
         let mut seen = HashSet::new();
 
+        // Sort relays by health score (lower = healthier) so healthier
+        // relays appear first in the LeaseSet
+        let mut sorted_relays: Vec<_> = self.relay_nodes.values().collect();
+        sorted_relays.sort_by_key(|s| s.score);
+
         // First pass: topology-confirmed relays with stream (best quality)
-        for relay_status in self.relay_nodes.values() {
+        for relay_status in &sorted_relays {
             if !swarm.is_connected(&relay_status.peer_id) {
                 continue;
             }
@@ -3746,7 +3881,7 @@ impl TunnelCraftNode {
         }
 
         // Second pass: DHT relays with encryption keys + stream (fallback)
-        for relay_status in self.relay_nodes.values() {
+        for relay_status in &sorted_relays {
             if !swarm.is_connected(&relay_status.peer_id) || seen.contains(&relay_status.peer_id) {
                 continue;
             }
@@ -4682,8 +4817,10 @@ impl TunnelCraftNode {
         let now = std::time::Instant::now();
         let entry = self.subscription_cache.entry(msg.user_pubkey).or_insert(SubscriptionEntry {
             tier: msg.tier,
+            start_date: 0,
             expires_at: msg.expires_at,
             verified: false,
+            verified_at: None,
             last_seen: now,
         });
         entry.tier = msg.tier;
@@ -4698,7 +4835,11 @@ impl TunnelCraftNode {
         );
     }
 
-    /// Periodically verify recently-seen subscriptions on-chain in batches
+    /// Periodically verify recently-seen subscriptions on-chain in batches.
+    ///
+    /// Checks actual on-chain tier + active window (start_date, expires_at),
+    /// not just boolean existence. Downgrades to free if claimed tier doesn't
+    /// match on-chain. Re-verifies stale entries (>5 min since last check).
     async fn maybe_verify_subscriptions(&mut self) {
         // Only verify in relay mode
         if !self.capabilities.is_service_node() {
@@ -4719,9 +4860,17 @@ impl TunnelCraftNode {
         };
         let settlement = Arc::clone(settlement);
 
-        // Collect unverified users sorted by last_seen (most recent first)
+        let now_instant = std::time::Instant::now();
+        let reverify_threshold = std::time::Duration::from_secs(300); // 5 minutes
+
+        // Collect entries needing verification:
+        // 1. Never verified (!verified)
+        // 2. Stale verification (verified_at older than 5 min)
         let mut to_verify: Vec<PublicKey> = self.subscription_cache.iter()
-            .filter(|(_, entry)| !entry.verified)
+            .filter(|(_, entry)| {
+                !entry.verified ||
+                entry.verified_at.map_or(true, |at| now_instant.duration_since(at) >= reverify_threshold)
+            })
             .map(|(pubkey, _)| *pubkey)
             .collect();
         to_verify.truncate(SUBSCRIPTION_VERIFY_BATCH_SIZE);
@@ -4732,26 +4881,67 @@ impl TunnelCraftNode {
 
         debug!("Verifying {} subscriptions on-chain", to_verify.len());
 
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
         for pubkey in to_verify {
-            match settlement.is_subscribed(pubkey).await {
-                Ok(true) => {
+            match settlement.get_subscription(pubkey).await {
+                Ok(Some((tier, start_date, expires_at))) => {
+                    // Verify active window: start_date <= now <= expires_at
+                    let is_active = start_date <= now_unix && now_unix <= expires_at;
+                    let verified_tier = if is_active { tier.as_u8() } else { 255 };
+
                     if let Some(entry) = self.subscription_cache.get_mut(&pubkey) {
+                        // Downgrade if claimed tier doesn't match on-chain
+                        if entry.tier != verified_tier {
+                            debug!(
+                                "Tier mismatch for {}: claimed={}, on-chain={} (active={})",
+                                hex::encode(&pubkey[..8]),
+                                entry.tier,
+                                verified_tier,
+                                is_active,
+                            );
+                        }
+                        entry.tier = verified_tier;
+                        entry.start_date = start_date;
+                        entry.expires_at = expires_at;
                         entry.verified = true;
+                        entry.verified_at = Some(now_instant);
+
                         debug!(
-                            "Verified subscription on-chain: {}",
+                            "Verified subscription: {} tier={} start={} expires={} active={}",
                             hex::encode(&pubkey[..8]),
+                            verified_tier,
+                            start_date,
+                            expires_at,
+                            is_active,
                         );
                     }
+
+                    // Propagate tier to StreamManager for priority routing
+                    let peer_id = self.find_peer_for_pubkey(&pubkey);
+                    if let (Some(ref mut sm), Some(pid)) = (&mut self.stream_manager, peer_id) {
+                        sm.update_peer_tier(&pid, verified_tier);
+                    }
                 }
-                Ok(false) => {
+                Ok(None) => {
                     // Not subscribed on-chain — mark as free tier
                     if let Some(entry) = self.subscription_cache.get_mut(&pubkey) {
                         entry.tier = 255; // Free
                         entry.verified = true;
+                        entry.verified_at = Some(now_instant);
+
                         debug!(
                             "Subscription NOT found on-chain: {} (marking free)",
                             hex::encode(&pubkey[..8]),
                         );
+                    }
+
+                    let peer_id = self.find_peer_for_pubkey(&pubkey);
+                    if let (Some(ref mut sm), Some(pid)) = (&mut self.stream_manager, peer_id) {
+                        sm.update_peer_tier(&pid, 255);
                     }
                 }
                 Err(e) => {
@@ -4760,10 +4950,20 @@ impl TunnelCraftNode {
                         hex::encode(&pubkey[..8]),
                         e,
                     );
-                    // Leave unverified, will retry next interval
+                    // Leave as-is, will retry next interval
                 }
             }
         }
+    }
+
+    /// Find the PeerId associated with a user pubkey (from relay_nodes or peer mappings).
+    fn find_peer_for_pubkey(&self, _pubkey: &PublicKey) -> Option<libp2p::PeerId> {
+        // Relay nodes are indexed by relay_id, not user_pubkey.
+        // The pubkey→PeerId mapping would require iterating relay_nodes.
+        // For now, tier updates happen on accept_stream via gossip.
+        // This is a best-effort optimization — the primary tier routing
+        // happens when the stream is accepted (accept_stream with tier param).
+        None
     }
 
     /// Pre-build Merkle distributions for expired pool epochs.

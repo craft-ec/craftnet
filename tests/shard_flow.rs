@@ -288,6 +288,8 @@ fn test_relay_handler_peels_1_hop_shard() {
         header,
         vec![1, 2, 3, 4],
         vec![0u8; 92],
+        0,
+        0,
     );
 
     let sender_pubkey = [9u8; 32];
@@ -349,6 +351,8 @@ fn test_relay_handler_peels_2_hop_chain() {
         header,
         vec![10, 20, 30],
         vec![0u8; 92],
+        0,
+        0,
     );
 
     // Relay 1 peels
@@ -400,6 +404,8 @@ fn test_relay_handler_wrong_key_rejects_shard() {
         header,
         vec![1, 2, 3],
         vec![0u8; 92],
+        0,
+        0,
     );
 
     let result = handler.handle_shard(shard, [0u8; 32]);
@@ -438,6 +444,8 @@ fn test_forward_receipt_from_relay_is_valid() {
         header,
         vec![0xAA; 2048],
         vec![0u8; 92],
+        0,
+        0,
     );
 
     let sender = [77u8; 32];
@@ -663,6 +671,7 @@ fn test_routing_tag_encrypt_decrypt_roundtrip() {
         5,
         0,
         1,
+        &[0u8; 32],
     )
     .expect("encrypt_routing_tag should succeed");
 
@@ -686,8 +695,8 @@ fn test_routing_tags_are_unlinkable() {
     let exit_enc = EncryptionKeypair::generate();
     let assembly_id = [42u8; 32];
 
-    let tag1 = encrypt_routing_tag(&exit_enc.public_key_bytes(), &assembly_id, 0, 5, 0, 1).unwrap();
-    let tag2 = encrypt_routing_tag(&exit_enc.public_key_bytes(), &assembly_id, 0, 5, 0, 1).unwrap();
+    let tag1 = encrypt_routing_tag(&exit_enc.public_key_bytes(), &assembly_id, 0, 5, 0, 1, &[0u8; 32]).unwrap();
+    let tag2 = encrypt_routing_tag(&exit_enc.public_key_bytes(), &assembly_id, 0, 5, 0, 1, &[0u8; 32]).unwrap();
 
     // Each call uses a fresh ephemeral key, so tags should differ
     assert_ne!(tag1, tag2, "Same assembly_id should produce different ciphertexts");
@@ -704,7 +713,7 @@ fn test_routing_tag_wrong_key_fails() {
     let exit_enc = EncryptionKeypair::generate();
     let wrong_enc = EncryptionKeypair::generate();
 
-    let tag = encrypt_routing_tag(&exit_enc.public_key_bytes(), &[1u8; 32], 0, 5, 0, 1).unwrap();
+    let tag = encrypt_routing_tag(&exit_enc.public_key_bytes(), &[1u8; 32], 0, 5, 0, 1, &[0u8; 32]).unwrap();
 
     let result = decrypt_routing_tag(&wrong_enc.secret_key_bytes(), &tag);
     assert!(result.is_err(), "Wrong key should fail to decrypt routing tag");
@@ -833,6 +842,8 @@ fn test_shard_new_fields() {
         vec![2, 3, 4],
         vec![5, 6, 7, 8],
         vec![9u8; 98],
+        0,
+        0,
     );
 
     assert_eq!(shard.ephemeral_pubkey, [1u8; 32]);
@@ -848,6 +859,8 @@ fn test_shard_serialization_roundtrip() {
         vec![2, 3, 4, 5],
         vec![10, 20, 30],
         vec![0u8; 98],
+        0,
+        0,
     );
 
     let bytes = shard.to_bytes().unwrap();

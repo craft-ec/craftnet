@@ -23,6 +23,8 @@ fn create_test_shard() -> Shard {
         vec![2u8; 64],          // header (onion layers)
         b"test payload".to_vec(), // payload
         vec![3u8; 92],          // routing_tag
+        0,                      // total_hops
+        0,                      // hops_remaining
     )
 }
 
@@ -301,6 +303,8 @@ async fn test_multiple_shards_via_stream() {
                 vec![2u8; 64],
                 format!("payload_{}", i).into_bytes(),
                 vec![3u8; 92],
+                0,
+                0,
             );
             write_shard_frame(&mut writer1, &shard, i + 1).await.unwrap();
         }

@@ -481,6 +481,7 @@ async fn test_post_distribution_blocked_during_active() {
             tier: tunnelcraft_core::SubscriptionTier::Standard,
             payment_amount: 1_000_000,
             duration_secs: 30 * 24 * 3600,
+            start_date: 0,
         })
         .await
         .unwrap();

@@ -184,6 +184,7 @@ async fn test_devnet_subscribe() -> anyhow::Result<()> {
             tier: tunnelcraft_core::SubscriptionTier::Standard,
             payment_amount: payment,
             duration_secs: 120, // 2 minutes for testing
+            start_date: 0,
         })
         .await?;
 
