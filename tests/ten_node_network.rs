@@ -616,7 +616,8 @@ async fn ten_node_live_network() {
             capabilities: Capabilities::EXIT,
             listen_addr: format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap(),
             bootstrap_peers: bootstrap_peers.clone(),
-            exit_blocked_domains: Some(vec![]), // Allow localhost for testing
+            exit_blocked_domains: Some(vec![]), // Clear domain blocklist for testing
+            exit_allow_private_ips: true,        // Allow 127.0.0.1 for localhost test server
             proof_batch_size: 5,
             proof_deadline: Duration::from_secs(30),
             maintenance_interval: Duration::from_secs(15),
@@ -656,6 +657,7 @@ async fn ten_node_live_network() {
         config.settlement_config = SettlementConfig::devnet_default();
         if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
             if !api_key.is_empty() {
+                config.settlement_config.rpc_url = format!("https://devnet.helius-rpc.com?api-key={}", api_key);
                 config.settlement_config.helius_api_key = Some(api_key);
             }
         }
@@ -712,6 +714,7 @@ async fn ten_node_live_network() {
 
                 if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
                     if !api_key.is_empty() {
+                        config.settlement_config.rpc_url = format!("https://devnet.helius-rpc.com?api-key={}", api_key);
                         config.settlement_config.helius_api_key = Some(api_key);
                     }
                 }
@@ -744,7 +747,9 @@ async fn ten_node_live_network() {
     let mut onchain_expires_at: Option<u64> = None;
     if let Some(ref kp) = devnet_keypair {
         println!("\n=== Devnet Settlement: On-chain Subscribe ===");
-        let user_pubkey: [u8; 32] = kp.pubkey().to_bytes();
+        // Ephemeral pool key — unique per run (avoids PDA collisions with old layouts)
+        let ephemeral_pool = solana_sdk::signature::Keypair::new();
+        let pool_pubkey: [u8; 32] = ephemeral_pool.pubkey().to_bytes();
 
         // Re-create the keypair for SettlementClient (it takes ownership)
         let kp_bytes = kp.to_bytes();
@@ -753,6 +758,7 @@ async fn ten_node_live_network() {
         let mut config = SettlementConfig::devnet_default();
         if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
             if !api_key.is_empty() {
+                config.rpc_url = format!("https://devnet.helius-rpc.com?api-key={}", api_key);
                 config.helius_api_key = Some(api_key);
             }
         }
@@ -761,11 +767,12 @@ async fn ten_node_live_network() {
 
         let payment = 10_000u64; // 0.01 USDC (wallet may have limited devnet USDC)
         println!("  Wallet: {}", kp.pubkey());
+        println!("  Pool pubkey: {}", hex::encode(&pool_pubkey[..8]));
         println!("  Subscribing with {} USDC on devnet...", payment as f64 / 1e6);
 
         match client
             .subscribe(Subscribe {
-                user_pubkey,
+                user_pubkey: pool_pubkey,
                 tier: tunnelcraft_core::SubscriptionTier::Basic,
                 payment_amount: payment,
                 duration_secs: 120, // 2-minute epoch for E2E test
@@ -776,7 +783,7 @@ async fn ten_node_live_network() {
             Ok(tx_sig) => {
                 println!("  tx: {}", bs58::encode(&tx_sig).into_string());
 
-                if let Ok(Some(state)) = client.get_subscription_state(user_pubkey).await {
+                if let Ok(Some(state)) = client.get_subscription_state(pool_pubkey).await {
                     println!("  tier: {:?}", state.tier);
                     println!("  pool_balance: {} USDC", state.pool_balance as f64 / 1e6);
                     println!("  expires_at: {}", state.expires_at);
@@ -1118,6 +1125,7 @@ async fn ten_node_live_network() {
         let mut plan_config = SettlementConfig::devnet_default();
         if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
             if !api_key.is_empty() {
+                plan_config.rpc_url = format!("https://devnet.helius-rpc.com?api-key={}", api_key);
                 plan_config.helius_api_key = Some(api_key);
             }
         }
@@ -1164,6 +1172,7 @@ async fn ten_node_live_network() {
         let mut yearly_config = SettlementConfig::devnet_default();
         if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
             if !api_key.is_empty() {
+                yearly_config.rpc_url = format!("https://devnet.helius-rpc.com?api-key={}", api_key);
                 yearly_config.helius_api_key = Some(api_key);
             }
         }
@@ -1173,13 +1182,13 @@ async fn ten_node_live_network() {
             user_pubkey,
             tunnelcraft_core::SubscriptionTier::Standard,
             120_000, // $0.12 yearly ($0.01/month)
-            120,     // 120 seconds per period (short for testing)
+            36_000,  // 36000s total period (~10h), each month = 3000s (50min)
         ).await {
             Ok(pool_results) => {
-                println!("  Created {} monthly pools (120s periods)", pool_results.len());
+                println!("  Created {} monthly pools (3000s per month, 36000s total)", pool_results.len());
                 assert_eq!(pool_results.len(), 12, "Yearly should create 12 pools");
 
-                // Verify first and last pools
+                // Verify first and last pools have correct tier
                 for (i, (pool_pk, tx_sig)) in pool_results.iter().enumerate() {
                     if i == 0 || i == 11 {
                         println!("  Pool {}: pubkey={}, tx={}",
@@ -1195,14 +1204,14 @@ async fn ten_node_live_network() {
                     }
                 }
 
-                // Verify staggered start dates: pool 1 should start 120s after pool 0
+                // Verify staggered start dates: pool 1 should start period/12 = 3000s after pool 0
                 if let (Ok(Some(s0)), Ok(Some(s1))) = (
                     yearly_client.get_subscription(pool_results[0].0).await,
                     yearly_client.get_subscription(pool_results[1].0).await,
                 ) {
-                    let gap = s1.1 - s0.1;
-                    println!("  Period gap between pool 0 and 1: {}s (expected 120s)", gap);
-                    assert_eq!(gap, 120, "Period gap should be 120s");
+                    let gap = s1.1.saturating_sub(s0.1);
+                    println!("  Period gap between pool 0 and 1: {}s (expected 3000s)", gap);
+                    assert_eq!(gap, 3000, "Period gap should be period_secs/12 = 3000s");
                 }
 
                 println!("  YEARLY SUBSCRIPTION OK");
@@ -1361,6 +1370,7 @@ async fn ten_node_live_network() {
         let mut config = SettlementConfig::devnet_default();
         if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
             if !api_key.is_empty() {
+                config.rpc_url = format!("https://devnet.helius-rpc.com?api-key={}", api_key);
                 config.helius_api_key = Some(api_key);
             }
         }

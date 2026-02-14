@@ -33,28 +33,114 @@ pub const LIGHT_CPI_SIGNER: CpiSigner =
 pub mod tunnelcraft_settlement {
     use super::*;
 
+    /// Initialize the global config PDA. Sets the caller as admin. One-time call.
+    pub fn initialize_config(ctx: Context<InitializeConfigCtx>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.admin = ctx.accounts.admin.key();
+        config.paused = false;
+
+        emit!(ConfigInitialized {
+            admin: config.admin,
+        });
+
+        Ok(())
+    }
+
+    /// Create a new pricing plan. Requires admin signer.
+    pub fn create_plan(
+        ctx: Context<CreatePlanCtx>,
+        tier: u8,
+        billing_period: u8,
+        price_usdc: u64,
+    ) -> Result<()> {
+        require!(tier <= 2, SettlementError::InvalidTier);
+        require!(billing_period <= 1, SettlementError::InvalidBillingPeriod);
+        require!(price_usdc > 0, SettlementError::InvalidPrice);
+
+        let plan = &mut ctx.accounts.pricing_plan;
+        plan.tier = tier;
+        plan.billing_period = billing_period;
+        plan.price_usdc = price_usdc;
+        plan.active = true;
+        plan.updated_at = Clock::get()?.unix_timestamp;
+
+        emit!(PlanCreated {
+            tier,
+            billing_period,
+            price_usdc,
+        });
+
+        Ok(())
+    }
+
+    /// Update a pricing plan's price. Requires admin signer.
+    pub fn update_plan(
+        ctx: Context<UpdatePlanCtx>,
+        new_price_usdc: u64,
+    ) -> Result<()> {
+        require!(new_price_usdc > 0, SettlementError::InvalidPrice);
+
+        let plan = &mut ctx.accounts.pricing_plan;
+        plan.price_usdc = new_price_usdc;
+        plan.updated_at = Clock::get()?.unix_timestamp;
+
+        emit!(PlanUpdated {
+            tier: plan.tier,
+            billing_period: plan.billing_period,
+            price_usdc: new_price_usdc,
+        });
+
+        Ok(())
+    }
+
+    /// Deactivate a pricing plan. Requires admin signer.
+    pub fn delete_plan(ctx: Context<DeletePlanCtx>) -> Result<()> {
+        let plan = &mut ctx.accounts.pricing_plan;
+        plan.active = false;
+        plan.updated_at = Clock::get()?.unix_timestamp;
+
+        emit!(PlanDeleted {
+            tier: plan.tier,
+            billing_period: plan.billing_period,
+        });
+
+        Ok(())
+    }
+
     /// Subscribe: Any wallet purchases a subscription for an ephemeral pool identity.
     ///
     /// Creates a SubscriptionAccount PDA keyed by `pool_pubkey` (ephemeral key).
     /// The pool token account holds the USDC payment. No persistent UserMeta —
     /// each subscription is independent.
+    ///
+    /// `start_date`: if > 0, the subscription starts at that unix timestamp (future-dated
+    /// for yearly monthly pools). If <= 0, uses current clock time.
     pub fn subscribe(
         ctx: Context<SubscribeCtx>,
         pool_pubkey: [u8; 32],
         tier: u8,
         payment_amount: u64,
         duration_secs: u64,
+        start_date: i64,
     ) -> Result<()> {
         require!(duration_secs >= 60, SettlementError::InvalidDuration);
 
         let subscription = &mut ctx.accounts.subscription_account;
         let clock = Clock::get()?;
 
+        // Use start_date if positive, else use current clock.
+        let effective_start = if start_date > 0 {
+            start_date
+        } else {
+            clock.unix_timestamp
+        };
+
         // Init subscription
         subscription.pool_pubkey = pool_pubkey;
         subscription.tier = tier;
+        subscription.start_date = effective_start;
         subscription.created_at = clock.unix_timestamp;
-        subscription.expires_at = clock.unix_timestamp + duration_secs as i64;
+        subscription.expires_at = effective_start + duration_secs as i64;
         subscription.pool_balance = payment_amount;
         subscription.original_pool_balance = payment_amount;
         subscription.total_receipts = 0;
@@ -78,6 +164,7 @@ pub mod tunnelcraft_settlement {
             pool_pubkey,
             tier,
             pool_balance: payment_amount,
+            start_date: effective_start,
             expires_at: subscription.expires_at,
         });
 
@@ -359,7 +446,79 @@ fn verify_merkle_proof(
 // ============================================================================
 
 #[derive(Accounts)]
-#[instruction(pool_pubkey: [u8; 32], tier: u8, payment_amount: u64, duration_secs: u64)]
+pub struct InitializeConfigCtx<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + Config::INIT_SPACE,
+        seeds = [b"config"],
+        bump,
+    )]
+    pub config: Account<'info, Config>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(tier: u8, billing_period: u8, price_usdc: u64)]
+pub struct CreatePlanCtx<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = admin,
+    )]
+    pub config: Account<'info, Config>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + PricingPlan::INIT_SPACE,
+        seeds = [b"plan".as_ref(), &[tier], &[billing_period]],
+        bump,
+    )]
+    pub pricing_plan: Account<'info, PricingPlan>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePlanCtx<'info> {
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = admin,
+    )]
+    pub config: Account<'info, Config>,
+
+    #[account(mut)]
+    pub pricing_plan: Account<'info, PricingPlan>,
+}
+
+#[derive(Accounts)]
+pub struct DeletePlanCtx<'info> {
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = admin,
+    )]
+    pub config: Account<'info, Config>,
+
+    #[account(mut)]
+    pub pricing_plan: Account<'info, PricingPlan>,
+}
+
+#[derive(Accounts)]
+#[instruction(pool_pubkey: [u8; 32], tier: u8, payment_amount: u64, duration_secs: u64, start_date: i64)]
 pub struct SubscribeCtx<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -455,12 +614,38 @@ pub struct ClaimCtx<'info> {
 
 #[account]
 #[derive(InitSpace)]
+pub struct Config {
+    /// Admin public key (only this key can manage pricing plans)
+    pub admin: Pubkey,
+    /// Whether the program is paused
+    pub paused: bool,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct PricingPlan {
+    /// Subscription tier (0=Basic, 1=Standard, 2=Premium)
+    pub tier: u8,
+    /// Billing period (0=Monthly, 1=Yearly)
+    pub billing_period: u8,
+    /// Price in USDC (6 decimals). Monthly: per-month. Yearly: total yearly price.
+    pub price_usdc: u64,
+    /// Whether this plan is active
+    pub active: bool,
+    /// Last update timestamp
+    pub updated_at: i64,
+}
+
+#[account]
+#[derive(InitSpace)]
 pub struct SubscriptionAccount {
     /// Ephemeral pool pubkey (subscription identity)
     pub pool_pubkey: [u8; 32],
     /// Subscription tier (0=Basic, 1=Standard, 2=Premium)
     pub tier: u8,
-    /// When subscription was created (unix timestamp)
+    /// When subscription becomes active (may be future-dated for yearly months)
+    pub start_date: i64,
+    /// When subscription PDA was created (unix timestamp)
     pub created_at: i64,
     /// When subscription expires (unix timestamp)
     pub expires_at: i64,
@@ -549,10 +734,36 @@ pub struct LightClaimParams {
 // ============================================================================
 
 #[event]
+pub struct ConfigInitialized {
+    pub admin: Pubkey,
+}
+
+#[event]
+pub struct PlanCreated {
+    pub tier: u8,
+    pub billing_period: u8,
+    pub price_usdc: u64,
+}
+
+#[event]
+pub struct PlanUpdated {
+    pub tier: u8,
+    pub billing_period: u8,
+    pub price_usdc: u64,
+}
+
+#[event]
+pub struct PlanDeleted {
+    pub tier: u8,
+    pub billing_period: u8,
+}
+
+#[event]
 pub struct Subscribed {
     pub pool_pubkey: [u8; 32],
     pub tier: u8,
     pub pool_balance: u64,
+    pub start_date: i64,
     pub expires_at: i64,
 }
 
@@ -598,4 +809,10 @@ pub enum SettlementError {
     InvalidProof,
     #[msg("Duration must be at least 60 seconds")]
     InvalidDuration,
+    #[msg("Tier must be 0-2")]
+    InvalidTier,
+    #[msg("Billing period must be 0-1")]
+    InvalidBillingPeriod,
+    #[msg("Price must be > 0")]
+    InvalidPrice,
 }

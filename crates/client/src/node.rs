@@ -193,6 +193,10 @@ pub struct NodeConfig {
     /// Set to Some(vec![]) to allow all destinations (useful for testing).
     pub exit_blocked_domains: Option<Vec<String>>,
 
+    /// Allow exit handler to connect to private/internal IP ranges.
+    /// Default: false (SSRF protection). Set to true for localhost testing.
+    pub exit_allow_private_ips: bool,
+
     /// Proof batch size: minimum receipts before triggering compression.
     /// Lower values cause more frequent (smaller) batches. Default: 10,000.
     /// The runtime value adapts based on compression speed, but starts here.
@@ -225,6 +229,7 @@ impl Default for NodeConfig {
             libp2p_keypair: None,
             data_dir: None,
             exit_blocked_domains: None,
+            exit_allow_private_ips: false,
             proof_batch_size: 10_000,
             proof_deadline: PROOF_DEADLINE,
             maintenance_interval: Duration::from_secs(30),
@@ -1163,6 +1168,7 @@ impl TunnelCraftNode {
             if caps.is_exit() && state.exit_handler.is_none() {
                 let mut exit_config = ExitConfig {
                     timeout: self.config.request_timeout,
+                    allow_private_ips: self.config.exit_allow_private_ips,
                     ..Default::default()
                 };
                 if let Some(ref blocked) = self.config.exit_blocked_domains {

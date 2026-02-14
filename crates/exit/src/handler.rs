@@ -875,8 +875,14 @@ impl ExitHandler {
                     (vec![], [0u8; 32], None)
                 };
 
+                // Response shards routed through a gateway relay need
+                // total_hops/hops_remaining set so the gateway's tier
+                // enforcement passes (gateway peels one layer and checks
+                // hops_remaining >= 1).  Direct mode responses (empty
+                // header) keep 0/0.
+                let resp_hops: u8 = if header.is_empty() { 0 } else { 1 };
                 shard_pairs.push((
-                    Shard::new(ephemeral, header, payload, routing_tag, 0, 0),
+                    Shard::new(ephemeral, header, payload, routing_tag, resp_hops, resp_hops),
                     gateway,
                 ));
             }

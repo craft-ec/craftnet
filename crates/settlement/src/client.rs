@@ -163,10 +163,10 @@ mod instruction {
     pub const SUBSCRIBE:            [u8; 8] = [0xfe, 0x1c, 0xbf, 0x8a, 0x9c, 0xb3, 0xb7, 0x35];
     pub const POST_DISTRIBUTION:    [u8; 8] = [0x0e, 0xa8, 0xf7, 0x4a, 0xbf, 0x7b, 0x15, 0xe8];
     pub const CLAIM:                [u8; 8] = [0x3e, 0xc6, 0xd6, 0xc1, 0xd5, 0x9f, 0x6c, 0xd2];
-    pub const INITIALIZE_CONFIG:    [u8; 8] = [0xd0, 0x7f, 0x15, 0x01, 0x3a, 0x2c, 0x7c, 0x0e];
-    pub const CREATE_PLAN:          [u8; 8] = [0xb2, 0x4d, 0x97, 0x60, 0xf3, 0x1e, 0xa5, 0x42];
-    pub const UPDATE_PLAN:          [u8; 8] = [0xc8, 0x53, 0x1a, 0xde, 0x47, 0x8b, 0xf2, 0x19];
-    pub const DELETE_PLAN:          [u8; 8] = [0xa1, 0x6e, 0x3b, 0xcc, 0x59, 0xd4, 0x80, 0x73];
+    pub const INITIALIZE_CONFIG:    [u8; 8] = [0xd0, 0x7f, 0x15, 0x01, 0xc2, 0xbe, 0xc4, 0x46];
+    pub const CREATE_PLAN:          [u8; 8] = [0x4d, 0x2b, 0x8d, 0xfe, 0xd4, 0x76, 0x29, 0xba];
+    pub const UPDATE_PLAN:          [u8; 8] = [0x77, 0x70, 0x3a, 0x3c, 0x4c, 0xcd, 0x01, 0x64];
+    pub const DELETE_PLAN:          [u8; 8] = [0x29, 0x6f, 0xa9, 0xd2, 0x5d, 0x8d, 0x6c, 0x35];
 }
 
 /// Settlement client for on-chain operations
@@ -316,6 +316,18 @@ impl SettlementClient {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    /// Get current on-chain time (slot timestamp) via RPC.
+    /// In mock mode, uses local system time.
+    async fn get_chain_time(&self) -> Option<i64> {
+        if let Some(rpc) = self.rpc_client.as_ref() {
+            let slot = rpc.get_slot().await.ok()?;
+            let block_time = rpc.get_block_time(slot).await.ok()?;
+            Some(block_time)
+        } else {
+            Some(Self::now() as i64)
+        }
     }
 
     /// Derive PDA for pool subscription account: ["pool", pool_pubkey]
@@ -805,16 +817,20 @@ impl SettlementClient {
         );
 
         let monthly_amount = yearly_price / 12;
-        let duration_secs: u64 = period_secs;
-        let now = Self::now() as i64;
+        let month_duration = period_secs / 12; // period_secs is total, each month = total / 12
+        let nonce = (Self::now() as u64).to_le_bytes();
+
+        // Get on-chain time as base — avoids client/chain clock skew.
+        // All 12 months are independent and can be created atomically.
+        let base_start = self.get_chain_time().await
+            .ok_or_else(|| SettlementError::RpcError("Failed to get on-chain time".into()))?;
 
         let mut results = Vec::with_capacity(12);
 
         for month in 0u8..12 {
-            // Each month gets its own deterministic "pool" pubkey.
-            // In production, generate ephemeral keypairs. For mock, derive from user+month.
             let mut pool_pubkey = user_pubkey;
-            pool_pubkey[31] = pool_pubkey[31].wrapping_add(month);
+            pool_pubkey[24..32].copy_from_slice(&nonce);
+            pool_pubkey[23] = month;
 
             let payment = if month == 11 {
                 yearly_price - monthly_amount * 11 // remainder
@@ -822,13 +838,13 @@ impl SettlementClient {
                 monthly_amount
             };
 
-            let start_date = now + (month as i64) * (duration_secs as i64);
+            let start_date = base_start + (month as i64) * (month_duration as i64);
 
             let sig = self.subscribe(Subscribe {
                 user_pubkey: pool_pubkey,
                 tier,
                 payment_amount: payment,
-                duration_secs,
+                duration_secs: month_duration,
                 start_date,
             }).await?;
 
@@ -1146,14 +1162,15 @@ impl SettlementClient {
                 // SubscriptionAccount layout (after 8-byte discriminator):
                 //   0..32:  pool_pubkey [u8; 32]
                 //  32..33:  tier u8
-                //  33..41:  created_at i64
-                //  41..49:  expires_at i64
-                //  49..57:  pool_balance u64
-                //  57..65:  original_pool_balance u64
-                //  65..73:  total_bytes u64
-                //  73..105: distribution_root [u8; 32]
-                // 105..106: distribution_posted bool
-                const MIN_LEN: usize = 8 + 32 + 1 + 8 + 8 + 8 + 8 + 8 + 32 + 1; // = 114
+                //  33..41:  start_date i64
+                //  41..49:  created_at i64
+                //  49..57:  expires_at i64
+                //  57..65:  pool_balance u64
+                //  65..73:  original_pool_balance u64
+                //  73..81:  total_bytes u64
+                //  81..113: distribution_root [u8; 32]
+                // 113..114: distribution_posted bool
+                const MIN_LEN: usize = 8 + 32 + 1 + 8 + 8 + 8 + 8 + 8 + 8 + 32 + 1; // = 122
                 if data.len() < MIN_LEN {
                     return Ok(None);
                 }
@@ -1170,20 +1187,21 @@ impl SettlementClient {
                     _ => SubscriptionTier::Basic,
                 };
 
-                let created_at = i64::from_le_bytes(d[33..41].try_into().expect("8 bytes"));
-                let expires_at = i64::from_le_bytes(d[41..49].try_into().expect("8 bytes"));
-                let pool_balance = u64::from_le_bytes(d[49..57].try_into().expect("8 bytes"));
-                let original_pool_balance = u64::from_le_bytes(d[57..65].try_into().expect("8 bytes"));
-                let total_bytes = u64::from_le_bytes(d[65..73].try_into().expect("8 bytes"));
+                let start_date = i64::from_le_bytes(d[33..41].try_into().expect("8 bytes"));
+                let created_at = i64::from_le_bytes(d[41..49].try_into().expect("8 bytes"));
+                let expires_at = i64::from_le_bytes(d[49..57].try_into().expect("8 bytes"));
+                let pool_balance = u64::from_le_bytes(d[57..65].try_into().expect("8 bytes"));
+                let original_pool_balance = u64::from_le_bytes(d[65..73].try_into().expect("8 bytes"));
+                let total_bytes = u64::from_le_bytes(d[73..81].try_into().expect("8 bytes"));
 
                 let mut distribution_root = [0u8; 32];
-                distribution_root.copy_from_slice(&d[73..105]);
-                let distribution_posted = d[105] != 0;
+                distribution_root.copy_from_slice(&d[81..113]);
+                let distribution_posted = d[113] != 0;
 
                 Ok(Some(SubscriptionState {
                     pool_pubkey: pubkey,
                     tier,
-                    start_date: created_at as u64,
+                    start_date: start_date as u64,
                     created_at: created_at as u64,
                     expires_at: expires_at as u64,
                     pool_balance,
@@ -1879,9 +1897,10 @@ mod tests {
         let expected_remainder = yearly_price - (yearly_price / 12) * 11;
         assert_eq!(month11.pool_balance, expected_remainder);
 
-        // Month 6 should start ~180 days in the future
+        // Month 6 should start 6 * month_duration in the future
         let month6 = client.get_subscription_state(results[6].0).await.unwrap().unwrap();
-        let six_months_secs: u64 = 6 * 30 * 24 * 3600;
+        let month_duration: u64 = 30 * 24 * 3600 / 12; // period_secs / 12
+        let six_months_secs: u64 = 6 * month_duration;
         assert!(month6.start_date > month0.start_date);
         assert!(month6.start_date >= month0.start_date + six_months_secs - 2);
     }
