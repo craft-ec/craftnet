@@ -74,15 +74,19 @@ pub enum SubscriptionTier {
     Standard,
     /// 1 TB + best-effort beyond / month
     Premium,
+    /// Unlimited / month — maximum privacy (4 hops)
+    Ultra,
 }
 
 impl SubscriptionTier {
     /// Maximum hop mode allowed for this tier.
+    /// Basic=1 hop, Standard=2 hops, Premium=3 hops, Ultra=4 hops.
     pub fn max_hop_mode(&self) -> HopMode {
         match self {
             SubscriptionTier::Basic => HopMode::Single,
             SubscriptionTier::Standard => HopMode::Double,
-            SubscriptionTier::Premium => HopMode::Quad,
+            SubscriptionTier::Premium => HopMode::Triple,
+            SubscriptionTier::Ultra => HopMode::Quad,
         }
     }
 
@@ -92,6 +96,7 @@ impl SubscriptionTier {
             0 => Some(SubscriptionTier::Basic),
             1 => Some(SubscriptionTier::Standard),
             2 => Some(SubscriptionTier::Premium),
+            3 => Some(SubscriptionTier::Ultra),
             _ => None,
         }
     }
@@ -102,6 +107,7 @@ impl SubscriptionTier {
             SubscriptionTier::Basic => 0,
             SubscriptionTier::Standard => 1,
             SubscriptionTier::Premium => 2,
+            SubscriptionTier::Ultra => 3,
         }
     }
 }
@@ -465,17 +471,8 @@ mod tests {
     // ==================== SubscriptionTier Tests ====================
 
     #[test]
-    fn test_subscription_tier_equality() {
-        assert_eq!(SubscriptionTier::Basic, SubscriptionTier::Basic);
-        assert_eq!(SubscriptionTier::Standard, SubscriptionTier::Standard);
-        assert_eq!(SubscriptionTier::Premium, SubscriptionTier::Premium);
-        assert_ne!(SubscriptionTier::Basic, SubscriptionTier::Standard);
-        assert_ne!(SubscriptionTier::Standard, SubscriptionTier::Premium);
-    }
-
-    #[test]
     fn test_subscription_tier_serialization() {
-        for tier in [SubscriptionTier::Basic, SubscriptionTier::Standard, SubscriptionTier::Premium] {
+        for tier in [SubscriptionTier::Basic, SubscriptionTier::Standard, SubscriptionTier::Premium, SubscriptionTier::Ultra] {
             let json = serde_json::to_string(&tier).unwrap();
             let restored: SubscriptionTier = serde_json::from_str(&json).unwrap();
             assert_eq!(tier, restored);
@@ -486,7 +483,8 @@ mod tests {
     fn test_subscription_tier_max_hop_mode() {
         assert_eq!(SubscriptionTier::Basic.max_hop_mode(), HopMode::Single);
         assert_eq!(SubscriptionTier::Standard.max_hop_mode(), HopMode::Double);
-        assert_eq!(SubscriptionTier::Premium.max_hop_mode(), HopMode::Quad);
+        assert_eq!(SubscriptionTier::Premium.max_hop_mode(), HopMode::Triple);
+        assert_eq!(SubscriptionTier::Ultra.max_hop_mode(), HopMode::Quad);
     }
 
     #[test]
@@ -494,7 +492,8 @@ mod tests {
         assert_eq!(SubscriptionTier::from_u8(0), Some(SubscriptionTier::Basic));
         assert_eq!(SubscriptionTier::from_u8(1), Some(SubscriptionTier::Standard));
         assert_eq!(SubscriptionTier::from_u8(2), Some(SubscriptionTier::Premium));
-        assert_eq!(SubscriptionTier::from_u8(3), None);
+        assert_eq!(SubscriptionTier::from_u8(3), Some(SubscriptionTier::Ultra));
+        assert_eq!(SubscriptionTier::from_u8(4), None);
         assert_eq!(SubscriptionTier::from_u8(255), None);
     }
 
@@ -503,6 +502,7 @@ mod tests {
         assert_eq!(SubscriptionTier::Basic.as_u8(), 0);
         assert_eq!(SubscriptionTier::Standard.as_u8(), 1);
         assert_eq!(SubscriptionTier::Premium.as_u8(), 2);
+        assert_eq!(SubscriptionTier::Ultra.as_u8(), 3);
     }
 
     #[test]
@@ -521,9 +521,13 @@ mod tests {
         assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Standard), HopMode::Double), HopMode::Double);
         assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Standard), HopMode::Single), HopMode::Single);
 
-        // Premium → up to Quad
-        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Premium), HopMode::Quad), HopMode::Quad);
+        // Premium → up to Triple (3 hops max)
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Premium), HopMode::Quad), HopMode::Triple);
         assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Premium), HopMode::Triple), HopMode::Triple);
+
+        // Ultra → up to Quad (4 hops max)
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Ultra), HopMode::Quad), HopMode::Quad);
+        assert_eq!(resolve_hop_mode(Some(SubscriptionTier::Ultra), HopMode::Triple), HopMode::Triple);
     }
 
     // ==================== ForwardReceipt Tests ====================

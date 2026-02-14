@@ -563,7 +563,8 @@ impl DaemonService {
         let tier = match amount {
             0..=7_000_000 => SubscriptionTier::Basic,
             7_000_001..=25_000_000 => SubscriptionTier::Standard,
-            _ => SubscriptionTier::Premium,
+            25_000_001..=75_000_000 => SubscriptionTier::Premium,
+            _ => SubscriptionTier::Ultra,
         };
 
         let subscribe = Subscribe {

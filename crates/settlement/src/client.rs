@@ -744,6 +744,7 @@ impl SettlementClient {
             SubscriptionTier::Basic => 0u8,
             SubscriptionTier::Standard => 1u8,
             SubscriptionTier::Premium => 2u8,
+            SubscriptionTier::Ultra => 3u8,
         };
 
         let mut data = instruction::SUBSCRIBE.to_vec();
@@ -793,16 +794,18 @@ impl SettlementClient {
         user_pubkey: PublicKey,
         tier: SubscriptionTier,
         yearly_price: u64,
+        period_secs: u64,
     ) -> Result<Vec<(PublicKey, TransactionSignature)>> {
         info!(
-            "Creating yearly subscription for {} ({:?}, total: {})",
+            "Creating yearly subscription for {} ({:?}, total: {}, period={}s)",
             hex_encode(&user_pubkey[..8]),
             tier,
             yearly_price,
+            period_secs,
         );
 
         let monthly_amount = yearly_price / 12;
-        let duration_secs: u64 = 30 * 24 * 3600; // 30 days per month
+        let duration_secs: u64 = period_secs;
         let now = Self::now() as i64;
 
         let mut results = Vec::with_capacity(12);
@@ -1163,6 +1166,7 @@ impl SettlementClient {
                     0 => SubscriptionTier::Basic,
                     1 => SubscriptionTier::Standard,
                     2 => SubscriptionTier::Premium,
+                    3 => SubscriptionTier::Ultra,
                     _ => SubscriptionTier::Basic,
                 };
 
@@ -1854,6 +1858,7 @@ mod tests {
             user_pubkey,
             SubscriptionTier::Standard,
             yearly_price,
+            30 * 24 * 3600, // 30 days per period
         ).await.unwrap();
 
         assert_eq!(results.len(), 12);

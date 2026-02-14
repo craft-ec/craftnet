@@ -5433,6 +5433,55 @@ impl TunnelCraftNode {
         self.aggregator.as_ref()?.build_distribution(&(pool_pubkey, pool_type))
     }
 
+    /// Get bandwidth for a pool (optionally filtered by relay) over a time range.
+    pub fn aggregator_bandwidth_by_period(
+        &self,
+        pool: &PublicKey,
+        relay: Option<&PublicKey>,
+        start: u64,
+        end: u64,
+        granularity: tunnelcraft_aggregator::Granularity,
+    ) -> Vec<tunnelcraft_aggregator::BandwidthBucket> {
+        self.aggregator.as_ref()
+            .map(|a| a.get_bandwidth_by_period(pool, relay, start, end, granularity))
+            .unwrap_or_default()
+    }
+
+    /// Get relay health scores: returns vec of (pubkey, score, online).
+    pub fn relay_health_scores(&self) -> Vec<([u8; 32], u8, bool)> {
+        self.relay_nodes.values()
+            .map(|s| {
+                let mut pubkey = [0u8; 32];
+                pubkey.copy_from_slice(&s.info.pubkey);
+                (pubkey, s.score, s.online)
+            })
+            .collect()
+    }
+
+    /// Get the number of cached subscriptions, grouped by tier.
+    /// Returns vec of (tier, count) pairs. tier=255 means free/unverified.
+    pub fn subscription_cache_summary(&self) -> Vec<(u8, usize)> {
+        let mut counts: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+        for entry in self.subscription_cache.values() {
+            *counts.entry(entry.tier).or_insert(0) += 1;
+        }
+        let mut result: Vec<_> = counts.into_iter().collect();
+        result.sort_by_key(|(tier, _)| *tier);
+        result
+    }
+
+    /// Get network-wide bandwidth over a time range.
+    pub fn aggregator_network_bandwidth(
+        &self,
+        start: u64,
+        end: u64,
+        granularity: tunnelcraft_aggregator::Granularity,
+    ) -> Vec<tunnelcraft_aggregator::BandwidthBucket> {
+        self.aggregator.as_ref()
+            .map(|a| a.get_network_bandwidth(start, end, granularity))
+            .unwrap_or_default()
+    }
+
     // =========================================================================
     // Proof queue + adaptive batch compressor
     // =========================================================================

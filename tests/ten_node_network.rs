@@ -1,7 +1,7 @@
 #![allow(dead_code)] // Test harness helpers used by #[ignore]d devnet test
-//! 15-Node Live Network E2E Test
+//! 16-Node Live Network E2E Test
 //!
-//! Spawns 15 real TunnelCraftNode instances connected via localhost TCP,
+//! Spawns 16 real TunnelCraftNode instances connected via localhost TCP,
 //! runs diverse HTTP requests through the onion-routed tunnel, and tracks
 //! all network activity: gossip, connections, shard forwarding, proof
 //! generation, subscription tiers, and aggregator submissions.
@@ -11,14 +11,15 @@
 //!   1-5: Relays
 //!   6-8: Exit nodes
 //!   9: Aggregator (relay)
-//!   10-14: Clients (Both mode, diverse configs)
+//!   10-15: Clients (Both mode, diverse configs)
 //!
 //! Client diversity:
-//!   Client-1 (10): Free tier,     Single hop, small requests
-//!   Client-2 (11): Basic sub,     Double hop, medium requests
-//!   Client-3 (12): Standard sub,  Double hop, 1x 10MB + small
-//!   Client-4 (13): Premium sub,   Triple hop, mixed requests
-//!   Client-5 (14): Basic sub,     Quad hop,   medium requests
+//!   Client-0 (10): Free tier,     Direct hop, small requests (0-hop direct mode)
+//!   Client-1 (11): Basic sub,     Single hop, small requests
+//!   Client-2 (12): Standard sub,  Double hop, medium requests
+//!   Client-3 (13): Standard sub,  Double hop, 1x 10MB + small
+//!   Client-4 (14): Premium sub,   Triple hop, mixed requests
+//!   Client-5 (15): Ultra sub,     Quad hop,   small requests (max privacy)
 //!
 //! Run with: cargo test -p tunnelcraft-tests ten_node_live_network -- --ignored --nocapture
 
@@ -34,7 +35,7 @@ use solana_system_interface::instruction as system_instruction;
 use solana_sdk::transaction::Transaction;
 use tunnelcraft_client::{Capabilities, NodeConfig, TunnelCraftNode, NodeStats};
 use tunnelcraft_core::HopMode;
-use tunnelcraft_aggregator::NetworkStats;
+use tunnelcraft_aggregator::{BandwidthBucket, Granularity, NetworkStats};
 use tunnelcraft_network::PoolType;
 use tunnelcraft_settlement::{
     SettlementClient, SettlementConfig, Subscribe,
@@ -64,6 +65,18 @@ enum TestCmd {
         pool_pubkey: [u8; 32],
         pool_type: PoolType,
         reply: oneshot::Sender<Option<tunnelcraft_aggregator::Distribution>>,
+    },
+    GetNetworkBandwidth {
+        start: u64,
+        end: u64,
+        granularity: Granularity,
+        reply: oneshot::Sender<Vec<BandwidthBucket>>,
+    },
+    GetSubscriptionCacheSummary {
+        reply: oneshot::Sender<Vec<(u8, usize)>>,
+    },
+    GetRelayHealthScores {
+        reply: oneshot::Sender<Vec<([u8; 32], u8, bool)>>,
     },
     Stop(oneshot::Sender<()>),
 }
@@ -202,6 +215,18 @@ async fn spawn_test_node(
                             let dist = node.aggregator_build_distribution(pool_pubkey, pool_type);
                             let _ = reply.send(dist);
                         }
+                        Some(TestCmd::GetNetworkBandwidth { start, end, granularity, reply }) => {
+                            let buckets = node.aggregator_network_bandwidth(start, end, granularity);
+                            let _ = reply.send(buckets);
+                        }
+                        Some(TestCmd::GetSubscriptionCacheSummary { reply }) => {
+                            let summary = node.subscription_cache_summary();
+                            let _ = reply.send(summary);
+                        }
+                        Some(TestCmd::GetRelayHealthScores { reply }) => {
+                            let scores = node.relay_health_scores();
+                            let _ = reply.send(scores);
+                        }
                         Some(TestCmd::Stop(reply)) => {
                             node.stop().await;
                             let _ = reply.send(());
@@ -269,6 +294,40 @@ async fn build_distribution(
     match tokio::time::timeout(Duration::from_secs(5), rx).await {
         Ok(Ok(dist)) => dist,
         _ => None,
+    }
+}
+
+async fn get_network_bandwidth(
+    node: &TestNode,
+    start: u64,
+    end: u64,
+    granularity: Granularity,
+) -> Vec<BandwidthBucket> {
+    let (tx, rx) = oneshot::channel();
+    let _ = node.cmd_tx.send(TestCmd::GetNetworkBandwidth {
+        start, end, granularity, reply: tx,
+    }).await;
+    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(buckets)) => buckets,
+        _ => vec![],
+    }
+}
+
+async fn get_relay_health_scores(node: &TestNode) -> Vec<([u8; 32], u8, bool)> {
+    let (tx, rx) = oneshot::channel();
+    let _ = node.cmd_tx.send(TestCmd::GetRelayHealthScores { reply: tx }).await;
+    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(scores)) => scores,
+        _ => vec![],
+    }
+}
+
+async fn get_subscription_cache_summary(node: &TestNode) -> Vec<(u8, usize)> {
+    let (tx, rx) = oneshot::channel();
+    let _ = node.cmd_tx.send(TestCmd::GetSubscriptionCacheSummary { reply: tx }).await;
+    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(summary)) => summary,
+        _ => vec![],
     }
 }
 
@@ -494,7 +553,7 @@ async fn print_final_report(nodes: &[TestNode], ok_count: usize, err_count: usiz
 // =========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Takes ~3-5min, binds 15 TCP ports
+#[ignore] // Takes ~3-5min, binds 16 TCP ports
 async fn ten_node_live_network() {
     // Initialize tracing
     let _ = tracing_subscriber::fmt()
@@ -606,20 +665,21 @@ async fn ten_node_live_network() {
         nodes.push(node);
     }
 
-    // Clients 10-14 (Both mode — they relay + send requests)
+    // Clients 10-15 (Both mode — they relay + send requests)
     struct ClientSpec {
         name: &'static str,
         hop_mode: HopMode,
-        /// 0 = free tier, 1 = Basic, 2 = Standard, 3 = Premium
+        /// 255 = free tier, 0 = Basic, 1 = Standard, 2 = Premium, 3 = Ultra (matches as_u8())
         subscription_tier: u8,
     }
 
     let client_specs = [
-        ClientSpec { name: "Client-1", hop_mode: HopMode::Single,  subscription_tier: 0 },
-        ClientSpec { name: "Client-2", hop_mode: HopMode::Double,  subscription_tier: 1 },
-        ClientSpec { name: "Client-3", hop_mode: HopMode::Double,  subscription_tier: 2 },
-        ClientSpec { name: "Client-4", hop_mode: HopMode::Triple,  subscription_tier: 3 },
-        ClientSpec { name: "Client-5", hop_mode: HopMode::Quad,    subscription_tier: 1 },
+        ClientSpec { name: "Client-0", hop_mode: HopMode::Direct,  subscription_tier: 255 }, // Free = Direct only
+        ClientSpec { name: "Client-1", hop_mode: HopMode::Single,  subscription_tier: 0 },   // Basic (as_u8=0) = up to Single
+        ClientSpec { name: "Client-2", hop_mode: HopMode::Double,  subscription_tier: 1 },   // Standard (as_u8=1) = up to Double
+        ClientSpec { name: "Client-3", hop_mode: HopMode::Double,  subscription_tier: 1 },   // Standard (as_u8=1), large payload
+        ClientSpec { name: "Client-4", hop_mode: HopMode::Triple,  subscription_tier: 2 },   // Premium (as_u8=2), max 3 hops
+        ClientSpec { name: "Client-5", hop_mode: HopMode::Quad,    subscription_tier: 3 },   // Ultra (as_u8=3), max 4 hops
     ];
 
     // Track which indices are clients and their tiers
@@ -642,8 +702,8 @@ async fn ten_node_live_network() {
             ..Default::default()
         };
 
-        // Inject devnet signing secret into Client-2 (index 1)
-        if i == 1 {
+        // Inject devnet signing secret into Client-2 (index 2)
+        if i == 2 {
             if let Some(ref kp) = devnet_keypair {
                 // First 32 bytes of the 64-byte Solana keypair are the ed25519 secret
                 let mut secret = [0u8; 32];
@@ -775,7 +835,7 @@ async fn ten_node_live_network() {
         expires_at, expires_at.saturating_sub(now_secs));
 
     for (i, spec) in client_specs.iter().enumerate() {
-        if spec.subscription_tier > 0 {
+        if spec.subscription_tier != 255 {
             let idx = client_start_idx + i;
             announce_subscription(&nodes[idx], spec.subscription_tier, expires_at).await;
             println!(
@@ -797,12 +857,41 @@ async fn ten_node_live_network() {
     let mut err_count = 0usize;
     let mut total_requests = 0usize;
     let mut large_payload_ok = false;
+    let mut direct_mode_ok = 0usize;
+    let mut direct_mode_total = 0usize;
 
-    // --- Client-1: Free tier, Single hop, 10x small requests ---
+    // --- Client-0: Free tier, Direct hop (0 relays), 5x small requests ---
     {
         let idx = client_start_idx;
+        let count = 5;
+        println!("\nClient-0 (free, Direct): Sending {} small requests (0-hop direct mode)...", count);
+        for i in 0..count {
+            total_requests += 1;
+            direct_mode_total += 1;
+            let url = if i % 2 == 0 {
+                format!("{}/ping", base_url)
+            } else {
+                format!("{}/data/{}", base_url, 500)
+            };
+            match fetch(&nodes[idx], &url, 30).await {
+                Ok(resp) => {
+                    ok_count += 1;
+                    direct_mode_ok += 1;
+                    println!("  C0 req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
+                }
+                Err(e) => {
+                    err_count += 1;
+                    println!("  C0 req {}: FAILED: {}", i + 1, e);
+                }
+            }
+        }
+    }
+
+    // --- Client-1: Basic sub, Single hop, 10x small requests ---
+    {
+        let idx = client_start_idx + 1;
         let count = 10;
-        println!("\nClient-1 (free, Single): Sending {} small requests...", count);
+        println!("\nClient-1 (Basic, Single): Sending {} small requests...", count);
         for i in 0..count {
             total_requests += 1;
             let url = if i % 2 == 0 {
@@ -823,11 +912,11 @@ async fn ten_node_live_network() {
         }
     }
 
-    // --- Client-2: Basic sub, Double hop, 5x medium requests ---
+    // --- Client-2: Standard sub, Double hop, 5x medium requests ---
     {
-        let idx = client_start_idx + 1;
+        let idx = client_start_idx + 2;
         let count = 5;
-        println!("\nClient-2 (Basic, Double): Sending {} medium requests...", count);
+        println!("\nClient-2 (Standard, Double): Sending {} medium requests...", count);
         for i in 0..count {
             total_requests += 1;
             let size = 10_000 + i * 10_000; // 10KB - 50KB
@@ -847,7 +936,7 @@ async fn ten_node_live_network() {
 
     // --- Client-3: Standard sub, Double hop, 1x 10MB + 2x small ---
     {
-        let idx = client_start_idx + 2;
+        let idx = client_start_idx + 3;
         println!("\nClient-3 (Standard, Double): Sending 1x 10MB large request...");
         total_requests += 1;
         let url_1mb = format!("{}/data/{}", base_url, 10 * 1024 * 1024);
@@ -887,7 +976,7 @@ async fn ten_node_live_network() {
 
     // --- Client-4: Premium sub, Triple hop, 8x mixed requests ---
     {
-        let idx = client_start_idx + 3;
+        let idx = client_start_idx + 4;
         let count = 8;
         println!("\nClient-4 (Premium, Triple): Sending {} mixed requests...", count);
         for i in 0..count {
@@ -911,15 +1000,15 @@ async fn ten_node_live_network() {
         }
     }
 
-    // --- Client-5: Basic sub, Quad hop, 3x medium requests ---
+    // --- Client-5: Ultra sub, Quad hop, 3x small requests ---
     {
-        let idx = client_start_idx + 4;
+        let idx = client_start_idx + 5;
         let count = 3;
-        println!("\nClient-5 (Basic, Quad): Sending {} medium requests...", count);
+        println!("\nClient-5 (Ultra, Quad): Sending {} small requests...", count);
         for i in 0..count {
             total_requests += 1;
-            let url = format!("{}/data/{}", base_url, 5_000 + i * 2_000);
-            match fetch(&nodes[idx], &url, 45).await {
+            let url = format!("{}/ping", base_url);
+            match fetch(&nodes[idx], &url, 30).await {
                 Ok(resp) => {
                     ok_count += 1;
                     println!("  C5 req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
@@ -931,6 +1020,279 @@ async fn ten_node_live_network() {
             }
         }
     }
+
+    // --- Step 7b: Concurrent free vs paid requests (prioritization test) ---
+    println!("\n=== Concurrent Free vs Paid Requests ===");
+    {
+        let free_idx = client_start_idx;       // Client-0 (free, Direct)
+        let paid_idx = client_start_idx + 4;   // Client-4 (Premium, Triple)
+        let concurrent_count = 5;
+
+        let mut free_handles = Vec::new();
+        let mut paid_handles = Vec::new();
+
+        for i in 0..concurrent_count {
+            let url = format!("{}/data/{}", base_url, 2_000);
+
+            // Free client
+            let (tx, rx) = oneshot::channel();
+            let _ = nodes[free_idx].cmd_tx.send(TestCmd::Fetch {
+                url: url.clone(), timeout_secs: 30, reply: tx,
+            }).await;
+            free_handles.push((i, rx));
+
+            // Paid client
+            let (tx2, rx2) = oneshot::channel();
+            let _ = nodes[paid_idx].cmd_tx.send(TestCmd::Fetch {
+                url, timeout_secs: 30, reply: tx2,
+            }).await;
+            paid_handles.push((i, rx2));
+        }
+
+        let mut free_ok = 0usize;
+        let mut paid_ok = 0usize;
+
+        for (i, rx) in free_handles {
+            total_requests += 1;
+            match tokio::time::timeout(Duration::from_secs(30), rx).await {
+                Ok(Ok(Ok(resp))) => {
+                    free_ok += 1;
+                    ok_count += 1;
+                    println!("  Free  req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
+                }
+                _ => {
+                    err_count += 1;
+                    println!("  Free  req {}: FAILED", i + 1);
+                }
+            }
+        }
+        for (i, rx) in paid_handles {
+            total_requests += 1;
+            match tokio::time::timeout(Duration::from_secs(30), rx).await {
+                Ok(Ok(Ok(resp))) => {
+                    paid_ok += 1;
+                    ok_count += 1;
+                    println!("  Paid  req {}: {} OK ({} bytes)", i + 1, resp.status, resp.body.len());
+                }
+                _ => {
+                    err_count += 1;
+                    println!("  Paid  req {}: FAILED", i + 1);
+                }
+            }
+        }
+
+        println!("  Concurrent results: Free {}/{}, Paid {}/{}", free_ok, concurrent_count, paid_ok, concurrent_count);
+    }
+    println!("=== End Concurrent ===");
+
+    // --- Step 7c: Verify subscription gossip propagated to relays ---
+    println!("\n=== Subscription Gossip Verification ===");
+    {
+        // Check a few relay nodes to see if they cached subscriptions
+        let relay_indices = [0, 1, 2]; // Bootstrap, Relay-1, Relay-2
+        for &idx in &relay_indices {
+            let summary = get_subscription_cache_summary(&nodes[idx]).await;
+            let total_cached: usize = summary.iter().map(|(_, c)| c).sum();
+            print!("  {} subscription cache: {} entries", nodes[idx].role, total_cached);
+            for (tier, count) in &summary {
+                let tier_name = match tier {
+                    0 => "Basic",
+                    1 => "Standard",
+                    2 => "Premium",
+                    3 => "Ultra",
+                    255 => "Free",
+                    _ => "Unknown",
+                };
+                print!(" [{}={}]", tier_name, count);
+            }
+            println!();
+        }
+    }
+    println!("=== End Gossip Verification ===");
+
+    // --- Step 7d: Pricing plans + yearly subscription (devnet settlement) ---
+    if let Some(ref kp) = devnet_keypair {
+        println!("\n=== Pricing Plans (Devnet) ===");
+        let kp_bytes = kp.to_bytes();
+        let plan_kp = SolanaKeypair::try_from(kp_bytes.as_ref()).unwrap();
+        let mut plan_config = SettlementConfig::devnet_default();
+        if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
+            if !api_key.is_empty() {
+                plan_config.helius_api_key = Some(api_key);
+            }
+        }
+        let plan_client = SettlementClient::with_keypair(plan_config, plan_kp);
+
+        // Initialize config (admin = signer)
+        match plan_client.initialize_config().await {
+            Ok(sig) => println!("  Config initialized: {}", bs58::encode(&sig).into_string()),
+            Err(e) => println!("  Config init skipped (likely already exists): {}", e),
+        }
+
+        // Create pricing plans — 0.01 USDC each, all tiers monthly
+        let plans = [
+            (0u8, 0u8, 10_000u64,  "Basic/Monthly $0.01"),    // as_u8=0, 1 hop max
+            (1,    0,   10_000,     "Standard/Monthly $0.01"),  // as_u8=1, 2 hops max
+            (2,    0,   10_000,     "Premium/Monthly $0.01"),   // as_u8=2, 3 hops max
+            (3,    0,   10_000,     "Ultra/Monthly $0.01"),     // as_u8=3, 4 hops max
+        ];
+        for (tier, period, price, label) in &plans {
+            match plan_client.create_plan(*tier, *period, *price).await {
+                Ok(sig) => println!("  Created {}: {}", label, bs58::encode(&sig).into_string()),
+                Err(e) => println!("  Plan {} skipped: {}", label, e),
+            }
+        }
+
+        // Query plans
+        match plan_client.get_all_plans().await {
+            Ok(all) => {
+                println!("  Plans on-chain: {}", all.len());
+                for p in &all {
+                    println!("    tier={}, period={}, price={}, active={}", p.tier, p.billing_period, p.price_usdc, p.active);
+                }
+            }
+            Err(e) => println!("  Query plans failed: {}", e),
+        }
+        println!("=== End Pricing Plans ===");
+
+        // Yearly subscription: 12 pools, 0.01 USDC total, 120s per period
+        println!("\n=== Yearly Subscription (Devnet) ===");
+        let user_pubkey: [u8; 32] = kp.pubkey().to_bytes();
+
+        let kp_bytes2 = kp.to_bytes();
+        let yearly_kp = SolanaKeypair::try_from(kp_bytes2.as_ref()).unwrap();
+        let mut yearly_config = SettlementConfig::devnet_default();
+        if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
+            if !api_key.is_empty() {
+                yearly_config.helius_api_key = Some(api_key);
+            }
+        }
+        let yearly_client = SettlementClient::with_keypair(yearly_config, yearly_kp);
+
+        match yearly_client.subscribe_yearly(
+            user_pubkey,
+            tunnelcraft_core::SubscriptionTier::Standard,
+            120_000, // $0.12 yearly ($0.01/month)
+            120,     // 120 seconds per period (short for testing)
+        ).await {
+            Ok(pool_results) => {
+                println!("  Created {} monthly pools (120s periods)", pool_results.len());
+                assert_eq!(pool_results.len(), 12, "Yearly should create 12 pools");
+
+                // Verify first and last pools
+                for (i, (pool_pk, tx_sig)) in pool_results.iter().enumerate() {
+                    if i == 0 || i == 11 {
+                        println!("  Pool {}: pubkey={}, tx={}",
+                            i, short_hex(pool_pk), bs58::encode(tx_sig).into_string());
+                        match yearly_client.get_subscription(*pool_pk).await {
+                            Ok(Some((tier, start, expires))) => {
+                                println!("    tier={:?}, start={}, expires={}, duration={}s",
+                                    tier, start, expires, expires - start);
+                            }
+                            Ok(None) => println!("    subscription not found"),
+                            Err(e) => println!("    query error: {}", e),
+                        }
+                    }
+                }
+
+                // Verify staggered start dates: pool 1 should start 120s after pool 0
+                if let (Ok(Some(s0)), Ok(Some(s1))) = (
+                    yearly_client.get_subscription(pool_results[0].0).await,
+                    yearly_client.get_subscription(pool_results[1].0).await,
+                ) {
+                    let gap = s1.1 - s0.1;
+                    println!("  Period gap between pool 0 and 1: {}s (expected 120s)", gap);
+                    assert_eq!(gap, 120, "Period gap should be 120s");
+                }
+
+                println!("  YEARLY SUBSCRIPTION OK");
+            }
+            Err(e) => println!("  Yearly subscription failed (non-fatal): {}", e),
+        }
+        println!("=== End Yearly Subscription ===");
+    } else {
+        println!("\nSkipping pricing plans + yearly subscription (no DEVNET_KEYPAIR)");
+    }
+
+    // --- Step 7g: Tier hop clamping (always runs — pure logic) ---
+    println!("\n=== Tier Hop Clamping ===");
+    {
+        use tunnelcraft_core::{SubscriptionTier, resolve_hop_mode};
+
+        // Free (no tier): always Direct regardless of request
+        let clamped = resolve_hop_mode(None, HopMode::Quad);
+        println!("  Free + Quad    → {:?} (expected Direct)", clamped);
+        assert_eq!(clamped, HopMode::Direct, "Free requesting Quad should clamp to Direct");
+
+        // Basic (as_u8=0): max Single (1 hop)
+        let clamped = resolve_hop_mode(Some(SubscriptionTier::Basic), HopMode::Quad);
+        println!("  Basic + Quad   → {:?} (expected Single)", clamped);
+        assert_eq!(clamped, HopMode::Single, "Basic requesting Quad should clamp to Single");
+
+        // Standard (as_u8=1): max Double (2 hops)
+        let clamped = resolve_hop_mode(Some(SubscriptionTier::Standard), HopMode::Triple);
+        println!("  Standard + Triple → {:?} (expected Double)", clamped);
+        assert_eq!(clamped, HopMode::Double, "Standard requesting Triple should clamp to Double");
+
+        let clamped = resolve_hop_mode(Some(SubscriptionTier::Standard), HopMode::Quad);
+        println!("  Standard + Quad → {:?} (expected Double)", clamped);
+        assert_eq!(clamped, HopMode::Double, "Standard requesting Quad should clamp to Double");
+
+        // Premium (as_u8=2): max Triple (3 hops) — requesting Quad gets clamped
+        let clamped = resolve_hop_mode(Some(SubscriptionTier::Premium), HopMode::Quad);
+        println!("  Premium + Quad → {:?} (expected Triple)", clamped);
+        assert_eq!(clamped, HopMode::Triple, "Premium requesting Quad should clamp to Triple");
+
+        // Premium requesting Triple — exactly at limit, no clamping
+        let clamped = resolve_hop_mode(Some(SubscriptionTier::Premium), HopMode::Triple);
+        println!("  Premium + Triple → {:?} (expected Triple)", clamped);
+        assert_eq!(clamped, HopMode::Triple, "Premium requesting Triple should pass through");
+
+        // Ultra (as_u8=3): max Quad (4 hops) — requesting Quad passes through
+        let clamped = resolve_hop_mode(Some(SubscriptionTier::Ultra), HopMode::Quad);
+        println!("  Ultra + Quad → {:?} (expected Quad)", clamped);
+        assert_eq!(clamped, HopMode::Quad, "Ultra requesting Quad should pass through");
+
+        // Ultra requesting Triple — within limit, no clamping
+        let clamped = resolve_hop_mode(Some(SubscriptionTier::Ultra), HopMode::Triple);
+        println!("  Ultra + Triple → {:?} (expected Triple)", clamped);
+        assert_eq!(clamped, HopMode::Triple, "Ultra requesting Triple should pass through");
+
+        // Invalid tier (from_u8(4)) → None → treated as free → Direct
+        assert!(SubscriptionTier::from_u8(4).is_none(), "Tier 4 should be invalid");
+        let clamped = resolve_hop_mode(None, HopMode::Quad);
+        println!("  Invalid tier + Quad → {:?} (expected Direct)", clamped);
+        assert_eq!(clamped, HopMode::Direct, "Invalid tier should resolve as free (Direct)");
+
+        println!("  TIER CLAMPING OK");
+    }
+    println!("=== End Tier Hop Clamping ===");
+
+    // --- Step 7f: Health scoring verification ---
+    println!("\n=== Health Scoring ===");
+    {
+        // Pick a client node that has been sending requests to check relay scores
+        let client_idx = client_start_idx + 4; // Client-4 (Premium, Triple — uses relays)
+        let scores = get_relay_health_scores(&nodes[client_idx]).await;
+
+        if scores.is_empty() {
+            println!("  SOFT WARNING: No relay health scores available on Client-4");
+        } else {
+            let online_count = scores.iter().filter(|(_, _, online)| *online).count();
+            let scored_count = scores.iter().filter(|(_, score, _)| *score > 0).count();
+            let min_score = scores.iter().map(|(_, s, _)| *s).min().unwrap_or(0);
+            let max_score = scores.iter().map(|(_, s, _)| *s).max().unwrap_or(0);
+            println!("  Relay scores: {} total, {} online, {} with score > 0",
+                scores.len(), online_count, scored_count);
+            println!("  Score range: {} - {}", min_score, max_score);
+
+            // After traffic, at least some relays should be online
+            if online_count == 0 {
+                println!("  SOFT WARNING: No relays online according to Client-4");
+            }
+        }
+    }
+    println!("=== End Health Scoring ===");
 
     println!(
         "\nAll requests complete: {}/{} OK. Waiting for proofs to settle...",
@@ -1236,6 +1598,78 @@ async fn ten_node_live_network() {
             println!("SOFT WARNING: Aggregator tracks only {} relays (expected >= 3)", agg.active_relays);
         }
     }
+
+    // SOFT: Direct mode (Client-0) requests succeeded
+    if direct_mode_ok == 0 {
+        println!("SOFT WARNING: No Direct mode (0-hop) requests succeeded ({}/{})", direct_mode_ok, direct_mode_total);
+    } else {
+        println!("Direct mode: {}/{} requests succeeded", direct_mode_ok, direct_mode_total);
+    }
+
+    // SOFT: Client-5 (Ultra tier, Quad hop) requests went through
+    let client5_stats = &all_stats[client_start_idx + 5].1;
+    if client5_stats.node_stats.peers_connected == 0 {
+        println!("SOFT WARNING: Client-5 (Ultra, Quad) has 0 peers");
+    }
+
+    // SOFT: Subscription gossip reached relays
+    // At least 1 relay should have cached >= 1 subscription
+    {
+        let mut relays_with_subs = 0;
+        for idx in [0, 1, 2, 3, 4, 5] { // Bootstrap + Relay-1..5
+            let summary = get_subscription_cache_summary(&nodes[idx]).await;
+            let total: usize = summary.iter().map(|(_, c)| c).sum();
+            if total > 0 { relays_with_subs += 1; }
+        }
+        if relays_with_subs == 0 {
+            println!("SOFT WARNING: No relays cached any subscriptions via gossip");
+        } else {
+            println!("Subscription gossip: {}/6 relays have cached subscriptions", relays_with_subs);
+        }
+    }
+
+    // SOFT: Aggregator tracks both Free and Subscribed pool types
+    if let Some(ref agg) = aggregator_stats.aggregator_stats {
+        let has_free = agg.free_bytes > 0;
+        let has_subscribed = agg.subscribed_bytes > 0;
+        println!(
+            "Pool types: Subscribed={} ({}), Free={} ({})",
+            has_subscribed, format_bytes(agg.subscribed_bytes),
+            has_free, format_bytes(agg.free_bytes),
+        );
+        if !has_subscribed {
+            println!("SOFT WARNING: Aggregator has no subscribed pool bytes");
+        }
+        if !has_free {
+            println!("SOFT WARNING: Aggregator has no free pool bytes (Client-0 traffic may not have generated proofs)");
+        }
+    }
+
+    // ── Step 10b: Bandwidth aggregation assertions ───────────────────
+    // Query the aggregator's bandwidth index for network-wide hourly data
+    println!("\n=== Bandwidth Aggregation ===");
+    let bandwidth_buckets = get_network_bandwidth(
+        &nodes[aggregator_idx],
+        0,
+        u64::MAX,
+        Granularity::Hourly,
+    ).await;
+
+    if !bandwidth_buckets.is_empty() {
+        let total_bw_bytes: u64 = bandwidth_buckets.iter().map(|b| b.bytes).sum();
+        let total_bw_batches: u32 = bandwidth_buckets.iter().map(|b| b.batch_count).sum();
+        println!(
+            "  Network bandwidth: {} across {} hourly buckets ({} batches)",
+            format_bytes(total_bw_bytes),
+            bandwidth_buckets.len(),
+            total_bw_batches,
+        );
+        assert!(total_bw_bytes > 0, "Bandwidth index should have recorded bytes");
+        assert!(total_bw_batches > 0, "Bandwidth index should have recorded batches");
+    } else {
+        println!("SOFT WARNING: No bandwidth data in aggregator (proofs may not have fired)");
+    }
+    println!("=== End Bandwidth ===");
 
     // ── Step 11: Cleanup ──────────────────────────────────────────────
     println!("\nShutting down nodes...");
