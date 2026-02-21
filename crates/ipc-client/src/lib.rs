@@ -1,6 +1,6 @@
-//! TunnelCraft IPC Client
+//! CraftNet IPC Client
 //!
-//! JSON-RPC 2.0 client for communicating with the TunnelCraft daemon.
+//! JSON-RPC 2.0 client for communicating with the CraftNet daemon.
 //!
 //! ## Supported Platforms
 //!
@@ -10,7 +10,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use tunnelcraft_ipc_client::{IpcClient, DEFAULT_SOCKET_PATH};
+//! use craftnet_ipc_client::{IpcClient, DEFAULT_SOCKET_PATH};
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
@@ -42,15 +42,15 @@ use thiserror::Error;
 
 /// Default socket path for Unix systems
 #[cfg(unix)]
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/tunnelcraft.sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/tmp/craftnet.sock";
 
 /// Default named pipe path for Windows
 #[cfg(windows)]
-pub const DEFAULT_PIPE_PATH: &str = r"\\.\pipe\tunnelcraft";
+pub const DEFAULT_PIPE_PATH: &str = r"\\.\pipe\craftnet";
 
 /// Default path (platform-appropriate)
 #[cfg(windows)]
-pub const DEFAULT_SOCKET_PATH: &str = r"\\.\pipe\tunnelcraft";
+pub const DEFAULT_SOCKET_PATH: &str = r"\\.\pipe\craftnet";
 
 #[derive(Error, Debug)]
 pub enum IpcError {

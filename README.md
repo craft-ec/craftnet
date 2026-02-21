@@ -1,4 +1,4 @@
-# TunnelCraft
+# CraftNet
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
@@ -8,7 +8,7 @@ Decentralized, trustless P2P VPN with cryptographic verification at every step.
 
 ## Overview
 
-TunnelCraft is a privacy-focused VPN network where no single node needs to be trusted. Privacy is achieved through:
+CraftNet is a privacy-focused VPN network where no single node needs to be trusted. Privacy is achieved through:
 
 - **Fragmentation**: Requests split into 5 shards, each taking a random path
 - **Erasure Coding**: Only 3 of 5 shards needed to reconstruct
@@ -40,8 +40,8 @@ npm run dev
 ### CLI
 
 ```bash
-cargo build --release -p tunnelcraft-cli
-./target/release/tunnelcraft-cli connect --hops 2
+cargo build --release -p craftnet-cli
+./target/release/craftnet-cli connect --hops 2
 ```
 
 ## Architecture
@@ -70,7 +70,7 @@ cargo build --release -p tunnelcraft-cli
 ## Project Structure
 
 ```
-tunnelcraft/
+craftnet/
 ├── crates/
 │   ├── core/           # Shared types and errors
 │   ├── crypto/         # Keys, signatures, encryption
@@ -128,7 +128,7 @@ cargo build
 cargo test
 
 # Run specific crate tests
-cargo test -p tunnelcraft-core
+cargo test -p craftnet-core
 
 # Format and lint
 cargo fmt && cargo clippy

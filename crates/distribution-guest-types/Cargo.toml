@@ -1,5 +1,5 @@
 [package]
-name = "tunnelcraft-distribution-guest-types"
+name = "craftnet-distribution-guest-types"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

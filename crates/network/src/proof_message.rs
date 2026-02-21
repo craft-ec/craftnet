@@ -1,7 +1,7 @@
 //! Proof gossipsub message types
 //!
 //! Relays gossip ZK-proven summaries (not individual receipts) via
-//! the `tunnelcraft/proofs/1.0.0` gossipsub topic. An aggregator
+//! the `craftnet/proofs/1.0.0` gossipsub topic. An aggregator
 //! collects these and builds per-pool Merkle distributions for on-chain
 //! settlement.
 

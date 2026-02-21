@@ -1,5 +1,5 @@
 [package]
-name = "tunnelcraft-uniffi"
+name = "craftnet-uniffi"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,16 +7,16 @@ license.workspace = true
 
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
-name = "tunnelcraft_uniffi"
+name = "craftnet_uniffi"
 
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/generate_bindings.rs"
 
 [dependencies]
-tunnelcraft-core = { workspace = true }
-tunnelcraft-client = { workspace = true }
-tunnelcraft-crypto = { workspace = true }
+craftnet-core = { workspace = true }
+craftnet-client = { workspace = true }
+craftec-crypto = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -1,0 +1,10 @@
+/Users/onlyabrak/dev/craftec/tunnelcraft/crates/distribution-guest/target/elf-compilation/riscv32im-succinct-zkvm-elf/release/deps/sp1_primitives-1b514a18db55221e.d: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/consts.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/io.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/types.rs
+
+/Users/onlyabrak/dev/craftec/tunnelcraft/crates/distribution-guest/target/elf-compilation/riscv32im-succinct-zkvm-elf/release/deps/libsp1_primitives-1b514a18db55221e.rlib: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/consts.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/io.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/types.rs
+
+/Users/onlyabrak/dev/craftec/tunnelcraft/crates/distribution-guest/target/elf-compilation/riscv32im-succinct-zkvm-elf/release/deps/libsp1_primitives-1b514a18db55221e.rmeta: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/consts.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/io.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/types.rs
+
+/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/lib.rs:
+/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/consts.rs:
+/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/io.rs:
+/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sp1-primitives-5.2.4/src/types.rs:

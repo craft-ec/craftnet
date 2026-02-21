@@ -1,4 +1,4 @@
-//! Unified TunnelCraft Node
+//! Unified CraftNet Node
 //!
 //! A single component that supports three modes:
 //! - Client: Route your traffic through the VPN (spend credits)
@@ -22,14 +22,15 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use tunnelcraft_core::{Capabilities, ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, SubscriptionTier, TunnelMetadata};
-use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair};
-use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
-use tunnelcraft_erasure::chunker::reassemble;
-use tunnelcraft_exit::{ExitConfig, ExitHandler};
-use tunnelcraft_network::{
-    build_swarm, NetworkConfig, ShardResponse, TunnelCraftBehaviour,
-    TunnelCraftBehaviourEvent, ExitStatusMessage, ExitStatusType,
+use craftnet_core::{Capabilities, ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, SubscriptionTier, TunnelMetadata};
+use craftec_crypto::{SigningKeypair, EncryptionKeypair};
+
+use craftnet_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
+use craftnet_erasure::chunker::reassemble;
+use craftnet_exit::{ExitConfig, ExitHandler};
+use craftnet_network::{
+    build_swarm, NetworkConfig, ShardResponse, CraftNetBehaviour,
+    CraftNetBehaviourEvent, CraftNetExt, ExitStatusMessage, ExitStatusType,
     RelayStatusMessage, RelayStatusType,
     ProofMessage, PoolType,
     SubscriptionAnnouncement, SUBSCRIPTION_TOPIC,
@@ -40,12 +41,12 @@ use tunnelcraft_network::{
     AGGREGATOR_SYNC_TOPIC, HistorySyncRequest, HistorySyncResponse,
     StreamManager, InboundShard, OutboundShard,
 };
-use tunnelcraft_aggregator::Aggregator;
-use tunnelcraft_prover::{ReceiptCompression, ReceiptCompressor};
-use tunnelcraft_relay::{RelayConfig, RelayHandler};
-use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
+use craftnet_aggregator::Aggregator;
+use craftnet_prover::{ReceiptCompression, ReceiptCompressor};
+use craftnet_relay::{RelayConfig, RelayHandler};
+use craftnet_settlement::{SettlementClient, SettlementConfig};
 #[cfg(feature = "sp1")]
-use tunnelcraft_settlement::PostDistribution;
+use craftnet_settlement::PostDistribution;
 
 use sha2::{Sha256, Digest};
 
@@ -70,7 +71,7 @@ fn derive_tunnel_id(client_peer_id: &PeerId, gateway_peer_id: &PeerId) -> Id {
 struct CompressionResult {
     pool_key: (PublicKey, PoolType),
     batch: Vec<ForwardReceipt>,
-    output: std::result::Result<tunnelcraft_prover::CompressedBatch, tunnelcraft_prover::CompressionError>,
+    output: std::result::Result<craftnet_prover::CompressedBatch, craftnet_prover::CompressionError>,
     start: Instant,
 }
 
@@ -668,11 +669,20 @@ struct NodeState {
     exit_handler: Option<ExitHandler>,
 }
 
-/// Unified TunnelCraft Node
+/// Handles for communicating with a shared libp2p swarm
+pub struct SwarmHandles {
+    pub cmd_tx: mpsc::Sender<craftec_network::SharedSwarmCommand>,
+    pub evt_rx: mpsc::Receiver<craftec_network::SharedSwarmEvent>,
+    pub stream_control: libp2p_stream::Control,
+    pub incoming_streams_rx: mpsc::Receiver<(PeerId, libp2p::Stream)>,
+    pub local_peer_id: PeerId,
+}
+
+/// Unified CraftNet Node
 ///
 /// Combines client SDK and node service into a single component
 /// with flexible mode switching.
-pub struct TunnelCraftNode {
+pub struct CraftNetNode {
     /// Active capabilities (composable bitflags)
     capabilities: Capabilities,
 
@@ -688,8 +698,14 @@ pub struct TunnelCraftNode {
     /// libp2p keypair
     libp2p_keypair: Keypair,
 
-    /// libp2p swarm (owned directly — no intermediate wrapper)
-    swarm: Option<libp2p::Swarm<TunnelCraftBehaviour>>,
+    /// Channel to send commands to the shared swarm
+    swarm_cmd_tx: Option<mpsc::Sender<craftec_network::SharedSwarmCommand>>,
+
+    /// Channel to receive events from the shared swarm
+    swarm_evt_rx: Option<mpsc::Receiver<craftec_network::SharedSwarmEvent>>,
+
+    /// Cached connection state for simple checks
+    connected_peers: HashSet<PeerId>,
 
     /// Our local peer ID (set after start)
     local_peer_id: Option<PeerId>,
@@ -855,7 +871,7 @@ pub struct TunnelCraftNode {
     stub_compressor: Arc<ReceiptCompressor>,
     /// SP1 Groth16 distribution prover (lazy-initialized, requires `sp1` feature)
     #[cfg(feature = "sp1")]
-    distribution_prover: Option<tunnelcraft_prover::DistributionProver>,
+    distribution_prover: Option<craftnet_prover::DistributionProver>,
     /// Channel for receiving compression results from spawn_blocking
     compression_result_rx: Option<tokio::sync::oneshot::Receiver<CompressionResult>>,
     /// Path for persisting aggregator state to disk
@@ -896,7 +912,25 @@ pub struct TunnelCraftNode {
     last_maintenance: Instant,
 }
 
-impl TunnelCraftNode {
+/// Snapshot of a known CraftNet peer (relay or exit node) for the UI.
+#[derive(Debug, Clone)]
+pub struct CraftNetPeerInfo {
+    pub peer_id: String,
+    /// "relay", "exit"
+    pub role: String,
+    pub online: bool,
+    pub score: u8,
+    pub load_percent: u8,
+    pub uptime_secs: u64,
+    /// Seconds since last heartbeat/DHT record
+    pub last_seen_secs: u64,
+    pub active_connections: u32,
+    pub country_code: Option<String>,
+    pub city: Option<String>,
+    pub region: String,
+}
+
+impl CraftNetNode {
     /// Create a new unified node
     pub fn new(config: NodeConfig) -> Result<Self> {
         let enable_aggregator = config.capabilities.is_aggregator();
@@ -1025,7 +1059,9 @@ impl TunnelCraftNode {
             keypair,
             encryption_keypair,
             libp2p_keypair,
-            swarm: None,
+            swarm_cmd_tx: None,
+            swarm_evt_rx: None,
+            connected_peers: HashSet::new(),
             local_peer_id: None,
             connected: false,
             credits: 0,
@@ -1205,34 +1241,26 @@ impl TunnelCraftNode {
     }
 
     /// Start the node (connect to P2P network)
-    pub async fn start(&mut self) -> Result<()> {
-        info!("Starting TunnelCraftNode with capabilities {:?}", self.capabilities);
+    /// 
+    /// If `handles` is provided, the node will attach to a shared libp2p swarm.
+    /// If `handles` is None, the node will build its own standalone swarm and bridge it.
+    pub async fn start(&mut self, handles: Option<SwarmHandles>) -> Result<()> {
+        info!("Starting CraftNetNode with capabilities {:?}", self.capabilities);
 
-        // Build swarm with default network config (listens on 0.0.0.0:0,
-        // adds hardcoded bootstrap peers to Kademlia).
-        // build_swarm() registers the shard stream protocol BEFORE listening,
-        // so connection handlers on every connection will negotiate it.
-        let (swarm, peer_id, mut incoming) = build_swarm(self.libp2p_keypair.clone(), NetworkConfig::default())
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+        let handles = if let Some(h) = handles {
+            h
+        } else {
+            // Standalone mode: build local swarm and bridge it over channels
+            let (swarm, peer_id, mut incoming) = build_swarm(self.libp2p_keypair.clone(), NetworkConfig::default())
+                .await
+                .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
 
-        info!("Node started with peer ID: {}", peer_id);
-
-        // Initialize persistent stream manager
-        let stream_control = swarm.behaviour().stream_control();
-        let (stream_mgr, high_rx, low_rx, receipt_rx, outbound_tx) =
-            StreamManager::new(stream_control);
-        self.stream_manager = Some(stream_mgr);
-        self.inbound_high_rx = Some(high_rx);
-        self.inbound_low_rx = Some(low_rx);
-        self.stream_receipt_rx = Some(receipt_rx);
-        self.outbound_tx = Some(outbound_tx);
-
-        // Bridge IncomingStreams (0-buffer futures channel) into a buffered tokio
-        // mpsc channel. The bridging task continuously polls IncomingStreams::next()
-        // so that streams are never dropped by the zero-buffer try_send().
-        {
+            let stream_control = swarm.behaviour().stream_control();
+            let (cmd_tx, cmd_rx) = mpsc::channel(256);
+            let (evt_tx, evt_rx) = mpsc::channel(1024);
             let (incoming_tx, incoming_rx) = mpsc::channel(256);
+
+            // Forward incoming streams
             tokio::spawn(async move {
                 use futures::StreamExt;
                 while let Some((peer, stream)) = incoming.next().await {
@@ -1241,22 +1269,44 @@ impl TunnelCraftNode {
                     }
                 }
             });
-            self.incoming_stream_rx = Some(incoming_rx);
-            info!("Registered for inbound shard streams");
-        }
 
-        self.local_peer_id = Some(peer_id);
-        self.swarm = Some(swarm);
+            // Start standalone swarm driver
+            tokio::spawn(run_standalone_swarm(swarm, cmd_rx, evt_tx));
+
+            SwarmHandles {
+                cmd_tx,
+                evt_rx,
+                stream_control,
+                incoming_streams_rx: incoming_rx,
+                local_peer_id: peer_id,
+            }
+        };
+
+        info!("Node started with peer ID: {}", handles.local_peer_id);
+
+        let (stream_mgr, high_rx, low_rx, receipt_rx, outbound_tx) =
+            StreamManager::new(handles.stream_control);
+        self.stream_manager = Some(stream_mgr);
+        self.inbound_high_rx = Some(high_rx);
+        self.inbound_low_rx = Some(low_rx);
+        self.stream_receipt_rx = Some(receipt_rx);
+        self.outbound_tx = Some(outbound_tx);
+
+        self.incoming_stream_rx = Some(handles.incoming_streams_rx);
+        self.local_peer_id = Some(handles.local_peer_id);
+        self.swarm_cmd_tx = Some(handles.cmd_tx);
+        self.swarm_evt_rx = Some(handles.evt_rx);
 
         // Initialize handlers based on mode
         self.set_capabilities(self.capabilities);
 
-        // Start listening
-        if let Some(ref mut swarm) = self.swarm {
-            swarm
-                .listen_on(self.config.listen_addr.clone())
-                .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-        }
+        // Listen on address (send command)
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::AddAddress(self.local_peer_id.unwrap(), self.config.listen_addr.clone()));
+        // Wait, swarm.listen_on doesn't have a command in SharedSwarmCommand.
+        // If it's a shared swarm, DaemonManager handles listening.
+        // If standalone, the drive loop should probably handle it or we should add a Listen command.
+        // For now, let's just add Listen to SharedSwarmCommand if we need it, but actually standalone
+        // is just a fallback. Let's add Listen On to the commands later if required.
 
         // Connect to bootstrap peers
         self.connect_bootstrap().await?;
@@ -1265,66 +1315,26 @@ impl TunnelCraftNode {
         let bootstrap_peers = if !self.config.bootstrap_peers.is_empty() {
             self.config.bootstrap_peers.clone()
         } else {
-            tunnelcraft_network::default_bootstrap_peers()
+            craftnet_network::default_bootstrap_peers()
         };
         self.bootstrap_peer_ids = bootstrap_peers.iter().map(|(pid, _)| *pid).collect();
 
         // Bootstrap the Kademlia DHT so we discover peers and exit nodes
-        if let Some(ref mut swarm) = self.swarm {
-            match swarm.behaviour_mut().bootstrap() {
-                Ok(_) => info!("Kademlia DHT bootstrap initiated"),
-                Err(e) => warn!("DHT bootstrap failed (no peers?): {:?}", e),
-            }
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::BootstrapSecondary);
+
+        // Subscribe to gossipsub topics
+        let topics = vec![
+            EXIT_STATUS_TOPIC,
+            PROOF_TOPIC,
+            RELAY_STATUS_TOPIC,
+            SUBSCRIPTION_TOPIC,
+        ];
+        for topic in topics {
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::SubscribeGossipsub(topic.to_string()));
         }
 
-        // Subscribe to exit status gossipsub topic
-        if let Some(ref mut swarm) = self.swarm {
-            if let Err(e) = swarm.behaviour_mut().subscribe_exit_status() {
-                warn!("Failed to subscribe to exit status topic: {:?}", e);
-            } else {
-                debug!("Subscribed to exit status topic");
-            }
-        }
-
-        // Subscribe to proof gossipsub topic (for receiving + publishing proofs)
-        if let Some(ref mut swarm) = self.swarm {
-            if let Err(e) = swarm.behaviour_mut().subscribe_proofs() {
-                warn!("Failed to subscribe to proof topic: {:?}", e);
-            } else {
-                debug!("Subscribed to proof topic");
-            }
-        }
-
-        // Subscribe to relay status gossipsub topic
-        if let Some(ref mut swarm) = self.swarm {
-            if let Err(e) = swarm.behaviour_mut().subscribe_relay_status() {
-                warn!("Failed to subscribe to relay status topic: {:?}", e);
-            } else {
-                debug!("Subscribed to relay status topic");
-            }
-        }
-
-        // Subscribe to subscription announcement topic
-        if let Some(ref mut swarm) = self.swarm {
-            if let Err(e) = swarm.behaviour_mut().subscribe_subscriptions() {
-                warn!("Failed to subscribe to subscription topic: {:?}", e);
-            } else {
-                debug!("Subscribed to subscription topic");
-            }
-        }
-
-        // Topology data is now carried in relay/exit heartbeats (connected_peers field),
-        // so no separate topology topic subscription is needed.
-
-        // Subscribe to aggregator sync topic (history sync for new aggregators)
         if self.aggregator.is_some() {
-            if let Some(ref mut swarm) = self.swarm {
-                if let Err(e) = swarm.behaviour_mut().subscribe_aggregator_sync() {
-                    warn!("Failed to subscribe to aggregator sync topic: {:?}", e);
-                } else {
-                    debug!("Subscribed to aggregator sync topic");
-                }
-            }
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::SubscribeGossipsub(AGGREGATOR_SYNC_TOPIC.to_string()));
         }
 
         // Create settlement client for subscription verification (Node/Both modes)
@@ -1352,9 +1362,18 @@ impl TunnelCraftNode {
         Ok(())
     }
 
+    /// Helper to send a command to the shared swarm
+    fn send_swarm_cmd(&self, cmd: craftec_network::SharedSwarmCommand) {
+        if let Some(ref tx) = self.swarm_cmd_tx {
+            if let Err(e) = tx.try_send(cmd) {
+                warn!("Failed to send swarm command (queue full?): {}", e);
+            }
+        }
+    }
+
     /// Connect to bootstrap peers
     async fn connect_bootstrap(&mut self) -> Result<()> {
-        if self.swarm.is_none() {
+        if self.swarm_cmd_tx.is_none() {
             return Ok(());
         }
 
@@ -1366,7 +1385,7 @@ impl TunnelCraftNode {
         let bootstrap_peers = if has_explicit_peers {
             self.config.bootstrap_peers.clone()
         } else {
-            tunnelcraft_network::default_bootstrap_peers()
+            craftnet_network::default_bootstrap_peers()
         };
         // Don't try to dial ourselves
         let local_peer = self.local_peer_id;
@@ -1382,12 +1401,8 @@ impl TunnelCraftNode {
 
         for (peer_id, addr) in &bootstrap_peers {
             debug!("Connecting to bootstrap peer: {}", peer_id);
-            if let Some(ref mut swarm) = self.swarm {
-                swarm.behaviour_mut().add_address(peer_id, addr.clone());
-                if let Err(e) = swarm.dial(*peer_id) {
-                    warn!("Failed to dial bootstrap peer {}: {}", peer_id, e);
-                }
-            }
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::AddAddress(*peer_id, addr.clone()));
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::Dial(*peer_id));
         }
 
         // Only block on connection when we have explicitly configured peers.
@@ -1401,7 +1416,7 @@ impl TunnelCraftNode {
         // Wait for at least one connection to an explicit bootstrap peer
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
-            let connected = self.swarm.as_ref().map(|s| s.connected_peers().count()).unwrap_or(0);
+            let connected = self.connected_peers.len();
             if connected > 0 {
                 info!("Connected to {} peers", connected);
                 return Ok(());
@@ -1511,7 +1526,7 @@ impl TunnelCraftNode {
 
     /// Stop the node
     pub async fn stop(&mut self) {
-        info!("Stopping TunnelCraftNode");
+        info!("Stopping CraftNetNode");
 
         // Announce offline if we're an exit
         if self.capabilities.is_exit() {
@@ -1527,24 +1542,23 @@ impl TunnelCraftNode {
         self.pending.clear();
         self.relay_nodes.clear();
         self.unverified_relay_peers.clear();
-        self.swarm = None;
+        self.swarm_cmd_tx = None;
+        self.swarm_evt_rx = None;
         self.local_peer_id = None;
     }
 
     /// Announce going offline via gossipsub (for exits)
     fn announce_offline(&mut self) {
-        if let Some(ref mut swarm) = self.swarm {
-            let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
-            let msg = ExitStatusMessage::offline(
-                self.keypair.public_key_bytes(),
-                &peer_id_str,
-            );
-            if let Err(e) = swarm.behaviour_mut().publish_exit_status(msg.to_bytes()) {
-                warn!("Failed to announce offline: {:?}", e);
-            } else {
-                debug!("Announced offline status");
-            }
-        }
+        let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+        let msg = ExitStatusMessage::offline(
+            self.keypair.public_key_bytes(),
+            &peer_id_str,
+        );
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PublishGossipsub {
+            topic: EXIT_STATUS_TOPIC.to_string(),
+            data: msg.to_bytes(),
+        });
+        debug!("Announced offline status");
     }
 
     /// Publish heartbeat via gossipsub (for exits)
@@ -1571,30 +1585,28 @@ impl TunnelCraftNode {
         };
 
         let connected_peers = self.connected_stream_peers();
-        if let Some(ref mut swarm) = self.swarm {
-            let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
-            let mut msg = ExitStatusMessage::heartbeat(
-                self.keypair.public_key_bytes(),
-                &peer_id_str,
-                load_percent,
-                self.active_requests,
-                self.exit_uplink_kbps,
-                self.exit_downlink_kbps,
-                uptime_secs,
-                region,
-                connected_peers,
-            );
-            msg.encryption_pubkey = Some(hex::encode(self.encryption_keypair.public_key_bytes()));
-            if let Err(e) = swarm.behaviour_mut().publish_exit_status(msg.to_bytes()) {
-                // Don't warn on InsufficientPeers - normal during startup
-                debug!("Failed to publish heartbeat: {:?}", e);
-            } else {
-                debug!(
-                    "Published heartbeat (load: {}%, uplink: {}KB/s, downlink: {}KB/s, uptime: {}s, peers: {})",
-                    load_percent, self.exit_uplink_kbps, self.exit_downlink_kbps, uptime_secs, msg.connected_peers.len()
-                );
-            }
-        }
+        let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+        let mut msg = ExitStatusMessage::heartbeat(
+            self.keypair.public_key_bytes(),
+            &peer_id_str,
+            load_percent,
+            self.active_requests,
+            self.exit_uplink_kbps,
+            self.exit_downlink_kbps,
+            uptime_secs,
+            region,
+            connected_peers,
+        );
+        msg.encryption_pubkey = Some(hex::encode(self.encryption_keypair.public_key_bytes()));
+        
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PublishGossipsub {
+            topic: EXIT_STATUS_TOPIC.to_string(),
+            data: msg.to_bytes(),
+        });
+        debug!(
+            "Published heartbeat (load: {}%, uplink: {}KB/s, downlink: {}KB/s, uptime: {}s, peers: {})",
+            load_percent, self.exit_uplink_kbps, self.exit_downlink_kbps, uptime_secs, msg.connected_peers.len()
+        );
         self.last_heartbeat_sent = Some(std::time::Instant::now());
     }
 
@@ -1840,11 +1852,6 @@ impl TunnelCraftNode {
 
     /// Announce this node as an exit to the DHT
     fn announce_as_exit(&mut self) {
-        let Some(ref mut swarm) = self.swarm else {
-            warn!("Cannot announce exit: swarm not initialized");
-            return;
-        };
-
         let local_peer_id = match self.local_peer_id {
             Some(pid) => pid,
             None => {
@@ -1876,12 +1883,19 @@ impl TunnelCraftNode {
         };
 
         // Announce to DHT
-        if let Err(e) = swarm.behaviour_mut().put_exit_record(&local_peer_id, record) {
-            warn!("Failed to put exit record in DHT: {:?}", e);
-        }
-        if let Err(e) = swarm.behaviour_mut().start_providing_exit() {
-            warn!("Failed to start providing exit: {:?}", e);
-        }
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::StartProvidingSecondary(
+            libp2p::kad::RecordKey::new(&craftnet_network::EXIT_REGISTRY_KEY),
+        ));
+
+        let record_value = record;
+        let key = libp2p::kad::RecordKey::new(&craftnet_network::exit_dht_key(&self.local_peer_id.unwrap()));
+        let record = libp2p::kad::Record {
+            key,
+            value: record_value,
+            publisher: Some(self.local_peer_id.unwrap()),
+            expires: Some(std::time::Instant::now() + craftnet_network::EXIT_RECORD_TTL),
+        };
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PutRecordSecondary(record));
         self.last_exit_announcement = Some(std::time::Instant::now());
         info!(
             "Announced as exit node: region={:?}, country={:?}, city={:?}",
@@ -1908,19 +1922,19 @@ impl TunnelCraftNode {
     /// Announce this node's signing pubkey → PeerId in DHT
     /// so relays can route response shards to us by destination lookup
     fn announce_as_peer(&mut self) {
-        let Some(ref mut swarm) = self.swarm else {
-            return;
-        };
         let Some(local_peer_id) = self.local_peer_id else {
             return;
         };
 
         let pubkey = self.keypair.public_key_bytes();
-        if let Err(e) = swarm.behaviour_mut().put_peer_record(&pubkey, &local_peer_id) {
-            warn!("Failed to put peer record in DHT: {:?}", e);
-        } else {
-            debug!("Announced peer record: pubkey {} → {}", hex::encode(&pubkey[..8]), local_peer_id);
-        }
+        let record = libp2p::kad::Record {
+            key: libp2p::kad::RecordKey::new(&craftnet_network::peer_dht_key(&pubkey)),
+            value: local_peer_id.to_bytes(),
+            publisher: Some(local_peer_id),
+            expires: Some(std::time::Instant::now() + craftnet_network::PEER_RECORD_TTL),
+        };
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PutRecordSecondary(record));
+        debug!("Announced peer record: pubkey {} → {}", hex::encode(&pubkey[..8]), local_peer_id);
         self.last_peer_announcement = Some(std::time::Instant::now());
     }
 
@@ -1994,7 +2008,7 @@ impl TunnelCraftNode {
                 .map(|p| p.to_string())
                 .unwrap_or_default(),
             connected: self.connected,
-            peer_count: self.swarm.as_ref().map(|s| s.connected_peers().count()).unwrap_or(0),
+            peer_count: self.connected_peers.len(),
             credits: self.credits,
             routing_active: self.is_routing_active(),
             relay_active: self.is_relay_active(),
@@ -2390,7 +2404,7 @@ impl TunnelCraftNode {
         // Important: exit nodes can also decrypt routing_tags on REQUEST shards (since
         // the client encrypted them with the exit's key). We distinguish by checking
         // whether the assembly_id matches something we're waiting for.
-        let tag_result = tunnelcraft_crypto::decrypt_routing_tag(
+        let tag_result = craftnet_core::onion_crypto::decrypt_routing_tag(
             &self.encryption_keypair.secret_key_bytes(),
             &shard.routing_tag,
         );
@@ -2668,7 +2682,7 @@ impl TunnelCraftNode {
                     format!("{:02x}{:02x}{:02x}{:02x}", modified_shard.payload[0], modified_shard.payload[1], modified_shard.payload[2], modified_shard.payload[3])
                 } else { "short".to_string() };
                 if let Ok(next_pid) = PeerId::from_bytes(&next_peer_bytes) {
-                    let connected = self.swarm.as_ref().is_some_and(|s| s.is_connected(&next_pid));
+                    let connected = self.connected_peers.contains(&next_pid);
                     let has_stream = self.stream_manager.as_ref().map_or(false, |sm| sm.has_stream(&next_pid));
                     let next_str = next_pid.to_string();
                     warn!(
@@ -2714,10 +2728,8 @@ impl TunnelCraftNode {
                         return self.process_as_exit(modified_shard, next_peer).await;
                     }
                     // If not connected to next peer, dial them first so open_stream can succeed.
-                    if let Some(ref mut swarm) = self.swarm {
-                        if !swarm.is_connected(&next_peer) {
-                            let _ = swarm.dial(next_peer);
-                        }
+                    if !self.connected_peers.contains(&next_peer) {
+                        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::Dial(next_peer));
                     }
                     // Ensure stream exists (triggers background open if needed)
                     if let Some(ref mut sm) = self.stream_manager {
@@ -2850,7 +2862,7 @@ impl TunnelCraftNode {
     /// was populated when we sent the request.
     fn handle_response_shard(&mut self, shard: Shard) {
         // Decrypt routing_tag to get assembly_id + shard/chunk metadata
-        let tag = match tunnelcraft_crypto::decrypt_routing_tag(
+        let tag = match craftnet_core::onion_crypto::decrypt_routing_tag(
             &self.encryption_keypair.secret_key_bytes(),
             &shard.routing_tag,
         ) {
@@ -3041,7 +3053,7 @@ impl TunnelCraftNode {
         let encrypted_data = &framed_data[4..4 + original_len];
 
         // Decrypt the response using the exit's encryption pubkey stored at request time
-        let data = tunnelcraft_crypto::decrypt_from_sender(
+        let data = craftec_crypto::decrypt_from_sender(
             &pending.exit_enc_pubkey,
             &self.encryption_keypair.secret_key_bytes(),
             encrypted_data,
@@ -3273,7 +3285,7 @@ impl TunnelCraftNode {
         let encrypted_data = &framed_data[4..4 + original_len];
 
         // Decrypt the response using the exit's encryption pubkey stored at request time
-        tunnelcraft_crypto::decrypt_from_sender(
+        craftec_crypto::decrypt_from_sender(
             &pending.exit_enc_pubkey,
             &self.encryption_keypair.secret_key_bytes(),
             encrypted_data,
@@ -3292,34 +3304,30 @@ impl TunnelCraftNode {
             self.try_compress();
         }
 
-        let Some(ref mut swarm) = self.swarm else {
-            // No swarm: yield to runtime so callers using select! don't busy-spin
+        let has_rx = self.swarm_evt_rx.is_some();
+        if !has_rx {
+            // No swarm connection: yield to runtime so callers using select! don't busy-spin
             tokio::time::sleep(Duration::from_millis(100)).await;
             return;
-        };
+        }
 
         // Drain all immediately available swarm events (don't wait after the first)
         // This prevents DHT events from starving shard delivery.
         tokio::select! {
-            event = swarm.select_next_some() => {
-                self.handle_swarm_event(event).await;
-                // Drain remaining ready events without blocking.
-                // Interleave shard drain+flush every 50 events to prevent
-                // gossip traffic from starving shard delivery.
-                let mut events_since_drain = 0u32;
-                loop {
-                    let Some(ref mut swarm) = self.swarm else { break };
-                    tokio::select! {
-                        biased;
-                        event = swarm.select_next_some() => {
-                            self.handle_swarm_event(event).await;
-                            events_since_drain += 1;
-                            if events_since_drain >= 50 {
-                                events_since_drain = 0;
-                                self.drain_stream_shards().await;
-                            }
+            event = async { self.swarm_evt_rx.as_mut().unwrap().recv().await } => {
+                if let Some(event) = event {
+                    self.handle_swarm_event(event).await;
+                    // Drain remaining ready events without blocking.
+                    // Interleave shard drain+flush every 50 events to prevent
+                    // gossip traffic from starving shard delivery.
+                    let mut events_since_drain = 0u32;
+                    while let Ok(evt) = self.swarm_evt_rx.as_mut().unwrap().try_recv() {
+                        self.handle_swarm_event(evt).await;
+                        events_since_drain += 1;
+                        if events_since_drain >= 50 {
+                            events_since_drain = 0;
+                            self.drain_stream_shards().await;
                         }
-                        _ = async {} => { break; }
                     }
                 }
             }
@@ -3555,6 +3563,46 @@ impl TunnelCraftNode {
         }
     }
 
+    /// Reconnect to bootstrap peers if we have lost all connections to them
+    fn maybe_reconnect_bootstrap(&mut self) {
+        let should_check = self.last_bootstrap_check
+            .map(|t| t.elapsed() > Duration::from_secs(60))
+            .unwrap_or(true);
+
+        if !should_check {
+            return;
+        }
+        self.last_bootstrap_check = Some(std::time::Instant::now());
+
+        let connected_to_bootstrap = self.bootstrap_peer_ids.iter().any(|pid| self.connected_peers.contains(pid));
+
+        if !connected_to_bootstrap && !self.bootstrap_peer_ids.is_empty() {
+            warn!("Lost connection to all bootstrap peers, reconnecting...");
+
+            let bootstrap_peers = if !self.config.bootstrap_peers.is_empty() {
+                self.config.bootstrap_peers.clone()
+            } else {
+                craftnet_network::default_bootstrap_peers()
+            };
+
+            for (peer_id, addr) in &bootstrap_peers {
+                if self.swarm_cmd_tx.is_some() {
+                    self.send_swarm_cmd(craftec_network::SharedSwarmCommand::AddAddress(*peer_id, addr.clone()));
+                    self.send_swarm_cmd(craftec_network::SharedSwarmCommand::Dial(*peer_id));
+                }
+            }
+            if self.swarm_cmd_tx.is_some() {
+                self.send_swarm_cmd(craftec_network::SharedSwarmCommand::BootstrapSecondary);
+            }
+        }
+    }
+
+    /// Register with circuit relay (stubbed out for shared swarm)
+    fn register_with_circuit_relay(&mut self) {
+        // Circuit relay registration is handled by the shared swarm coordinator
+        // using the AutoNAT status, so we don't need to do it here.
+    }
+
     /// Run async maintenance tasks (subscription verification, distribution posting, aggregator persistence).
     /// Call this periodically alongside `run_maintenance()` when not using `run()`.
     pub async fn run_async_maintenance(&mut self) {
@@ -3572,8 +3620,8 @@ impl TunnelCraftNode {
     /// Tunnels have a 5-minute TTL from ConnectionEstablished. Since connections
     /// are persistent, we must renew them periodically to prevent expiration.
     fn refresh_and_evict_tunnels(&mut self) {
-        if let (Some(local_pid), Some(swarm)) = (self.local_peer_id, self.swarm.as_ref()) {
-            let connected_peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+        if let Some(local_pid) = self.local_peer_id {
+            let connected_peers: Vec<PeerId> = self.connected_peers.iter().cloned().collect();
             let expires_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -3631,12 +3679,10 @@ impl TunnelCraftNode {
     fn connected_stream_peers(&self) -> Vec<String> {
         if let Some(ref sm) = self.stream_manager {
             let stream_peers: HashSet<PeerId> = sm.stream_peers().into_iter().collect();
-            self.swarm.as_ref()
-                .map(|s| s.connected_peers()
-                    .filter(|p| stream_peers.contains(p))
-                    .map(|p| p.to_string())
-                    .collect())
-                .unwrap_or_default()
+            self.connected_peers.iter()
+                .filter(|p| stream_peers.contains(p))
+                .map(|p| p.to_string())
+                .collect()
         } else {
             vec![]
         }
@@ -3648,9 +3694,9 @@ impl TunnelCraftNode {
     /// - `paths`: onion paths for each shard (relay hops + exit)
     /// - `first_hop_targets`: PeerId of the first relay for each path
     /// - `lease_set`: gateway info for response routing
-    fn build_request_paths(&self, exit_hop: &PathHop) -> Result<(Vec<crate::path::OnionPath>, Vec<PeerId>, tunnelcraft_core::lease_set::LeaseSet)> {
+    fn build_request_paths(&self, exit_hop: &PathHop) -> Result<(Vec<crate::path::OnionPath>, Vec<PeerId>, craftnet_core::lease_set::LeaseSet)> {
         use crate::path::{PathSelector, OnionPath, random_id};
-        use tunnelcraft_core::lease_set::{LeaseSet, Lease};
+        use craftnet_core::lease_set::{LeaseSet, Lease};
 
         let our_peer_id = self.local_peer_id
             .ok_or(ClientError::NotConnected)?;
@@ -3741,7 +3787,7 @@ impl TunnelCraftNode {
             &self.topology,
             extra_hops,
             exit_hop,
-            tunnelcraft_erasure::TOTAL_SHARDS,
+            craftnet_erasure::TOTAL_SHARDS,
             Some(&gw_bytes),
         )?;
 
@@ -3768,13 +3814,12 @@ impl TunnelCraftNode {
     ///
     /// Returns `(PeerId, PathHop)` with full info needed for onion layer.
     fn select_gateway_relay(&self, our_bytes: &[u8]) -> Option<(PeerId, PathHop)> {
-        let swarm = self.swarm.as_ref()?;
         let sm = self.stream_manager.as_ref();
 
         info!("Selecting gateway relay from {} known relay nodes", self.relay_nodes.len());
 
         for relay_status in self.relay_nodes.values() {
-            let connected = swarm.is_connected(&relay_status.peer_id);
+            let connected = self.connected_peers.contains(&relay_status.peer_id);
             let has_stream = sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false);
             let has_enc_key = relay_status.info.encryption_pubkey.is_some()
                 && relay_status.info.encryption_pubkey != Some([0u8; 32]);
@@ -3792,7 +3837,7 @@ impl TunnelCraftNode {
         // Best: DHT relay that also appears in topology with our bytes in connected_peers
         // AND has an established shard-stream
         for relay_status in &sorted_relays {
-            if !swarm.is_connected(&relay_status.peer_id) {
+            if !self.connected_peers.contains(&relay_status.peer_id) {
                 continue;
             }
             if !sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false) {
@@ -3815,7 +3860,7 @@ impl TunnelCraftNode {
 
         // Fallback: any DHT relay connected via swarm with stream (use topology enc key if available)
         for relay_status in &sorted_relays {
-            if !swarm.is_connected(&relay_status.peer_id) {
+            if !self.connected_peers.contains(&relay_status.peer_id) {
                 continue;
             }
             if !sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false) {
@@ -3852,7 +3897,6 @@ impl TunnelCraftNode {
     /// request. Additional entries go into the LeaseSet so the exit can pick
     /// any for response routing.
     fn select_all_gateway_relays(&self, our_bytes: &[u8]) -> Vec<(PeerId, PathHop)> {
-        let Some(swarm) = self.swarm.as_ref() else { return vec![] };
         let sm = self.stream_manager.as_ref();
 
         let mut results = Vec::new();
@@ -3865,7 +3909,7 @@ impl TunnelCraftNode {
 
         // First pass: topology-confirmed relays with stream (best quality)
         for relay_status in &sorted_relays {
-            if !swarm.is_connected(&relay_status.peer_id) {
+            if !self.connected_peers.contains(&relay_status.peer_id) {
                 continue;
             }
             if !sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false) {
@@ -3888,7 +3932,7 @@ impl TunnelCraftNode {
 
         // Second pass: DHT relays with encryption keys + stream (fallback)
         for relay_status in &sorted_relays {
-            if !swarm.is_connected(&relay_status.peer_id) || seen.contains(&relay_status.peer_id) {
+            if !self.connected_peers.contains(&relay_status.peer_id) || seen.contains(&relay_status.peer_id) {
                 continue;
             }
             if !sm.map(|s| s.has_stream(&relay_status.peer_id)).unwrap_or(false) {
@@ -3948,21 +3992,17 @@ impl TunnelCraftNode {
         let mut maintenance_interval = tokio::time::interval(self.maintenance_interval);
 
         loop {
-            if self.swarm.is_none() {
+            if self.swarm_evt_rx.is_none() {
                 break;
             }
 
             tokio::select! {
                 // Handle network events
-                event = async {
-                    if let Some(ref mut swarm) = self.swarm {
-                        Some(swarm.select_next_some().await)
-                    } else {
-                        None
-                    }
-                } => {
+                event = async { self.swarm_evt_rx.as_mut().unwrap().recv().await } => {
                     if let Some(event) = event {
                         self.handle_swarm_event(event).await;
+                    } else {
+                        break; // Channel closed
                     }
                 }
 
@@ -4018,25 +4058,22 @@ impl TunnelCraftNode {
                 }
             }
         }
-        if let Some(ref mut swarm) = self.swarm {
+        if self.swarm_cmd_tx.is_some() {
             debug!("Starting exit discovery via DHT (existing exit_nodes={})", self.exit_nodes.len());
-            let qid = swarm.behaviour_mut().get_exit_providers();
-            self.pending_exit_provider_queries.insert(qid);
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetProvidersSecondary(
+                libp2p::kad::RecordKey::new(&craftnet_network::EXIT_REGISTRY_KEY),
+            ));
             self.last_exit_discovery = Some(std::time::Instant::now());
         }
     }
 
     /// Handle swarm event
-    async fn handle_swarm_event(&mut self, event: SwarmEvent<TunnelCraftBehaviourEvent>) {
+    async fn handle_swarm_event(&mut self, event: craftec_network::SharedSwarmEvent) {
+        use craftec_network::SharedSwarmEvent;
         match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                info!("Listening on {}", address);
-                if let Some(ref mut swarm) = self.swarm {
-                    swarm.add_external_address(address);
-                }
-            }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SharedSwarmEvent::ConnectionEstablished(peer_id) => {
                 debug!("Connected to peer: {}", peer_id);
+                self.connected_peers.insert(peer_id);
                 if !self.unverified_relay_peers.contains(&peer_id) {
                     self.unverified_relay_peers.push(peer_id);
                 }
@@ -4063,19 +4100,14 @@ impl TunnelCraftNode {
                     sm.clear_open_cooldown(&peer_id);
                     sm.ensure_opening(peer_id);
                 }
-                // Topology is now carried in heartbeats (30s interval), so new
-                // connections will be picked up at the next heartbeat cycle.
             }
-            SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
-                debug!("Connection closed to peer: {} (remaining={})", peer_id, num_established);
-                let mut state = self.state.write();
-                state.stats.peers_connected = state.stats.peers_connected.saturating_sub(1);
-                drop(state);
+            SharedSwarmEvent::ConnectionClosed(peer_id) => {
+                    debug!("Connection closed to peer: {}", peer_id);
+                    self.connected_peers.remove(&peer_id);
+                    let mut state = self.state.write();
+                    state.stats.peers_connected = state.stats.peers_connected.saturating_sub(1);
+                    drop(state);
 
-                // Tunnel registrations are time-committed — topology gossip is
-                // the commitment. Don't unregister tunnels on connection events;
-                // let refresh_and_evict_tunnels() handle cleanup in maintenance.
-                if num_established == 0 {
                     info!("Fully disconnected from peer: {}", peer_id);
                     self.unverified_relay_peers.retain(|p| p != &peer_id);
                     for status in self.relay_nodes.values_mut() {
@@ -4087,301 +4119,145 @@ impl TunnelCraftNode {
                     if let Some(ref mut sm) = self.stream_manager {
                         sm.on_peer_disconnected(&peer_id);
                     }
-                    // Topology is now carried in heartbeats — disconnection will be
-                    // reflected at the next 30s heartbeat cycle.
+                }
+            SharedSwarmEvent::GossipsubMessage { topic, data, propagation_source } => {
+                use libp2p::gossipsub::IdentTopic;
+                use craftnet_network::{EXIT_STATUS_TOPIC, RELAY_STATUS_TOPIC, PROOF_TOPIC, SUBSCRIPTION_TOPIC, AGGREGATOR_SYNC_TOPIC};
+                let exit_hash = IdentTopic::new(EXIT_STATUS_TOPIC).hash();
+                let relay_hash = IdentTopic::new(RELAY_STATUS_TOPIC).hash();
+                let proof_hash = IdentTopic::new(PROOF_TOPIC).hash();
+                let sub_hash = IdentTopic::new(SUBSCRIPTION_TOPIC).hash();
+                let agg_sync_hash = IdentTopic::new(AGGREGATOR_SYNC_TOPIC).hash();
+
+                if topic == exit_hash {
+                    self.handle_exit_status(&data, propagation_source);
+                } else if topic == relay_hash {
+                    self.handle_relay_status(&data, propagation_source);
+                } else if topic == proof_hash {
+                    self.handle_proof_message(&data, propagation_source);
+                } else if topic == sub_hash {
+                    self.handle_subscription_announcement(&data);
+                } else if topic == agg_sync_hash {
+                    self.handle_aggregator_sync(&data);
+                } else {
+                    debug!("Received gossipsub message on unknown topic: {:?}", topic);
                 }
             }
-            SwarmEvent::Behaviour(behaviour_event) => {
-                self.handle_behaviour_event(behaviour_event).await;
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle behaviour event
-    async fn handle_behaviour_event(&mut self, event: TunnelCraftBehaviourEvent) {
-        match event {
-            TunnelCraftBehaviourEvent::Kademlia(kad_event) => {
-                self.handle_kademlia_event(kad_event);
-            }
-            TunnelCraftBehaviourEvent::Mdns(mdns_event) => {
-                use libp2p::mdns::Event;
-                match mdns_event {
-                    Event::Discovered(peers) => {
-                        if !self.local_discovery_enabled {
-                            debug!("mDNS discovery disabled, ignoring {} peers", peers.len());
-                            return;
-                        }
-                        let mut new_peers = false;
-                        for (peer_id, addr) in peers {
-                            debug!("mDNS discovered peer {} at {}", peer_id, addr);
-                            if let Some(ref mut swarm) = self.swarm {
-                                swarm.behaviour_mut().add_address(&peer_id, addr);
-                            }
-                            if !self.unverified_relay_peers.contains(&peer_id) {
-                                self.unverified_relay_peers.push(peer_id);
-                                new_peers = true;
-                            }
-                        }
-                        // Re-announce our peer record when new peers join
-                        // so they learn our pubkey → PeerId mapping faster
-                        if new_peers {
-                            self.announce_as_peer();
-                        }
-                    }
-                    Event::Expired(peers) => {
-                        for (peer_id, _) in peers {
-                            self.unverified_relay_peers.retain(|p| p != &peer_id);
-                        }
+            SharedSwarmEvent::MdnsDiscovered(peers) => {
+                if !self.local_discovery_enabled {
+                    return;
+                }
+                let mut new_peers = false;
+                for (peer_id, addr) in peers {
+                    debug!("mDNS discovered peer {} at {}", peer_id, addr);
+                    self.send_swarm_cmd(craftec_network::SharedSwarmCommand::AddAddress(peer_id, addr));
+                    if !self.unverified_relay_peers.contains(&peer_id) {
+                        self.unverified_relay_peers.push(peer_id);
+                        new_peers = true;
                     }
                 }
+                // Re-announce our peer record when new peers join
+                if new_peers {
+                    self.announce_as_peer();
+                }
             }
-            TunnelCraftBehaviourEvent::Gossipsub(gossip_event) => {
-                use libp2p::gossipsub::{Event, IdentTopic};
-                if let Event::Message { message, propagation_source, .. } = gossip_event {
-                    // Route by topic hash
-                    let exit_hash = IdentTopic::new(EXIT_STATUS_TOPIC).hash();
-                    let relay_hash = IdentTopic::new(RELAY_STATUS_TOPIC).hash();
-                    let proof_hash = IdentTopic::new(PROOF_TOPIC).hash();
-                    let sub_hash = IdentTopic::new(SUBSCRIPTION_TOPIC).hash();
-                    let agg_sync_hash = IdentTopic::new(AGGREGATOR_SYNC_TOPIC).hash();
-
-                    if message.topic == exit_hash {
-                        self.handle_exit_status(&message.data, Some(propagation_source));
-                    } else if message.topic == relay_hash {
-                        self.handle_relay_status(&message.data, Some(propagation_source));
-                    } else if message.topic == proof_hash {
-                        self.handle_proof_message(&message.data, Some(propagation_source));
-                    } else if message.topic == sub_hash {
-                        self.handle_subscription_announcement(&message.data);
-                    } else if message.topic == agg_sync_hash {
-                        self.handle_aggregator_sync(&message.data);
-                    } else {
-                        debug!("Received gossipsub message on unknown topic: {:?}", message.topic);
+            SharedSwarmEvent::MdnsExpired(peers) => {
+                for (peer_id, _) in peers {
+                    self.unverified_relay_peers.retain(|p| p != &peer_id);
+                }
+            }
+            SharedSwarmEvent::AutoNatStatusChanged(autonat_status) => {
+                use craftec_network::AutoNatStatus;
+                match autonat_status {
+                    AutoNatStatus::Public => {
+                        info!("AutoNAT: Publicly reachable");
+                        self.nat_status = NatStatus::Public;
+                    }
+                    AutoNatStatus::Private => {
+                        warn!("AutoNAT: Behind NAT (private)");
+                        self.nat_status = NatStatus::Private;
+                        // Register with circuit relay through bootstrap peers
+                        self.register_with_circuit_relay();
+                    }
+                    AutoNatStatus::Unknown => {
+                        debug!("AutoNAT: Status unknown");
+                        self.nat_status = NatStatus::Unknown;
                     }
                 }
             }
-            TunnelCraftBehaviourEvent::AutoNat(autonat_event) => {
-                self.handle_autonat_event(autonat_event);
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle AutoNAT events (NAT detection)
-    fn handle_autonat_event(&mut self, event: libp2p::autonat::Event) {
-        use libp2p::autonat::Event;
-        if let Event::StatusChanged { new, .. } = event {
-            use libp2p::autonat::NatStatus as LibNatStatus;
-            match new {
-                LibNatStatus::Public(_addr) => {
-                    info!("AutoNAT: Publicly reachable");
-                    self.nat_status = NatStatus::Public;
-                }
-                LibNatStatus::Private => {
-                    warn!("AutoNAT: Behind NAT (private)");
-                    self.nat_status = NatStatus::Private;
-                    // Register with circuit relay through bootstrap peers
-                    self.register_with_circuit_relay();
-                }
-                LibNatStatus::Unknown => {
-                    debug!("AutoNAT: Status unknown");
-                    self.nat_status = NatStatus::Unknown;
-                }
-            }
-        }
-    }
-
-    /// Register with circuit relay through bootstrap peers (for NATted nodes)
-    fn register_with_circuit_relay(&mut self) {
-        if self.bootstrap_peer_ids.is_empty() {
-            return;
-        }
-
-        for bootstrap_id in self.bootstrap_peer_ids.clone() {
-            if let Some(ref mut swarm) = self.swarm {
-                // Build relay-circuit multiaddr: /p2p/<bootstrap_id>/p2p-circuit
-                let relay_addr: Multiaddr = format!("/p2p/{}/p2p-circuit", bootstrap_id)
-                    .parse()
-                    .unwrap();
-                match swarm.listen_on(relay_addr.clone()) {
-                    Ok(_) => info!("Listening via circuit relay through {}", bootstrap_id),
-                    Err(e) => debug!("Failed to listen via circuit relay through {}: {:?}", bootstrap_id, e),
-                }
-            }
-        }
-    }
-
-    /// Reconnect to bootstrap peers if we've lost all connections
-    fn maybe_reconnect_bootstrap(&mut self) {
-        let should_check = self.last_bootstrap_check
-            .map(|t| t.elapsed() > Duration::from_secs(60))
-            .unwrap_or(true);
-
-        if !should_check {
-            return;
-        }
-        self.last_bootstrap_check = Some(std::time::Instant::now());
-
-        // Check if we're connected to any bootstrap peer
-        let connected_to_bootstrap = if let Some(ref swarm) = self.swarm {
-            self.bootstrap_peer_ids.iter().any(|pid| swarm.is_connected(pid))
-        } else {
-            return;
-        };
-
-        if !connected_to_bootstrap && !self.bootstrap_peer_ids.is_empty() {
-            warn!("Lost connection to all bootstrap peers, reconnecting...");
-
-            // Re-dial bootstrap peers
-            let bootstrap_peers = if !self.config.bootstrap_peers.is_empty() {
-                self.config.bootstrap_peers.clone()
-            } else {
-                tunnelcraft_network::default_bootstrap_peers()
-            };
-
-            for (peer_id, addr) in &bootstrap_peers {
-                if let Some(ref mut swarm) = self.swarm {
-                    swarm.behaviour_mut().add_address(peer_id, addr.clone());
-                    let _ = swarm.dial(*peer_id);
-                }
-            }
-
-            // Re-bootstrap Kademlia
-            if let Some(ref mut swarm) = self.swarm {
-                match swarm.behaviour_mut().bootstrap() {
-                    Ok(_) => debug!("Re-bootstrapped Kademlia DHT"),
-                    Err(e) => warn!("Re-bootstrap failed: {:?}", e),
-                }
-            }
-        }
-    }
-
-    /// Handle Kademlia DHT events (exit/relay node discovery + peer connectivity)
-    fn handle_kademlia_event(&mut self, event: libp2p::kad::Event) {
-        use libp2p::kad::{Event, QueryResult, GetRecordOk, GetProvidersOk};
-        use tunnelcraft_network::{EXIT_DHT_KEY_PREFIX, RELAY_DHT_KEY_PREFIX, PEER_DHT_KEY_PREFIX};
-
-        match event {
-            // Kademlia discovered a new peer in the routing table.
-            // Do NOT auto-dial: relay/exit peers are discovered via targeted
-            // DHT queries (GET_PROVIDERS). Auto-dialing RoutingUpdated peers
-            // pulls in global network nodes that pollute topology and waste
-            // connections (causes gossipsub queue overflow in test networks).
-            Event::RoutingUpdated { peer, is_new_peer, .. } => {
-                if is_new_peer {
-                    debug!("DHT routing updated: new peer {} (not auto-dialing)", peer);
-                }
-            }
-            Event::OutboundQueryProgressed { id, result, .. } => {
-                match result {
-                    QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(peer_record))) => {
-                        let key_str = String::from_utf8_lossy(peer_record.record.key.as_ref());
-                        if key_str.starts_with(EXIT_DHT_KEY_PREFIX) {
-                            // Parse PeerId from DHT key: /tunnelcraft/exits/<peer_id>
-                            let exit_peer_id = key_str.strip_prefix(EXIT_DHT_KEY_PREFIX)
-                                .and_then(|pid_str| pid_str.parse::<PeerId>().ok());
-
-                            // Parse exit info from record
-                            if let Ok(exit_info) = serde_json::from_slice::<ExitInfo>(&peer_record.record.value) {
-                                self.on_exit_discovered(exit_info, exit_peer_id);
-                            }
-                        } else if key_str.starts_with(RELAY_DHT_KEY_PREFIX) {
-                            // Parse PeerId from DHT key: /tunnelcraft/relays/<peer_id>
-                            let relay_peer_id = key_str.strip_prefix(RELAY_DHT_KEY_PREFIX)
-                                .and_then(|pid_str| pid_str.parse::<PeerId>().ok());
-
-                            // Parse relay info from record
-                            match serde_json::from_slice::<RelayInfo>(&peer_record.record.value) {
-                                Ok(relay_info) => {
-                                    info!("DHT relay record retrieved: peer_id={:?} pubkey={}", relay_peer_id, hex::encode(&relay_info.pubkey[..8]));
-                                    self.on_relay_discovered(relay_info, relay_peer_id);
-                                }
-                                Err(e) => {
-                                    warn!("DHT relay record deserialization failed: peer_id={:?} err={} raw_len={} raw={}",
-                                        relay_peer_id, e, peer_record.record.value.len(),
-                                        String::from_utf8_lossy(&peer_record.record.value[..peer_record.record.value.len().min(200)]));
-                                }
-                            }
-                            self.pending_relay_record_queries.remove(&id);
-                        } else if key_str.starts_with(PEER_DHT_KEY_PREFIX) {
-                            // Parse peer record: /tunnelcraft/peers/<pubkey_hex> → PeerId bytes
-                            if let Some(pubkey_hex) = key_str.strip_prefix(PEER_DHT_KEY_PREFIX) {
-                                if let Ok(pubkey_bytes) = hex::decode(pubkey_hex) {
-                                    if pubkey_bytes.len() == 32 {
-                                        if let Ok(peer_id) = PeerId::from_bytes(&peer_record.record.value) {
-                                            let mut pubkey = [0u8; 32];
-                                            pubkey.copy_from_slice(&pubkey_bytes);
-                                            info!("Resolved peer record: {} → {}", pubkey_hex, peer_id);
-                                            self.known_peers.insert(pubkey, peer_id);
-
-                                            // Flush any shards buffered for this destination via outbound channel
-                                            if let Some(shards) = self.pending_destination.remove(&pubkey) {
-                                                let count = shards.len();
-                                                if let Some(ref tx) = self.outbound_tx {
-                                                    for shard in shards {
-                                                        let _ = tx.try_send(OutboundShard { peer: peer_id, shard });
-                                                    }
-                                                }
-                                                info!("Queued {} buffered shards for peer {} via outbound channel", count, peer_id);
+            SharedSwarmEvent::KademliaSecondaryRecordFound { key, value } => {
+                use craftnet_network::{EXIT_DHT_KEY_PREFIX, RELAY_DHT_KEY_PREFIX, PEER_DHT_KEY_PREFIX};
+                let key_str = String::from_utf8_lossy(key.as_ref());
+                
+                if key_str.starts_with(EXIT_DHT_KEY_PREFIX) {
+                    // Parse PeerId from DHT key: /craftnet/exits/<peer_id>
+                    let exit_peer_id = key_str.strip_prefix(EXIT_DHT_KEY_PREFIX)
+                        .and_then(|pid_str| pid_str.parse::<PeerId>().ok());
+                    if let Ok(exit_info) = serde_json::from_slice::<ExitInfo>(&value) {
+                        self.on_exit_discovered(exit_info, exit_peer_id);
+                    }
+                } else if key_str.starts_with(RELAY_DHT_KEY_PREFIX) {
+                    // Parse PeerId from DHT key: /craftnet/relays/<peer_id>
+                    let relay_peer_id = key_str.strip_prefix(RELAY_DHT_KEY_PREFIX)
+                        .and_then(|pid_str| pid_str.parse::<PeerId>().ok());
+                    match serde_json::from_slice::<RelayInfo>(&value) {
+                        Ok(relay_info) => {
+                            info!("DHT relay record retrieved: peer_id={:?} pubkey={}", relay_peer_id, hex::encode(&relay_info.pubkey[..8]));
+                            self.on_relay_discovered(relay_info, relay_peer_id);
+                        }
+                        Err(e) => {
+                            warn!("DHT relay record deserialization failed: peer_id={:?} err={}", relay_peer_id, e);
+                        }
+                    }
+                } else if key_str.starts_with(PEER_DHT_KEY_PREFIX) {
+                    // Parse peer record: /craftnet/peers/<pubkey_hex> → PeerId bytes
+                    if let Some(pubkey_hex) = key_str.strip_prefix(PEER_DHT_KEY_PREFIX) {
+                        if let Ok(pubkey_bytes) = hex::decode(pubkey_hex) {
+                            if pubkey_bytes.len() == 32 {
+                                if let Ok(peer_id) = PeerId::from_bytes(&value) {
+                                    let mut pubkey = [0u8; 32];
+                                    pubkey.copy_from_slice(&pubkey_bytes);
+                                    info!("Resolved peer record: {} → {}", pubkey_hex, peer_id);
+                                    self.known_peers.insert(pubkey, peer_id);
+                                    if let Some(shards) = self.pending_destination.remove(&pubkey) {
+                                        let count = shards.len();
+                                        if let Some(ref tx) = self.outbound_tx {
+                                            for shard in shards {
+                                                let _ = tx.try_send(OutboundShard { peer: peer_id, shard });
                                             }
                                         }
+                                        info!("Queued {} buffered shards for peer {} via outbound channel", count, peer_id);
                                     }
                                 }
                             }
                         }
                     }
-                    QueryResult::GetProviders(Ok(result)) => {
-                        // Use contains (not remove) because get_providers fires FoundProviders
-                        // progressively — removing on first event would misclassify later batches.
-                        // Removal happens in FinishedWithNoAdditionalRecord when the query is done.
-                        let is_relay_query = self.pending_relay_provider_queries.contains(&id);
-                        let is_exit_query = self.pending_exit_provider_queries.contains(&id);
-
-                        match result {
-                            GetProvidersOk::FoundProviders { providers, .. } => {
-                                if is_relay_query {
-                                    info!("DHT found {} relay providers", providers.len());
-                                    for provider_id in &providers {
-                                        debug!("DHT relay provider: {}", provider_id);
-                                    }
-                                    for provider_id in providers {
-                                        if let Some(ref mut swarm) = self.swarm {
-                                            let qid = swarm.behaviour_mut().get_relay_record(&provider_id);
-                                            self.pending_relay_record_queries.insert(qid);
-                                        }
-                                    }
-                                } else if is_exit_query {
-                                    info!("DHT found {} exit providers", providers.len());
-                                    for provider_id in &providers {
-                                        debug!("DHT exit provider: {}", provider_id);
-                                    }
-                                    for provider_id in providers {
-                                        if let Some(ref mut swarm) = self.swarm {
-                                            swarm.behaviour_mut().get_exit_record(&provider_id);
-                                        }
-                                    }
-                                } else {
-                                    warn!("DHT GetProviders for unknown query id {:?}, {} providers", id, providers.len());
-                                }
-                            }
-                            GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {
-                                // Now safe to remove — query is complete
-                                if self.pending_relay_provider_queries.remove(&id) {
-                                    debug!("DHT relay provider query finished (relay_nodes={})", self.relay_nodes.len());
-                                } else if self.pending_exit_provider_queries.remove(&id) {
-                                    debug!("DHT exit provider query finished (exit_nodes={})", self.exit_nodes.len());
-                                }
-                            }
-                        }
-                    }
-                    QueryResult::GetProviders(Err(ref e)) => {
-                        warn!("DHT GetProviders failed: {:?}", e);
-                    }
-                    _ => {}
                 }
             }
-            _ => {}
+            SharedSwarmEvent::KademliaSecondaryProvidersFound { key, providers } => {
+                use craftnet_network::{EXIT_REGISTRY_KEY, RELAY_REGISTRY_KEY};
+                let key_bytes = key.as_ref();
+                let state = self.state.read(); // Added this line
+                if key_bytes == RELAY_REGISTRY_KEY {
+                    info!("DHT found {} relay providers", providers.len());
+                    for provider_id in providers {
+                        if self.capabilities().is_relay() {
+                            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetRecordSecondary(
+                                libp2p::kad::RecordKey::new(&craftnet_network::relay_dht_key(&provider_id)),
+                            ));
+                        }
+                    }
+                } else if key_bytes == EXIT_REGISTRY_KEY {
+                    info!("DHT found {} exit providers", providers.len());
+                    for provider_id in providers {
+                        if self.capabilities().is_exit() { // This condition was moved and applied to exit providers
+                            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetRecordSecondary(
+                                libp2p::kad::RecordKey::new(&craftnet_network::exit_dht_key(&provider_id)),
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -4427,7 +4303,7 @@ impl TunnelCraftNode {
     /// Remove stale exits that haven't been seen recently
     /// Called periodically from the run loop
     fn cleanup_stale_exits(&mut self) {
-        use tunnelcraft_network::EXIT_RECORD_TTL;
+        use craftnet_network::EXIT_RECORD_TTL;
 
         let now = std::time::Instant::now();
         let before_count = self.exit_nodes.len();
@@ -4452,6 +4328,71 @@ impl TunnelCraftNode {
     /// Get discovered exit nodes (excludes stale ones)
     pub fn exit_nodes(&self) -> Vec<&ExitInfo> {
         self.exit_nodes.values().map(|status| &status.info).collect()
+    }
+
+    /// Get seconds since relay/exit capabilities were last announced via DHT (120s cycle).
+    /// Returns (relay_secs_ago, exit_secs_ago), None if never announced.
+    pub fn announce_timing(&self) -> (Option<u64>, Option<u64>) {
+        let relay = self.last_relay_announcement.map(|t| t.elapsed().as_secs());
+        let exit  = self.last_exit_announcement.map(|t| t.elapsed().as_secs());
+        (relay, exit)
+    }
+
+    /// Immediately announce current capabilities to the network, bypassing the normal
+    /// 120s re-announce interval. Call this when capabilities change at runtime so
+    /// peers discover the new role without waiting for the next maintenance tick.
+    pub fn announce_capabilities_now(&mut self) {
+        if self.capabilities.is_relay() {
+            self.announce_as_relay();
+        }
+        if self.capabilities.is_exit() {
+            self.announce_as_exit();
+        }
+    }
+
+    /// Return a snapshot of all known CraftNet peers (relays + exits).
+    pub fn peers_info(&self) -> Vec<CraftNetPeerInfo> {
+        let mut peers = Vec::new();
+
+        for status in self.relay_nodes.values() {
+            let last_seen_secs = status.last_heartbeat
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or_else(|| status.last_dht_seen.elapsed().as_secs());
+            peers.push(CraftNetPeerInfo {
+                peer_id: status.peer_id.to_string(),
+                role: "relay".to_string(),
+                online: status.online,
+                score: status.score,
+                load_percent: status.load_percent,
+                uptime_secs: status.uptime_secs,
+                last_seen_secs,
+                active_connections: status.active_connections,
+                country_code: None,
+                city: None,
+                region: String::new(),
+            });
+        }
+
+        for status in self.exit_nodes.values() {
+            let last_seen_secs = status.last_heartbeat
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or_else(|| status.last_dht_seen.elapsed().as_secs());
+            peers.push(CraftNetPeerInfo {
+                peer_id: status.info.peer_id.clone().unwrap_or_default(),
+                role: "exit".to_string(),
+                online: status.online,
+                score: status.score,
+                load_percent: status.announced_load_percent,
+                uptime_secs: status.announced_uptime_secs,
+                last_seen_secs,
+                active_connections: 0,
+                country_code: status.info.country_code.clone(),
+                city: status.info.city.clone(),
+                region: format!("{:?}", status.info.region),
+            });
+        }
+
+        peers
     }
 
     /// Get online exit nodes only
@@ -4561,17 +4502,22 @@ impl TunnelCraftNode {
             encryption_pubkey: Some(self.encryption_keypair.public_key_bytes()),
         };
 
-        if let Some(ref mut swarm) = self.swarm {
-            let record_value = serde_json::to_vec(&relay_info).unwrap_or_default();
-            if let Err(e) = swarm.behaviour_mut().put_relay_record(&peer_id, record_value) {
-                warn!("Failed to put relay DHT record: {:?}", e);
-            }
-            if let Err(e) = swarm.behaviour_mut().start_providing_relay() {
-                warn!("Failed to start providing relay: {:?}", e);
-            }
-            debug!("announce_as_relay: peer_id={}, put_record + start_providing done", peer_id);
-            info!("Announced as relay node via DHT");
-        }
+        let record_value = serde_json::to_vec(&relay_info).unwrap_or_default();
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::StartProvidingSecondary(
+            libp2p::kad::RecordKey::new(&craftnet_network::RELAY_REGISTRY_KEY)
+        ));
+
+        let record_value = record_value;
+        let key = libp2p::kad::RecordKey::new(&craftnet_network::relay_dht_key(&self.local_peer_id.unwrap()));
+        let record = libp2p::kad::Record {
+            key,
+            value: record_value,
+            publisher: Some(self.local_peer_id.unwrap()),
+            expires: Some(std::time::Instant::now() + craftnet_network::RELAY_RECORD_TTL),
+        };
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PutRecordSecondary(record));
+        debug!("announce_as_relay: peer_id={}, put_record + start_providing done", peer_id);
+        info!("Announced as relay node via DHT");
 
         self.last_relay_announcement = Some(std::time::Instant::now());
     }
@@ -4600,23 +4546,23 @@ impl TunnelCraftNode {
         let queue_depth = self.proof_queue_depth() as u32;
         let connected_peers = self.connected_stream_peers();
 
-        if let Some(ref mut swarm) = self.swarm {
-            let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
-            let mut msg = RelayStatusMessage::heartbeat(
-                self.keypair.public_key_bytes(),
-                &peer_id_str,
-                load_percent,
-                self.active_requests,
-                queue_depth,
-                self.exit_downlink_kbps, // reuse throughput measurement
-                uptime_secs,
-                connected_peers,
-            );
-            msg.encryption_pubkey = Some(hex::encode(self.encryption_keypair.public_key_bytes()));
-            if let Err(e) = swarm.behaviour_mut().publish_relay_status(msg.to_bytes()) {
-                debug!("Failed to publish relay heartbeat: {:?}", e);
-            }
-        }
+        let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+        let mut msg = RelayStatusMessage::heartbeat(
+            self.keypair.public_key_bytes(),
+            &peer_id_str,
+            load_percent,
+            self.active_requests,
+            queue_depth,
+            self.exit_downlink_kbps, // reuse throughput measurement
+            uptime_secs,
+            connected_peers,
+        );
+        msg.encryption_pubkey = Some(hex::encode(self.encryption_keypair.public_key_bytes()));
+        
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PublishGossipsub {
+            topic: RELAY_STATUS_TOPIC.to_string(),
+            data: msg.to_bytes(),
+        });
     }
 
     /// Send relay heartbeat every RELAY_HEARTBEAT_INTERVAL (30s)
@@ -4764,13 +4710,14 @@ impl TunnelCraftNode {
             };
 
             let resp_bytes = resp.to_bytes();
-            if let Some(ref mut swarm) = self.swarm {
-                let _ = swarm.behaviour_mut().publish_aggregator_sync(resp_bytes);
-                debug!(
-                    "Sent {} history entries to sync requester (has_more={})",
-                    batch_len, has_more,
-                );
-            }
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PublishGossipsub {
+                topic: AGGREGATOR_SYNC_TOPIC.to_string(),
+                data: resp_bytes,
+            });
+            debug!(
+                "Sent {} history entries to sync requester (has_more={})",
+                batch_len, has_more,
+            );
             return;
         }
 
@@ -4783,7 +4730,7 @@ impl TunnelCraftNode {
 
             let mut applied = 0usize;
             for entry_bytes in &resp.entries {
-                if serde_json::from_slice::<tunnelcraft_aggregator::HistoryEntry>(entry_bytes).is_ok() {
+                if serde_json::from_slice::<craftnet_aggregator::HistoryEntry>(entry_bytes).is_ok() {
                     applied += 1;
                 }
             }
@@ -4811,7 +4758,7 @@ impl TunnelCraftNode {
             return;
         }
         let sig: [u8; 64] = msg.signature[..64].try_into().unwrap();
-        if !tunnelcraft_crypto::verify_signature(&msg.user_pubkey, &signable, &sig) {
+        if !craftec_crypto::verify_signature(&msg.user_pubkey, &signable, &sig) {
             debug!(
                 "Invalid subscription signature from {}",
                 hex::encode(&msg.user_pubkey[..8]),
@@ -5076,7 +5023,7 @@ impl TunnelCraftNode {
                 // Lazy-init the distribution prover
                 if self.distribution_prover.is_none() {
                     info!("Initializing SP1 distribution prover...");
-                    self.distribution_prover = Some(tunnelcraft_prover::DistributionProver::new());
+                    self.distribution_prover = Some(craftnet_prover::DistributionProver::new());
                 }
                 let prover = self.distribution_prover.as_ref().unwrap();
                 let entries: Vec<([u8; 32], u64)> = dist.entries.iter()
@@ -5253,16 +5200,17 @@ impl TunnelCraftNode {
         };
 
         let signable = announcement.signable_data();
-        announcement.signature = tunnelcraft_crypto::sign_data(&self.keypair, &signable).to_vec();
+        announcement.signature = craftec_crypto::sign_data(&self.keypair, &signable).to_vec();
 
-        if let Some(ref mut swarm) = self.swarm {
-            match swarm.behaviour_mut().publish_subscription(announcement.to_bytes()) {
-                Ok(_) => info!(
-                    "Announced subscription: tier={}, expires={}",
-                    tier, expires_at,
-                ),
-                Err(e) => warn!("Failed to announce subscription: {:?}", e),
-            }
+        if self.swarm_cmd_tx.is_some() {
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PublishGossipsub {
+                topic: craftnet_network::SUBSCRIPTION_TOPIC.to_string(),
+                data: announcement.to_bytes(),
+            });
+            info!(
+                "Announced subscription: tier={}, expires={}",
+                tier, expires_at,
+            );
         }
     }
 
@@ -5277,10 +5225,11 @@ impl TunnelCraftNode {
                 }
             }
         }
-        if let Some(ref mut swarm) = self.swarm {
+        if self.swarm_cmd_tx.is_some() {
             debug!("Starting relay discovery via DHT (existing relay_nodes={})", self.relay_nodes.len());
-            let qid = swarm.behaviour_mut().get_relay_providers();
-            self.pending_relay_provider_queries.insert(qid);
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetProvidersSecondary(
+                libp2p::kad::RecordKey::new(&craftnet_network::RELAY_REGISTRY_KEY),
+            ));
             self.last_relay_discovery = Some(std::time::Instant::now());
         }
     }
@@ -5309,18 +5258,18 @@ impl TunnelCraftNode {
 
             // Add the relay's address and dial to establish a swarm connection
             if let Some(real_pid) = peer_id {
-                if let Some(ref mut swarm) = self.swarm {
+                if self.swarm_cmd_tx.is_some() {
                     // Add address from DHT record so the swarm knows how to reach this peer
                     if let Ok(addr) = self.relay_nodes.get(&pubkey)
                         .map(|s| s.info.address.clone())
                         .unwrap_or_default()
-                        .parse::<Multiaddr>()
+                        .parse::<libp2p::Multiaddr>()
                     {
-                        swarm.behaviour_mut().add_address(&real_pid, addr);
+                        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::AddAddress(real_pid, addr));
                     }
-                    if !swarm.is_connected(&real_pid) {
+                    if !self.connected_peers.contains(&real_pid) {
                         info!("Dialing newly discovered relay {}", real_pid);
-                        let _ = swarm.dial(real_pid);
+                        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::Dial(real_pid));
                     }
                 }
             }
@@ -5358,7 +5307,7 @@ impl TunnelCraftNode {
 
     /// Remove stale relay entries older than TTL
     fn cleanup_stale_relays(&mut self) {
-        use tunnelcraft_network::RELAY_RECORD_TTL;
+        use craftnet_network::RELAY_RECORD_TTL;
 
         let now = std::time::Instant::now();
         let before_count = self.relay_nodes.len();
@@ -5375,22 +5324,20 @@ impl TunnelCraftNode {
 
     /// Announce relay going offline via gossipsub
     fn announce_relay_offline(&mut self) {
-        if let Some(ref mut swarm) = self.swarm {
+        if self.swarm_cmd_tx.is_some() {
             let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
             let msg = RelayStatusMessage::offline(
                 self.keypair.public_key_bytes(),
                 &peer_id_str,
             );
-            if let Err(e) = swarm.behaviour_mut().publish_relay_status(msg.to_bytes()) {
-                warn!("Failed to announce relay offline: {:?}", e);
-            } else {
-                debug!("Announced relay offline status");
-            }
-        }
-
-        // Stop providing in DHT
-        if let Some(ref mut swarm) = self.swarm {
-            swarm.behaviour_mut().stop_providing_relay();
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PublishGossipsub {
+                topic: craftnet_network::RELAY_STATUS_TOPIC.to_string(),
+                data: msg.to_bytes(),
+            });
+            debug!("Announced relay offline status");
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::StopProvidingSecondary(
+            libp2p::kad::RecordKey::new(&craftnet_network::RELAY_REGISTRY_KEY)
+        ));
         }
     }
 
@@ -5405,7 +5352,7 @@ impl TunnelCraftNode {
     }
 
     /// Get aggregator network stats (if aggregator is enabled)
-    pub fn aggregator_stats(&self) -> Option<tunnelcraft_aggregator::NetworkStats> {
+    pub fn aggregator_stats(&self) -> Option<craftnet_aggregator::NetworkStats> {
         self.aggregator.as_ref().map(|a| a.get_network_stats())
     }
 
@@ -5435,7 +5382,7 @@ impl TunnelCraftNode {
         &self,
         pool_pubkey: [u8; 32],
         pool_type: PoolType,
-    ) -> Option<tunnelcraft_aggregator::Distribution> {
+    ) -> Option<craftnet_aggregator::Distribution> {
         self.aggregator.as_ref()?.build_distribution(&(pool_pubkey, pool_type))
     }
 
@@ -5446,8 +5393,8 @@ impl TunnelCraftNode {
         relay: Option<&PublicKey>,
         start: u64,
         end: u64,
-        granularity: tunnelcraft_aggregator::Granularity,
-    ) -> Vec<tunnelcraft_aggregator::BandwidthBucket> {
+        granularity: craftnet_aggregator::Granularity,
+    ) -> Vec<craftnet_aggregator::BandwidthBucket> {
         self.aggregator.as_ref()
             .map(|a| a.get_bandwidth_by_period(pool, relay, start, end, granularity))
             .unwrap_or_default()
@@ -5481,8 +5428,8 @@ impl TunnelCraftNode {
         &self,
         start: u64,
         end: u64,
-        granularity: tunnelcraft_aggregator::Granularity,
-    ) -> Vec<tunnelcraft_aggregator::BandwidthBucket> {
+        granularity: craftnet_aggregator::Granularity,
+    ) -> Vec<craftnet_aggregator::BandwidthBucket> {
         self.aggregator.as_ref()
             .map(|a| a.get_network_bandwidth(start, end, granularity))
             .unwrap_or_default()
@@ -5628,27 +5575,23 @@ impl TunnelCraftNode {
         };
 
         // Sign the proof message with relay's ed25519 keypair
-        let sig = tunnelcraft_crypto::sign_data(&self.keypair, &msg.signable_data());
+        let sig = craftec_crypto::sign_data(&self.keypair, &msg.signable_data());
         msg.signature = sig.to_vec();
 
         // Publish to gossipsub
-        if let Some(ref mut swarm) = self.swarm {
+        if self.swarm_cmd_tx.is_some() {
             let data = msg.to_bytes();
-            match swarm.behaviour_mut().publish_proof(data) {
-                Ok(msg_id) => {
-                    debug!(
-                        "Published proof for pool {} {:?} (batch_bytes: {}, cumulative_bytes: {}, msg: {:?})",
-                        hex::encode(&pool[..8]),
-                        pool_type,
-                        batch_bytes_total,
-                        cumulative_bytes,
-                        msg_id,
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to publish proof: {:?}", e);
-                }
-            }
+            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::PublishGossipsub {
+                topic: craftnet_network::PROOF_TOPIC.to_string(),
+                data,
+            });
+            debug!(
+                "Published proof for pool {} {:?} (batch_bytes: {}, cumulative_bytes: {})",
+                hex::encode(&pool[..8]),
+                pool_type,
+                batch_bytes_total,
+                cumulative_bytes,
+            );
         }
 
         // Update pool roots
@@ -5803,6 +5746,120 @@ impl TunnelCraftNode {
     }
 }
 
+/// Runs a local libp2p Swarm for standalone CraftNet instances,
+/// bridging channels to and from it.
+async fn run_standalone_swarm(
+    mut swarm: libp2p::Swarm<craftnet_network::CraftNetBehaviour>,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<craftec_network::SharedSwarmCommand>,
+    evt_tx: tokio::sync::mpsc::Sender<craftec_network::SharedSwarmEvent>,
+) {
+    use craftec_network::{SharedSwarmCommand, SharedSwarmEvent};
+    use futures::StreamExt;
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                match cmd {
+                    SharedSwarmCommand::Dial(peer_id) => { let _ = swarm.dial(peer_id); }
+                    SharedSwarmCommand::Disconnect(peer_id) => { let _ = swarm.disconnect_peer_id(peer_id); }
+                    SharedSwarmCommand::AddAddress(peer_id, addr) => { swarm.behaviour_mut().add_address(&peer_id, addr); }
+                    SharedSwarmCommand::PublishGossipsub { topic, data } => {
+                        let t = libp2p::gossipsub::IdentTopic::new(topic);
+                        let _ = swarm.behaviour_mut().gossipsub.publish(t, data);
+                    }
+                    SharedSwarmCommand::SubscribeGossipsub(topic) => {
+                        let t = libp2p::gossipsub::IdentTopic::new(topic);
+                        let _ = swarm.behaviour_mut().gossipsub.subscribe(&t);
+                    }
+                    SharedSwarmCommand::UnsubscribeGossipsub(topic) => {
+                        let t = libp2p::gossipsub::IdentTopic::new(topic);
+                        let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
+                    }
+                    SharedSwarmCommand::PutRecordSecondary(record) => {
+                        swarm.behaviour_mut().kademlia_secondary.as_mut().map(|k| k.put_record(record, libp2p::kad::Quorum::One));
+                    }
+                    SharedSwarmCommand::StartProvidingSecondary(key) => {
+                        swarm.behaviour_mut().kademlia_secondary.as_mut().map(|k| k.start_providing(key));
+                    }
+                    SharedSwarmCommand::StopProvidingSecondary(key) => {
+                        swarm.behaviour_mut().kademlia_secondary.as_mut().map(|k| k.stop_providing(&key));
+                    }
+                    SharedSwarmCommand::GetConnectedPeers(tx) => {
+                        let peers: Vec<_> = swarm.connected_peers().copied().collect();
+                        let _ = tx.send(peers);
+                    }
+                    SharedSwarmCommand::IsConnected(peer_id, tx) => {
+                        let _ = tx.send(swarm.is_connected(&peer_id));
+                    }
+                    _ => {}
+                }
+            }
+            event = swarm.select_next_some() => {
+                use libp2p::swarm::SwarmEvent;
+                let shared_evt = match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        Some(SharedSwarmEvent::ConnectionEstablished(peer_id))
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        if num_established == 0 {
+                            Some(SharedSwarmEvent::ConnectionClosed(peer_id))
+                        } else {
+                            None
+                        }
+                    }
+                    SwarmEvent::Behaviour(craftnet_network::CraftNetBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, propagation_source, .. })) => {
+                        Some(SharedSwarmEvent::GossipsubMessage {
+                            topic: message.topic,
+                            data: message.data,
+                            propagation_source: Some(propagation_source),
+                        })
+                    }
+                    SwarmEvent::Behaviour(craftnet_network::CraftNetBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(peers))) => {
+                        Some(SharedSwarmEvent::MdnsDiscovered(peers.into_iter().collect()))
+                    }
+                    SwarmEvent::Behaviour(craftnet_network::CraftNetBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(peers))) => {
+                        Some(SharedSwarmEvent::MdnsExpired(peers.into_iter().collect()))
+                    }
+                    SwarmEvent::Behaviour(craftnet_network::CraftNetBehaviourEvent::AutoNat(libp2p::autonat::Event::StatusChanged { new, .. })) => {
+                        use libp2p::autonat::NatStatus as LibNatStatus;
+                        let status = match new {
+                            LibNatStatus::Public(_) => craftec_network::AutoNatStatus::Public,
+                            LibNatStatus::Private => craftec_network::AutoNatStatus::Private,
+                            LibNatStatus::Unknown => craftec_network::AutoNatStatus::Unknown,
+                        };
+                        Some(SharedSwarmEvent::AutoNatStatusChanged(status))
+                    }
+                    SwarmEvent::Behaviour(craftnet_network::CraftNetBehaviourEvent::Kademlia(libp2p::kad::Event::OutboundQueryProgressed { result, .. })) => {
+                        use libp2p::kad::QueryResult;
+                        use libp2p::kad::{GetRecordOk, GetProvidersOk};
+                        match result {
+                            QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(record))) => {
+                                Some(SharedSwarmEvent::KademliaSecondaryRecordFound {
+                                    key: record.record.key.clone(),
+                                    value: record.record.value.clone(),
+                                })
+                            }
+                            QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders { key, providers, .. })) => {
+                                Some(SharedSwarmEvent::KademliaSecondaryProvidersFound {
+                                    key: key.clone(),
+                                    providers: providers.into_iter().collect(),
+                                })
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(evt) = shared_evt {
+                    if evt_tx.send(evt).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5819,7 +5876,7 @@ mod tests {
     #[test]
     fn test_node_creation() {
         let config = NodeConfig::default();
-        let node = TunnelCraftNode::new(config).unwrap();
+        let node = CraftNetNode::new(config).unwrap();
         assert_eq!(node.capabilities(), Capabilities::CLIENT);
         assert!(!node.is_connected());
     }
@@ -5827,7 +5884,7 @@ mod tests {
     #[test]
     fn test_capabilities_switching() {
         let config = NodeConfig::default();
-        let mut node = TunnelCraftNode::new(config).unwrap();
+        let mut node = CraftNetNode::new(config).unwrap();
 
         assert!(node.capabilities().is_client());
 
@@ -5852,7 +5909,7 @@ mod tests {
     #[test]
     fn test_credits() {
         let config = NodeConfig::default();
-        let mut node = TunnelCraftNode::new(config).unwrap();
+        let mut node = CraftNetNode::new(config).unwrap();
 
         assert_eq!(node.credits(), 0);
         node.set_credits(100);

@@ -8,16 +8,14 @@
 //! 5. HTTP request/response serialization
 //! 6. End-to-end: client -> relay(s) -> exit (direct mode)
 
-use tunnelcraft_client::{RequestBuilder, PathHop, OnionPath};
-use tunnelcraft_core::{Shard, OnionSettlement, ExitPayload, ShardType, lease_set::LeaseSet};
-use tunnelcraft_crypto::{
-    SigningKeypair, EncryptionKeypair, build_onion_header, peel_onion_layer,
-    encrypt_routing_tag, decrypt_routing_tag, encrypt_exit_payload,
-    sign_forward_receipt, verify_forward_receipt,
-};
-use tunnelcraft_relay::{RelayHandler, RelayConfig};
-use tunnelcraft_erasure::{ErasureCoder, TOTAL_SHARDS};
-use tunnelcraft_exit::{HttpRequest, HttpResponse};
+use craftnet_client::{RequestBuilder, PathHop, OnionPath};
+use craftnet_core::{Shard, OnionSettlement, ExitPayload, ShardType, lease_set::LeaseSet};
+use craftec_crypto::{SigningKeypair, EncryptionKeypair};
+use craftnet_core::onion_crypto::{build_onion_header, peel_onion_layer, encrypt_routing_tag, decrypt_routing_tag, encrypt_exit_payload};
+use craftnet_core::receipt_crypto::{sign_forward_receipt, verify_forward_receipt};
+use craftnet_relay::{RelayHandler, RelayConfig};
+use craftnet_erasure::{ErasureCoder, TOTAL_SHARDS};
+use craftnet_exit::{HttpRequest, HttpResponse};
 
 // =============================================================================
 // HELPERS
@@ -56,7 +54,7 @@ fn test_build_onion_direct_mode_creates_valid_shards() {
     };
 
     let builder = RequestBuilder::new("GET", "https://example.com")
-        .header("User-Agent", "TunnelCraft-Test");
+        .header("User-Agent", "CraftNet-Test");
 
     let (request_id, shards) = builder
         .build_onion(&keypair, &exit, &[], &empty_lease_set(), [0u8; 32])
@@ -746,7 +744,7 @@ fn test_exit_payload_encrypt_decrypt_roundtrip() {
 
     assert!(encrypted.len() > 32, "Encrypted payload should have ephemeral key + ciphertext");
 
-    let decrypted = tunnelcraft_crypto::decrypt_exit_payload(
+    let decrypted = craftnet_core::onion_crypto::decrypt_exit_payload(
         &exit_enc.secret_key_bytes(),
         &encrypted,
     )
@@ -766,7 +764,7 @@ fn test_exit_payload_encrypt_decrypt_roundtrip() {
 
 #[tokio::test]
 async fn test_complete_direct_mode_flow_client_to_exit() {
-    use tunnelcraft_exit::{ExitHandler, ExitConfig};
+    use craftnet_exit::{ExitHandler, ExitConfig};
 
     let user_keypair = SigningKeypair::generate();
     let exit_signing = SigningKeypair::generate();
@@ -791,7 +789,7 @@ async fn test_complete_direct_mode_flow_client_to_exit() {
 
     // Build onion shards in direct mode
     let builder = RequestBuilder::new("GET", "https://httpbin.org/get")
-        .header("User-Agent", "TunnelCraft-Test");
+        .header("User-Agent", "CraftNet-Test");
 
     let (_request_id, shards) = builder
         .build_onion(&user_keypair, &exit_hop, &[], &empty_lease_set(), [0u8; 32])

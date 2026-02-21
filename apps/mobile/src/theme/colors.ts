@@ -1,5 +1,5 @@
 /**
- * TunnelCraft Color System
+ * CraftNet Color System
  *
  * Three mode-based color schemes that subtly shift the entire UI feel
  */

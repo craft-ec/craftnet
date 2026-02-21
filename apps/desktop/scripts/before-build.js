@@ -15,7 +15,7 @@ exports.default = async function beforeBuild(context) {
   console.log(`Pre-build for ${electronPlatformName} (${arch})`);
 
   const projectRoot = path.resolve(__dirname, '../../..');
-  const daemonPath = path.join(projectRoot, 'target/release/tunnelcraft-daemon');
+  const daemonPath = path.join(projectRoot, 'target/release/craftnet-daemon');
 
   // Check if daemon exists
   if (!fs.existsSync(daemonPath)) {
@@ -23,7 +23,7 @@ exports.default = async function beforeBuild(context) {
     
     try {
       // Build the daemon
-      execSync('cargo build --release -p tunnelcraft-daemon', {
+      execSync('cargo build --release -p craftnet-daemon', {
         cwd: projectRoot,
         stdio: 'inherit',
       });
@@ -54,7 +54,7 @@ async function setupMacOS(context, projectRoot) {
   console.log('Setting up macOS build...');
   
   // Ensure daemon is executable
-  const daemonPath = path.join(projectRoot, 'target/release/tunnelcraft-daemon');
+  const daemonPath = path.join(projectRoot, 'target/release/craftnet-daemon');
   if (fs.existsSync(daemonPath)) {
     fs.chmodSync(daemonPath, '755');
   }
@@ -63,8 +63,8 @@ async function setupMacOS(context, projectRoot) {
 async function setupWindows(context, projectRoot) {
   console.log('Setting up Windows build...');
   
-  // Windows daemon would be tunnelcraft-daemon.exe
-  const daemonPath = path.join(projectRoot, 'target/release/tunnelcraft-daemon.exe');
+  // Windows daemon would be craftnet-daemon.exe
+  const daemonPath = path.join(projectRoot, 'target/release/craftnet-daemon.exe');
   
   if (!fs.existsSync(daemonPath)) {
     console.log('Windows daemon not found. Cross-compilation may be required.');
@@ -75,7 +75,7 @@ async function setupLinux(context, projectRoot) {
   console.log('Setting up Linux build...');
   
   // Ensure daemon is executable
-  const daemonPath = path.join(projectRoot, 'target/release/tunnelcraft-daemon');
+  const daemonPath = path.join(projectRoot, 'target/release/craftnet-daemon');
   if (fs.existsSync(daemonPath)) {
     fs.chmodSync(daemonPath, '755');
   }

@@ -1,13 +1,13 @@
 /**
- * TunnelCraft Context
+ * CraftNet Context
  *
  * Global state management for the VPN/Node functionality.
- * Wired through to native bridge (TunnelCraftVPN) for real operations.
+ * Wired through to native bridge (CraftNetVPN) for real operations.
  */
 
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react';
 import { NodeMode } from '../theme/colors';
-import { TunnelCraftVPN } from '../native/TunnelCraftVPN';
+import { CraftNetVPN } from '../native/CraftNetVPN';
 import { LogService } from '../services/LogService';
 
 // Types matching the Rust UniFFI bindings
@@ -153,16 +153,16 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
 
   // Subscribe to native event listeners
   useEffect(() => {
-    const unsubState = TunnelCraftVPN.onStateChange((state) => {
+    const unsubState = CraftNetVPN.onStateChange((state) => {
       setConnectionState(state as ConnectionState);
     });
 
-    const unsubError = TunnelCraftVPN.onError((error) => {
+    const unsubError = CraftNetVPN.onError((error) => {
       LogService.error('TunnelContext', 'VPN error: ' + error);
       setConnectionState('error');
     });
 
-    const unsubStats = TunnelCraftVPN.onStatsUpdate((nativeStats) => {
+    const unsubStats = CraftNetVPN.onStatsUpdate((nativeStats) => {
       setStats((prev) => ({
         ...prev,
         bytesSent: nativeStats.bytesSent ?? prev.bytesSent,
@@ -171,7 +171,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
     });
 
     // Fetch initial status
-    TunnelCraftVPN.getStatus().then((status) => {
+    CraftNetVPN.getStatus().then((status) => {
       setConnectionState(status.state as ConnectionState);
       if (status.credits) setCredits(status.credits);
     }).catch(() => {
@@ -199,7 +199,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
 
     const pollStats = async () => {
       try {
-        const nodeStats = await TunnelCraftVPN.getStats();
+        const nodeStats = await CraftNetVPN.getStats();
         uptimeRef.current += 5;
         setStats({
           bytesSent: nodeStats.bytesSent ?? 0,
@@ -240,7 +240,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
 
     const pollExits = async () => {
       try {
-        const nativeExits = await TunnelCraftVPN.getAvailableExits();
+        const nativeExits = await CraftNetVPN.getAvailableExits();
         if (nativeExits && nativeExits.length > 0) {
           setAvailableExits(nativeExits.map((exit, idx) => ({
             id: exit.pubkey || String(idx + 1),
@@ -321,7 +321,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
   const connect = useCallback(async () => {
     setConnectionState('connecting');
     try {
-      await TunnelCraftVPN.connect({ privacyLevel });
+      await CraftNetVPN.connect({ privacyLevel });
       setConnectionState('connected');
     } catch (error) {
       LogService.error('TunnelContext', 'Connect failed: ' + error);
@@ -332,7 +332,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
   const disconnect = useCallback(async () => {
     setConnectionState('disconnecting');
     try {
-      await TunnelCraftVPN.disconnect();
+      await CraftNetVPN.disconnect();
       setConnectionState('disconnected');
       setStats(defaultStats);
     } catch (error) {
@@ -351,14 +351,14 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
 
   const setMode = useCallback((newMode: NodeMode) => {
     setModeState(newMode);
-    TunnelCraftVPN.setMode(newMode).catch((err) => {
+    CraftNetVPN.setMode(newMode).catch((err) => {
       LogService.error('TunnelContext', 'setMode failed: ' + err);
     });
   }, []);
 
   const setPrivacyLevel = useCallback((level: PrivacyLevel) => {
     setPrivacyLevelState(level);
-    TunnelCraftVPN.setPrivacyLevel(level).catch((err) => {
+    CraftNetVPN.setPrivacyLevel(level).catch((err) => {
       LogService.error('TunnelContext', 'setPrivacyLevel failed: ' + err);
     });
   }, []);
@@ -366,7 +366,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
   const setExitSelection = useCallback((selection: ExitSelection) => {
     setExitSelectionState(selection);
     const region = selection.region === 'auto' ? 'auto' : selection.region;
-    TunnelCraftVPN.selectExit(
+    CraftNetVPN.selectExit(
       region,
       selection.countryCode,
       undefined,
@@ -377,7 +377,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
 
   const purchaseCredits = useCallback(async (amount: number) => {
     try {
-      const result = await TunnelCraftVPN.purchaseCredits(amount);
+      const result = await CraftNetVPN.purchaseCredits(amount);
       setCredits(result.balance);
     } catch (error) {
       LogService.error('TunnelContext', 'purchaseCredits failed: ' + error);
@@ -385,7 +385,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
   }, []);
 
   const request = useCallback(async (method: string, url: string, body?: string, headers?: Record<string, string>): Promise<{ status: number; body: string }> => {
-    return TunnelCraftVPN.request(method, url, body, headers);
+    return CraftNetVPN.request(method, url, body, headers);
   }, []);
 
   const value: TunnelContextType = {

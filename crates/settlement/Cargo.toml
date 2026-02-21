@@ -1,5 +1,5 @@
 [package]
-name = "tunnelcraft-settlement"
+name = "craftnet-settlement"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,8 +9,8 @@ license.workspace = true
 # Force vendored OpenSSL for static linking (solana-sdk pulls in openssl)
 openssl = { workspace = true }
 
-tunnelcraft-core = { workspace = true }
-tunnelcraft-prover = { workspace = true }
+craftnet-core = { workspace = true }
+craftnet-prover = { workspace = true }
 solana-program = { workspace = true }
 solana-client = "2.1"
 solana-sdk = "2.1"

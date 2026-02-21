@@ -13,17 +13,16 @@
 
 use std::sync::Arc;
 
-use tunnelcraft_client::{RequestBuilder, PathHop};
-use tunnelcraft_core::{Shard, lease_set::LeaseSet};
-use tunnelcraft_crypto::{
-    SigningKeypair, EncryptionKeypair,
-    build_onion_header, encrypt_routing_tag, verify_forward_receipt,
-};
-use tunnelcraft_core::OnionSettlement;
-use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
-use tunnelcraft_exit::{ExitConfig, ExitHandler};
-use tunnelcraft_relay::RelayHandler;
-use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
+use craftnet_client::{RequestBuilder, PathHop};
+use craftnet_core::{Shard, lease_set::LeaseSet};
+use craftec_crypto::{SigningKeypair, EncryptionKeypair};
+use craftnet_core::onion_crypto::{build_onion_header, encrypt_routing_tag};
+use craftnet_core::receipt_crypto::{verify_forward_receipt};
+use craftnet_core::OnionSettlement;
+use craftnet_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
+use craftnet_exit::{ExitConfig, ExitHandler};
+use craftnet_relay::RelayHandler;
+use craftnet_settlement::{SettlementClient, SettlementConfig};
 
 /// Direct mode: client builds onion shards with no relay chain, feeds directly to exit.
 ///
@@ -68,7 +67,7 @@ async fn test_full_tunnel_roundtrip_direct() {
 
     // === Step 1: Client creates onion request shards ===
     let (request_id, shards) = RequestBuilder::new("GET", "https://httpbin.org/get")
-        .header("User-Agent", "TunnelCraft-E2E-Test")
+        .header("User-Agent", "CraftNet-E2E-Test")
         .build_onion(
             &user_keypair,
             &exit_hop,
@@ -140,9 +139,9 @@ async fn test_exit_settlement_integration() {
     let settlement_client = Arc::new(SettlementClient::new(settlement_config, exit_pubkey));
 
     // Subscribe the user (payment goes into their pool)
-    settlement_client.subscribe(tunnelcraft_settlement::Subscribe {
+    settlement_client.subscribe(craftnet_settlement::Subscribe {
         user_pubkey,
-        tier: tunnelcraft_core::SubscriptionTier::Standard,
+        tier: craftnet_core::SubscriptionTier::Standard,
         payment_amount: 1000,
         duration_secs: 30 * 24 * 3600,
         start_date: 0,
@@ -153,7 +152,7 @@ async fn test_exit_settlement_integration() {
         .expect("Get state should succeed")
         .expect("Subscription should exist");
     assert_eq!(state.pool_balance, 1000);
-    assert_eq!(state.tier, tunnelcraft_core::SubscriptionTier::Standard);
+    assert_eq!(state.tier, craftnet_core::SubscriptionTier::Standard);
 
     // Create exit handler with this settlement client
     let exit_handler = ExitHandler::with_keypair_and_settlement(
@@ -199,7 +198,7 @@ fn test_erasure_reconstruction_from_subset() {
     };
 
     let (_request_id, shards) = RequestBuilder::new("POST", "https://example.com/api")
-        .body(b"Hello, TunnelCraft!".to_vec())
+        .body(b"Hello, CraftNet!".to_vec())
         .build_onion(
             &user_keypair,
             &exit_hop,
@@ -448,19 +447,19 @@ async fn test_relay_exit_shard_roundtrip() {
     ).unwrap();
 
     // === Build PathHops ===
-    let exit_hop = tunnelcraft_client::PathHop {
+    let exit_hop = craftnet_client::PathHop {
         peer_id: b"exit_peer".to_vec(),
         signing_pubkey: exit_signing.public_key_bytes(),
         encryption_pubkey: exit_enc.public_key_bytes(),
     };
 
-    let relay_hop = tunnelcraft_client::PathHop {
+    let relay_hop = craftnet_client::PathHop {
         peer_id: b"relay_peer".to_vec(),
         signing_pubkey: relay_signing.public_key_bytes(),
         encryption_pubkey: relay_enc.public_key_bytes(),
     };
 
-    let onion_path = tunnelcraft_client::OnionPath {
+    let onion_path = craftnet_client::OnionPath {
         hops: vec![relay_hop],
         exit: exit_hop.clone(),
     };
@@ -615,7 +614,7 @@ async fn test_client_relay_exit_integration() {
         encryption_pubkey: relay_enc.public_key_bytes(),
     };
 
-    let onion_path = tunnelcraft_client::OnionPath {
+    let onion_path = craftnet_client::OnionPath {
         hops: vec![relay_hop],
         exit: exit_hop.clone(),
     };

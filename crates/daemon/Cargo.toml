@@ -1,16 +1,16 @@
 [package]
-name = "tunnelcraft-daemon"
+name = "craftnet-daemon"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-tunnelcraft-core = { workspace = true }
-tunnelcraft-client = { workspace = true }
-tunnelcraft-settlement = { workspace = true }
-tunnelcraft-settings = { workspace = true }
-tunnelcraft-keystore = { workspace = true }
+craftnet-core = { workspace = true }
+craftnet-client = { workspace = true }
+craftnet-settlement = { workspace = true }
+craftec-settings = { workspace = true }
+craftec-keystore = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

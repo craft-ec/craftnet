@@ -1,13 +1,14 @@
 [package]
-name = "tunnelcraft-network"
+name = "craftnet-network"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-tunnelcraft-core = { workspace = true }
-tunnelcraft-crypto = { workspace = true }
+craftnet-core = { workspace = true }
+craftec-crypto = { workspace = true }
+craftec-network = { workspace = true }
 libp2p = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

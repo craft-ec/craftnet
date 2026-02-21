@@ -26,8 +26,8 @@
 //! ```
 
 use std::collections::HashMap;
-use tunnelcraft_core::{Id, SubscriptionTier};
-use tunnelcraft_erasure::TOTAL_SHARDS;
+use craftnet_core::{Id, SubscriptionTier};
+use craftnet_erasure::TOTAL_SHARDS;
 
 /// Cost per shard per hop (in credit units)
 const COST_PER_SHARD_HOP: u64 = 1;

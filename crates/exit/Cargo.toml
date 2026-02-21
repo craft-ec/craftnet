@@ -1,15 +1,15 @@
 [package]
-name = "tunnelcraft-exit"
+name = "craftnet-exit"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-tunnelcraft-core = { workspace = true }
-tunnelcraft-crypto = { workspace = true }
-tunnelcraft-erasure = { workspace = true }
-tunnelcraft-settlement = { workspace = true }
+craftnet-core = { workspace = true }
+craftec-crypto = { workspace = true }
+craftnet-erasure = { workspace = true }
+craftnet-settlement = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

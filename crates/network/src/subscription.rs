@@ -1,7 +1,7 @@
 //! Subscription gossipsub message types
 //!
 //! Users announce their subscription status via the
-//! `tunnelcraft/subscriptions/1.0.0` gossipsub topic. Relays cache these
+//! `craftnet/subscriptions/1.0.0` gossipsub topic. Relays cache these
 //! announcements and periodically verify them on-chain in batches.
 //! Subscribed users get priority routing; unsubscribed get best-effort.
 

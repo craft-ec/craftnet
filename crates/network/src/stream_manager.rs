@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 /// Cooldown after a failed outbound open before retrying (seconds).
 const OPEN_RETRY_COOLDOWN_SECS: u64 = 1;
 
-use tunnelcraft_core::{ForwardReceipt, Shard};
+use craftnet_core::{ForwardReceipt, Shard};
 
 use crate::protocol::{
     read_frame, write_ack_frame, write_nack_frame, write_shard_frame, StreamFrame,
@@ -812,7 +812,7 @@ impl StreamManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnelcraft_core::Shard;
+    use craftnet_core::Shard;
 
     fn test_peer() -> PeerId {
         PeerId::random()

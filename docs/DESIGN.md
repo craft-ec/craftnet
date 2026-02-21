@@ -1,8 +1,8 @@
-# TunnelCraft: P2P Incentivized VPN
+# CraftNet: P2P Incentivized VPN
 
 ## Executive Summary
 
-TunnelCraft is a decentralized, trustless VPN network. It is **private but not anonymous** — no single node sees the full picture, and decentralization eliminates the single trust point that centralized VPNs require.
+CraftNet is a decentralized, trustless VPN network. It is **private but not anonymous** — no single node sees the full picture, and decentralization eliminates the single trust point that centralized VPNs require.
 
 **Key Innovation**: Privacy through fragmentation + decentralized relay operators + trustless verification.
 
@@ -61,7 +61,7 @@ L4 TCP tunneling. TLS end-to-end.
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   Browser/App → SOCKS5 proxy (localhost:1080)                │
-│     → TunnelCraft network → Exit node                        │
+│     → CraftNet network → Exit node                        │
 │       → Raw TCP connection to destination                    │
 │                                                              │
 │   Exit sees: host:port + TLS ciphertext                      │
@@ -80,7 +80,7 @@ L4 TCP tunneling. TLS end-to-end.
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   Client builds HTTP request shards                          │
-│     → TunnelCraft network → Exit node                        │
+│     → CraftNet network → Exit node                        │
 │       → Exit fetches URL via reqwest                         │
 │                                                              │
 │   Exit sees: full HTTP request (URL, headers, body)          │
@@ -326,7 +326,7 @@ L4 TCP tunneling. TLS end-to-end.
 |---------|------|-------------|-----------------|-------------------------|-------------|
 | NordVPN/ExpressVPN | 1 | Yes | Yes (HTTPS) | No — provider sees all | Trust the company |
 | Mullvad multi-hop | 2 | Yes | Yes | Split — same company | Trust the company |
-| **TunnelCraft** | **2+** | **No** | **Yes (TLS e2e)** | **Split — independent operators** | **No single trust point** |
+| **CraftNet** | **2+** | **No** | **Yes (TLS e2e)** | **Split — independent operators** | **No single trust point** |
 | Tor | 3 | No | Yes | Yes — onion encryption | No trust needed |
 | Nym | 3 | No | Yes | Yes + timing obfuscation | No trust needed |
 
@@ -489,7 +489,7 @@ Redundancy ratio: 1.67x
 
 ### NAT Traversal: Circuit Relay
 
-TunnelCraft uses circuit relay (libp2p) — works on ALL NAT types including symmetric NAT (mobile carriers). NATted nodes connect outbound to public relays, and all traffic flows through established connections.
+CraftNet uses circuit relay (libp2p) — works on ALL NAT types including symmetric NAT (mobile carriers). NATted nodes connect outbound to public relays, and all traffic flows through established connections.
 
 ---
 
@@ -501,7 +501,7 @@ App traffic
     → VPN extension reads IP packets
       → tun2socks reassembles TCP, connects to SOCKS5
         → SOCKS5 proxy (Rust, localhost:1080)
-          → TunnelCraft network
+          → CraftNet network
 ```
 
 The SOCKS5 proxy runs inside the Rust library. The uniffi surface is just `start(port)` / `stop()` / `status()`. No uniffi bindings needed for SOCKS5 itself.

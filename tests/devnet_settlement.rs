@@ -13,8 +13,8 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
-use tunnelcraft_prover::MerkleTree;
-use tunnelcraft_settlement::{
+use craftnet_prover::MerkleTree;
+use craftnet_settlement::{
     light::{derive_claim_receipt_address, PhotonClient, ADDRESS_TREE_V2},
     ClaimRewards, EpochPhase, PostDistribution, SettlementClient,
     SettlementConfig, Subscribe,
@@ -64,7 +64,7 @@ fn devnet_rpc() -> RpcClient {
 // Test 1: Program existence (no env vars needed)
 // ============================================================================
 
-/// Verifies the TunnelCraft settlement program is deployed on devnet and executable.
+/// Verifies the CraftNet settlement program is deployed on devnet and executable.
 /// Also checks that the devnet USDC mint account exists.
 #[tokio::test]
 #[ignore]
@@ -85,7 +85,7 @@ async fn test_devnet_program_exists() -> anyhow::Result<()> {
     );
 
     // Verify USDC mint exists on devnet
-    let usdc_mint = Pubkey::new_from_array(tunnelcraft_settlement::USDC_MINT_DEVNET);
+    let usdc_mint = Pubkey::new_from_array(craftnet_settlement::USDC_MINT_DEVNET);
     println!("Checking USDC mint: {}", usdc_mint);
 
     let mint_account = rpc.get_account(&usdc_mint).await?;
@@ -181,7 +181,7 @@ async fn test_devnet_subscribe() -> anyhow::Result<()> {
     let tx_sig = client
         .subscribe(Subscribe {
             user_pubkey,
-            tier: tunnelcraft_core::SubscriptionTier::Standard,
+            tier: craftnet_core::SubscriptionTier::Standard,
             payment_amount: payment,
             duration_secs: 120, // 2 minutes for testing
             start_date: 0,
@@ -196,7 +196,7 @@ async fn test_devnet_subscribe() -> anyhow::Result<()> {
         .await?
         .expect("subscription should exist after subscribe()");
 
-    assert_eq!(state.tier, tunnelcraft_core::SubscriptionTier::Standard);
+    assert_eq!(state.tier, craftnet_core::SubscriptionTier::Standard);
     assert!(state.pool_balance > 0, "Pool should have balance");
     assert!(state.expires_at > state.created_at, "expires_at > created_at");
 

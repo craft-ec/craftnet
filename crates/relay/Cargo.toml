@@ -1,14 +1,14 @@
 [package]
-name = "tunnelcraft-relay"
+name = "craftnet-relay"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-tunnelcraft-core = { workspace = true }
-tunnelcraft-crypto = { workspace = true }
-tunnelcraft-settlement = { workspace = true }
+craftnet-core = { workspace = true }
+craftec-crypto = { workspace = true }
+craftnet-settlement = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -1,22 +1,22 @@
 [package]
-name = "tunnelcraft-cli"
+name = "craftnet-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "tunnelcraft"
+name = "craftnet"
 path = "src/main.rs"
 
 [dependencies]
-tunnelcraft-app = { workspace = true }
-tunnelcraft-client = { workspace = true }
-tunnelcraft-core = { workspace = true }
-tunnelcraft-daemon = { workspace = true }
-tunnelcraft-network = { workspace = true }
-tunnelcraft-keystore = { workspace = true }
-tunnelcraft-ipc-client = { workspace = true }
+craftec-app = { workspace = true }
+craftnet-client = { workspace = true }
+craftnet-core = { workspace = true }
+craftnet-daemon = { workspace = true }
+craftnet-network = { workspace = true }
+craftec-keystore = { workspace = true }
+craftnet-ipc-client = { workspace = true }
 tokio = { workspace = true }
 libp2p = { workspace = true }
 clap = { version = "4.4", features = ["derive"] }

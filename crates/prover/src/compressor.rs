@@ -6,7 +6,7 @@
 //! thousands of receipts).
 
 use sha2::{Digest, Sha256};
-use tunnelcraft_core::ForwardReceipt;
+use craftnet_core::ForwardReceipt;
 
 use crate::merkle::MerkleTree;
 use crate::traits::{CompressedBatch, ReceiptCompression, CompressionError};

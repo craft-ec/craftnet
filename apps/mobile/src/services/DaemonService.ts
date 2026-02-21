@@ -20,7 +20,7 @@ import { LogService } from './LogService';
 const TAG = 'DaemonService';
 
 // Native module interface
-interface TunnelCraftDaemon {
+interface CraftNetDaemon {
   // Connection
   connect(config: ConnectionConfig): Promise<void>;
   disconnect(): Promise<void>;
@@ -155,7 +155,7 @@ interface DaemonEvents {
 }
 
 class DaemonServiceClass {
-  private daemon: TunnelCraftDaemon | null = null;
+  private daemon: CraftNetDaemon | null = null;
   private eventEmitter: NativeEventEmitter | null = null;
   private listeners: Map<string, Set<Function>> = new Map();
   private isInitialized = false;
@@ -178,11 +178,11 @@ class DaemonServiceClass {
 
     try {
       // Get native module
-      const { TunnelCraftDaemon: NativeDaemon } = NativeModules;
+      const { CraftNetDaemon: NativeDaemon } = NativeModules;
 
       if (!NativeDaemon) {
-        LogService.error(TAG, 'Native module TunnelCraftDaemon not found!');
-        throw new Error('TunnelCraftDaemon native module not available. Ensure the app is built with native modules.');
+        LogService.error(TAG, 'Native module CraftNetDaemon not found!');
+        throw new Error('CraftNetDaemon native module not available. Ensure the app is built with native modules.');
       }
 
       LogService.info(TAG, 'Native module found, using real daemon');
@@ -527,7 +527,7 @@ export const DaemonService = new DaemonServiceClass();
 export type { ConnectionConfig, ConnectionState, DaemonEvents, NodePoints, ClaimHistory, ClaimResult, SplitTunnelMode, SplitTunnelRule, SplitTunnelConfig };
 export type { SettlementConfig } from '../config/settlement';
 export {
-  TUNNELCRAFT_PROGRAM_ID,
+  CRAFTNET_PROGRAM_ID,
   SETTLEMENT_PROGRAM_ID,
   USDC_MINT_DEVNET,
   USDC_MINT_MAINNET,

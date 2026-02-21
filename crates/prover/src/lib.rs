@@ -1,4 +1,4 @@
-//! TunnelCraft Prover
+//! CraftNet Prover
 //!
 //! Binary Merkle tree, receipt compression, and distribution proof generation.
 //!

@@ -1,6 +1,6 @@
-//! TunnelCraft Client SDK
+//! CraftNet Client SDK
 //!
-//! Client-side SDK for connecting to the TunnelCraft network.
+//! Client-side SDK for connecting to the CraftNet network.
 //!
 //! ## Overview
 //!
@@ -13,7 +13,7 @@
 //!
 //! ## Unified Node
 //!
-//! The `TunnelCraftNode` is the recommended way to use this SDK.
+//! The `CraftNetNode` is the recommended way to use this SDK.
 //! Node behavior is controlled via composable `Capabilities` bitflags:
 //! - `CLIENT`     — Route personal VPN traffic (spend credits)
 //! - `RELAY`      — Forward shards for others (earn credits)
@@ -23,14 +23,14 @@
 //! ## Example
 //!
 //! ```ignore
-//! use tunnelcraft_client::{TunnelCraftNode, NodeConfig, Capabilities};
+//! use craftnet_client::{CraftNetNode, NodeConfig, Capabilities};
 //!
 //! // Create a node that routes VPN traffic and relays for others
 //! let config = NodeConfig {
 //!     capabilities: Capabilities::CLIENT | Capabilities::RELAY,
 //!     ..Default::default()
 //! };
-//! let mut node = TunnelCraftNode::new(config)?;
+//! let mut node = CraftNetNode::new(config)?;
 //! node.start().await?;
 //!
 //! // Make an HTTP request through the tunnel
@@ -52,9 +52,9 @@ pub mod socks5;
 mod tunnel;
 
 // Unified node (the single networking implementation)
-pub use node::{NodeConfig, NodeStats, NodeStatus, CompressionStatus, TunnelCraftNode};
+pub use node::{NodeConfig, NodeStats, NodeStatus, CompressionStatus, CraftNetNode, SwarmHandles};
 // Re-export Capabilities from core
-pub use tunnelcraft_core::Capabilities;
+pub use craftnet_core::Capabilities;
 
 // Credit management
 pub use credits::CreditManager;

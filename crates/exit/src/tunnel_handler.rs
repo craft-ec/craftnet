@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use tunnelcraft_core::{Id, PublicKey, TunnelMetadata};
+use craftnet_core::{Id, PublicKey, TunnelMetadata};
 
 use crate::{ExitError, Result};
 
@@ -37,7 +37,7 @@ pub struct TunnelHandler {
 
 impl TunnelHandler {
     /// Create a new tunnel handler
-    pub fn new(_keypair: tunnelcraft_crypto::SigningKeypair) -> Self {
+    pub fn new(_keypair: craftec_crypto::SigningKeypair) -> Self {
         Self {
             sessions: HashMap::new(),
         }

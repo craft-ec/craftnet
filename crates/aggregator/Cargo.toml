@@ -1,16 +1,16 @@
 [package]
-name = "tunnelcraft-aggregator"
+name = "craftnet-aggregator"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-tunnelcraft-core = { workspace = true }
-tunnelcraft-network = { workspace = true }
-tunnelcraft-settlement = { workspace = true }
-tunnelcraft-prover = { workspace = true }
-tunnelcraft-crypto = { workspace = true }
+craftnet-core = { workspace = true }
+craftnet-network = { workspace = true }
+craftnet-settlement = { workspace = true }
+craftnet-prover = { workspace = true }
+craftec-crypto = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

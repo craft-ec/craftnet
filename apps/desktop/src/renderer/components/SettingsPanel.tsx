@@ -183,17 +183,17 @@ export const SettingsPanel: React.FC = () => {
       <div className="settings-section">
         <span className="section-label">About</span>
 
-        <a className="setting-link" href="https://tunnelcraft.app/docs" target="_blank" rel="noreferrer">
+        <a className="setting-link" href="https://craftnet.app/docs" target="_blank" rel="noreferrer">
           Documentation
           <span className="link-arrow">&rsaquo;</span>
         </a>
 
-        <a className="setting-link" href="https://github.com/craftec/tunnelcraft/discussions" target="_blank" rel="noreferrer">
+        <a className="setting-link" href="https://github.com/craftec/craftnet/discussions" target="_blank" rel="noreferrer">
           Community
           <span className="link-arrow">&rsaquo;</span>
         </a>
 
-        <a className="setting-link" href="https://github.com/craftec/tunnelcraft/issues" target="_blank" rel="noreferrer">
+        <a className="setting-link" href="https://github.com/craftec/craftnet/issues" target="_blank" rel="noreferrer">
           Report Issue
           <span className="link-arrow">&rsaquo;</span>
         </a>

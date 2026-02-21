@@ -1,4 +1,4 @@
-//! TunnelCraft Relay
+//! CraftNet Relay
 //!
 //! Onion relay logic — peels one encrypted layer per hop to learn the next peer.
 //! No plaintext routing metadata is visible. Gateway mode delivers shards to

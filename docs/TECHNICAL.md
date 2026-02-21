@@ -1,4 +1,4 @@
-# TunnelCraft: Technical Specification
+# CraftNet: Technical Specification
 
 ## Technology Stack
 
@@ -333,7 +333,7 @@ pub struct NodeAccount {
 
 ```rust
 #[program]
-pub mod tunnelcraft {
+pub mod craftnet {
     /// Subscribe — create/renew subscription + fund user pool
     pub fn subscribe(ctx: Context<Subscribe>, tier: u8, payment_amount: u64) -> Result<()>;
 
@@ -423,7 +423,7 @@ pub mod tunnelcraft {
 ## Crate Structure
 
 ```
-tunnelcraft/
+craftnet/
 ├── Cargo.toml
 ├── crates/
 │   ├── core/              # Types, traits, errors
@@ -456,7 +456,7 @@ tunnelcraft/
 │   │   └── client.rs      # Settlement client (mock + live modes)
 │   │
 │   ├── client/            # User client
-│   │   ├── node.rs        # TunnelCraftNode (event loop, shard routing)
+│   │   ├── node.rs        # CraftNetNode (event loop, shard routing)
 │   │   ├── request.rs     # RequestBuilder (HTTP mode)
 │   │   ├── tunnel.rs      # build_tunnel_shards() (tunnel mode)
 │   │   └── socks5.rs      # SOCKS5 proxy server (RFC 1928)
@@ -468,7 +468,7 @@ tunnelcraft/
 │   └── uniffi/            # Mobile FFI bindings
 │
 ├── programs/              # Solana programs
-│   └── tunnelcraft-settlement/
+│   └── craftnet-settlement/
 │
 └── apps/
     ├── cli/               # CLI application

@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum TunnelCraftError {
+pub enum CraftNetError {
     #[error("Destination mismatch: response destination does not match request origin")]
     DestinationMismatch,
 
@@ -60,7 +60,7 @@ pub enum TunnelCraftError {
     Timeout,
 }
 
-pub type Result<T> = std::result::Result<T, TunnelCraftError>;
+pub type Result<T> = std::result::Result<T, CraftNetError>;
 
 #[cfg(test)]
 mod tests {
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_error_display_destination_mismatch() {
-        let err = TunnelCraftError::DestinationMismatch;
+        let err = CraftNetError::DestinationMismatch;
         assert_eq!(
             err.to_string(),
             "Destination mismatch: response destination does not match request origin"
@@ -77,19 +77,19 @@ mod tests {
 
     #[test]
     fn test_error_display_invalid_chain_signature() {
-        let err = TunnelCraftError::InvalidChainSignature(5);
+        let err = CraftNetError::InvalidChainSignature(5);
         assert_eq!(err.to_string(), "Invalid chain signature at index 5");
     }
 
     #[test]
     fn test_error_display_chain_verification_failed() {
-        let err = TunnelCraftError::ChainVerificationFailed("bad signature".to_string());
+        let err = CraftNetError::ChainVerificationFailed("bad signature".to_string());
         assert_eq!(err.to_string(), "Chain verification failed: bad signature");
     }
 
     #[test]
     fn test_error_display_insufficient_shards() {
-        let err = TunnelCraftError::InsufficientShards {
+        let err = CraftNetError::InsufficientShards {
             required: 3,
             available: 2,
         };
@@ -98,97 +98,97 @@ mod tests {
 
     #[test]
     fn test_error_display_shard_reconstruction_failed() {
-        let err = TunnelCraftError::ShardReconstructionFailed("corrupted data".to_string());
+        let err = CraftNetError::ShardReconstructionFailed("corrupted data".to_string());
         assert_eq!(err.to_string(), "Shard reconstruction failed: corrupted data");
     }
 
     #[test]
     fn test_error_display_encryption_failed() {
-        let err = TunnelCraftError::EncryptionFailed("invalid key".to_string());
+        let err = CraftNetError::EncryptionFailed("invalid key".to_string());
         assert_eq!(err.to_string(), "Encryption failed: invalid key");
     }
 
     #[test]
     fn test_error_display_decryption_failed() {
-        let err = TunnelCraftError::DecryptionFailed("corrupted ciphertext".to_string());
+        let err = CraftNetError::DecryptionFailed("corrupted ciphertext".to_string());
         assert_eq!(err.to_string(), "Decryption failed: corrupted ciphertext");
     }
 
     #[test]
     fn test_error_display_invalid_credit_secret() {
-        let err = TunnelCraftError::InvalidCreditSecret;
+        let err = CraftNetError::InvalidCreditSecret;
         assert_eq!(err.to_string(), "Invalid credit secret");
     }
 
     #[test]
     fn test_error_display_credit_expired() {
-        let err = TunnelCraftError::CreditExpired;
+        let err = CraftNetError::CreditExpired;
         assert_eq!(err.to_string(), "Credit expired");
     }
 
     #[test]
     fn test_error_display_request_not_found() {
-        let err = TunnelCraftError::RequestNotFound("abc123".to_string());
+        let err = CraftNetError::RequestNotFound("abc123".to_string());
         assert_eq!(err.to_string(), "Request not found: abc123");
     }
 
     #[test]
     fn test_error_display_request_already_settled() {
-        let err = TunnelCraftError::RequestAlreadySettled;
+        let err = CraftNetError::RequestAlreadySettled;
         assert_eq!(err.to_string(), "Request already settled");
     }
 
     #[test]
     fn test_error_display_request_not_pending() {
-        let err = TunnelCraftError::RequestNotPending;
+        let err = CraftNetError::RequestNotPending;
         assert_eq!(err.to_string(), "Request not pending");
     }
 
     #[test]
     fn test_error_display_network_error() {
-        let err = TunnelCraftError::NetworkError("connection refused".to_string());
+        let err = CraftNetError::NetworkError("connection refused".to_string());
         assert_eq!(err.to_string(), "Network error: connection refused");
     }
 
     #[test]
     fn test_error_display_peer_not_found() {
-        let err = TunnelCraftError::PeerNotFound("peer123".to_string());
+        let err = CraftNetError::PeerNotFound("peer123".to_string());
         assert_eq!(err.to_string(), "Peer not found: peer123");
     }
 
     #[test]
     fn test_error_display_settlement_error() {
-        let err = TunnelCraftError::SettlementError("transaction failed".to_string());
+        let err = CraftNetError::SettlementError("transaction failed".to_string());
         assert_eq!(err.to_string(), "Settlement error: transaction failed");
     }
 
     #[test]
     fn test_error_display_serialization_error() {
-        let err = TunnelCraftError::SerializationError("invalid format".to_string());
+        let err = CraftNetError::SerializationError("invalid format".to_string());
         assert_eq!(err.to_string(), "Serialization error: invalid format");
     }
 
     #[test]
     fn test_error_display_invalid_public_key() {
-        let err = TunnelCraftError::InvalidPublicKey;
+        let err = CraftNetError::InvalidPublicKey;
         assert_eq!(err.to_string(), "Invalid public key");
     }
 
     #[test]
     fn test_error_display_invalid_signature() {
-        let err = TunnelCraftError::InvalidSignature;
+        let err = CraftNetError::InvalidSignature;
         assert_eq!(err.to_string(), "Invalid signature");
     }
 
     #[test]
     fn test_error_display_timeout() {
-        let err = TunnelCraftError::Timeout;
+        let err = CraftNetError::Timeout;
         assert_eq!(err.to_string(), "Timeout");
     }
 
     #[test]
     fn test_error_is_debug() {
-        let err = TunnelCraftError::Timeout;
+        let err = CraftNetError::Timeout;
         let debug_str = format!("{:?}", err);
         assert!(debug_str.contains("Timeout"));
     }
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_result_type_err() {
-        let result: Result<i32> = Err(TunnelCraftError::Timeout);
+        let result: Result<i32> = Err(CraftNetError::Timeout);
         assert!(result.is_err());
     }
 }

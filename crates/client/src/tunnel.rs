@@ -3,12 +3,12 @@
 //! Constructs onion-routed shards from raw TCP bytes for SOCKS5 tunnel mode.
 //! Delegates to the shared shard builder for the encrypt → frame → erasure → onion pipeline.
 
-use tunnelcraft_core::{
+use craftnet_core::{
     Shard, Id, PublicKey,
     TunnelMetadata, PAYLOAD_MODE_TUNNEL,
     lease_set::LeaseSet,
 };
-use tunnelcraft_crypto::SigningKeypair;
+use craftec_crypto::SigningKeypair;
 
 use crate::path::{OnionPath, PathHop};
 use crate::shard_builder::build_onion_shards;
@@ -62,12 +62,12 @@ pub fn build_tunnel_shards(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnelcraft_erasure::TOTAL_SHARDS;
+    use craftnet_erasure::TOTAL_SHARDS;
 
     #[test]
     fn test_build_tunnel_shards_direct() {
         let keypair = SigningKeypair::generate();
-        let enc_keypair = tunnelcraft_crypto::EncryptionKeypair::generate();
+        let enc_keypair = craftec_crypto::EncryptionKeypair::generate();
 
         let exit = PathHop {
             peer_id: b"exit_peer".to_vec(),

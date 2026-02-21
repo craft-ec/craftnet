@@ -14,7 +14,7 @@ sp1_zkvm::entrypoint!(main);
 
 use sha2::{Digest, Sha256};
 
-use tunnelcraft_distribution_guest_types::DistributionInput;
+use craftnet_distribution_guest_types::DistributionInput;
 
 pub fn main() {
     let input = sp1_zkvm::io::read::<DistributionInput>();

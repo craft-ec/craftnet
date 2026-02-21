@@ -1,11 +1,11 @@
 //! Bootstrap node configuration
 //!
-//! Default bootstrap nodes for joining the TunnelCraft network.
+//! Default bootstrap nodes for joining the CraftNet network.
 //! These are public nodes that act as entry points for peer discovery.
 
 use libp2p::{Multiaddr, PeerId};
 
-/// Default bootstrap nodes for the TunnelCraft network
+/// Default bootstrap nodes for the CraftNet network
 ///
 /// These nodes run on public VPS and provide:
 /// - Initial peer discovery (DHT bootstrap)
@@ -15,20 +15,20 @@ use libp2p::{Multiaddr, PeerId};
 /// Format: /ip4/<IP>/tcp/<PORT>/p2p/<PEER_ID>
 ///
 /// To add your own bootstrap node:
-/// 1. Run `tunnelcraft-node` on a VPS with public IP
+/// 1. Run `craftnet-node` on a VPS with public IP
 /// 2. Note the peer ID from startup logs
 /// 3. Add the multiaddr below
 ///
-/// Devnet bootstrap nodes for the TunnelCraft network.
+/// Devnet bootstrap nodes for the CraftNet network.
 ///
 /// These can be overridden via settings (`network.bootstrap_peers`).
-/// To run your own bootstrap node: `tunnelcraft daemon --bootstrap`
+/// To run your own bootstrap node: `craftnet daemon --bootstrap`
 pub const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
     // DigitalOcean NYC bootstrap node
     "/ip4/64.225.12.79/tcp/9000/p2p/12D3KooWMHxq3CkQ1YogRBuCUJJPoSgFSdi3pshqv3zfLxMHS9hq",
 ];
 
-/// Default port for TunnelCraft nodes
+/// Default port for CraftNet nodes
 pub const DEFAULT_PORT: u16 = 9000;
 
 /// Parse bootstrap nodes from the default list

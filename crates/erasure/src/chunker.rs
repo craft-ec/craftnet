@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn test_small_data_single_chunk() {
-        let data = b"Hello, TunnelCraft!";
+        let data = b"Hello, CraftNet!";
         let chunks = chunk_and_encode(data).unwrap();
 
         assert_eq!(chunks.len(), 1);

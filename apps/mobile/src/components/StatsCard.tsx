@@ -1,6 +1,6 @@
 import React from 'react';
 import {View, Text, StyleSheet} from 'react-native';
-import {ConnectionState, NetworkStats} from '../native/TunnelCraftVPN';
+import {ConnectionState, NetworkStats} from '../native/CraftNetVPN';
 
 interface StatsCardProps {
   state: ConnectionState;
@@ -44,7 +44,7 @@ export const StatsCard: React.FC<StatsCardProps> = ({
       <StatRow label="Data Sent" value={formatBytes(stats.bytesSent)} />
       <StatRow label="Data Received" value={formatBytes(stats.bytesReceived)} />
       <StatRow label="Uptime" value={formatDuration(stats.uptimeSecs)} />
-      <StatRow label="Protocol" value="TunnelCraft P2P" />
+      <StatRow label="Protocol" value="CraftNet P2P" />
     </View>
   );
 };

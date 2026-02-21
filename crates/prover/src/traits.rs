@@ -4,7 +4,7 @@
 //! This is a compression format for efficient gossip messaging — one
 //! root + cumulative bytes instead of thousands of individual receipts.
 
-use tunnelcraft_core::ForwardReceipt;
+use craftnet_core::ForwardReceipt;
 
 /// Output of receipt batch compression.
 #[derive(Debug, Clone)]

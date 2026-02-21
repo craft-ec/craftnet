@@ -1,5 +1,5 @@
 /**
- * TunnelCraft Typography System
+ * CraftNet Typography System
  *
  * Using system fonts with fallbacks for a native feel
  * with specific weights for hierarchy

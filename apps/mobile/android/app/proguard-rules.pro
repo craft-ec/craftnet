@@ -1,7 +1,7 @@
 # React Native ProGuard Rules
 
 # Keep our native module
--keep class com.tunnelcraft.** { *; }
+-keep class com.craftnet.** { *; }
 
 # React Native
 -keep class com.facebook.react.** { *; }
@@ -12,5 +12,5 @@
     native <methods>;
 }
 
-# TunnelCraft UniFFI bindings
+# CraftNet UniFFI bindings
 -keep class uniffi.** { *; }

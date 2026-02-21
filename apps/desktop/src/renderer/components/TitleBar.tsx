@@ -13,7 +13,7 @@ export const TitleBar: React.FC = () => {
   return (
     <div className="title-bar">
       <div className="title-bar-drag">
-        <span className="title">TunnelCraft</span>
+        <span className="title">CraftNet</span>
       </div>
       <div className="window-controls">
         <button className="control-button minimize" onClick={handleMinimize} aria-label="Minimize">

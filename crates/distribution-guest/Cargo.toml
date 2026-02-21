@@ -1,9 +1,9 @@
 [package]
-name = "tunnelcraft-distribution-guest"
+name = "craftnet-distribution-guest"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tunnelcraft-distribution-guest-types = { path = "../distribution-guest-types" }
+craftnet-distribution-guest-types = { path = "../distribution-guest-types" }
 sp1-zkvm = "5.2"
 sha2 = "0.10"

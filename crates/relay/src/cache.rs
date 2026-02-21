@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use tunnelcraft_core::{Id, PublicKey};
+use craftnet_core::{Id, PublicKey};
 
 /// Default TTL for cached entries (5 minutes)
 const DEFAULT_TTL: Duration = Duration::from_secs(300);

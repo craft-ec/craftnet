@@ -109,7 +109,7 @@ export function HomeScreen() {
           {/* Header */}
           <View style={styles.header}>
             <View>
-              <Text style={styles.logo}>TunnelCraft</Text>
+              <Text style={styles.logo}>CraftNet</Text>
               <Text style={styles.tagline}>Decentralized VPN</Text>
             </View>
             <View style={styles.creditsContainer}>

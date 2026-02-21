@@ -15,7 +15,7 @@ use crate::protocol::{
 };
 use crate::{IpcError, Result};
 
-/// IPC Client for communicating with the TunnelCraft daemon
+/// IPC Client for communicating with the CraftNet daemon
 pub struct IpcClient {
     socket_path: PathBuf,
     request_id: AtomicU64,

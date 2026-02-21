@@ -1,4 +1,4 @@
-# TunnelCraft: Implementation Roadmap
+# CraftNet: Implementation Roadmap
 
 ## Overview
 
@@ -157,7 +157,7 @@ pub struct TunnelHandler {
 
 ```rust
 #[program]
-pub mod tunnelcraft {
+pub mod craftnet {
     pub fn subscribe(tier: u8, payment: u64) -> Result<()>;
     pub fn submit_receipts(receipts: Vec<ForwardReceipt>) -> Result<()>;
     pub fn claim_rewards() -> Result<()>;
@@ -174,9 +174,9 @@ pub mod tunnelcraft {
 ### Deliverables
 
 ```rust
-pub struct TunnelCraftNode { ... }
+pub struct CraftNetNode { ... }
 
-impl TunnelCraftNode {
+impl CraftNetNode {
     pub async fn connect(&mut self) -> Result<()>;
     pub async fn request(&mut self, url: &str) -> Result<TunnelResponse>;
     pub async fn send_tunnel_burst(&mut self, metadata: TunnelMetadata, data: &[u8]) -> Result<...>;
@@ -196,9 +196,9 @@ pub struct Socks5Server { ... }        // RFC 1928 SOCKS5 proxy
 
 ### CLI
 ```bash
-tunnelcraft connect [--hops 2]
-tunnelcraft status
-tunnelcraft balance
+craftnet connect [--hops 2]
+craftnet status
+craftnet balance
 ```
 
 ### Desktop (Electron)

@@ -21,14 +21,14 @@ impl Default for IpcConfig {
     fn default() -> Self {
         // Default socket path
         let path = if cfg!(target_os = "macos") {
-            PathBuf::from("/tmp/tunnelcraft.sock")
+            PathBuf::from("/tmp/craftnet.sock")
         } else if cfg!(target_os = "linux") {
             let xdg_runtime = std::env::var("XDG_RUNTIME_DIR")
                 .unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(format!("{}/tunnelcraft.sock", xdg_runtime))
+            PathBuf::from(format!("{}/craftnet.sock", xdg_runtime))
         } else {
             // Windows would use named pipes, but for now use a path
-            PathBuf::from("\\\\.\\pipe\\tunnelcraft")
+            PathBuf::from("\\\\.\\pipe\\craftnet")
         };
 
         Self { socket_path: path }
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = IpcConfig::default();
-        assert!(config.socket_path.to_str().unwrap().contains("tunnelcraft"));
+        assert!(config.socket_path.to_str().unwrap().contains("craftnet"));
     }
 
     #[test]

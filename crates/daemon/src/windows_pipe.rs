@@ -1,6 +1,6 @@
 //! Windows Named Pipe IPC Server
 //!
-//! Implements JSON-RPC 2.0 over Windows named pipes for the TunnelCraft daemon.
+//! Implements JSON-RPC 2.0 over Windows named pipes for the CraftNet daemon.
 
 #[cfg(windows)]
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use crate::ipc::{IpcHandler, JsonRpcRequest, JsonRpcResponse};
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 pub struct WindowsPipeConfig {
-    /// Pipe name (e.g., "\\\\.\\pipe\\tunnelcraft")
+    /// Pipe name (e.g., "\\\\.\\pipe\\craftnet")
     pub pipe_name: String,
     /// Maximum number of concurrent connections
     pub max_connections: u32,
@@ -35,7 +35,7 @@ pub struct WindowsPipeConfig {
 impl Default for WindowsPipeConfig {
     fn default() -> Self {
         Self {
-            pipe_name: r"\\.\pipe\tunnelcraft".to_string(),
+            pipe_name: r"\\.\pipe\craftnet".to_string(),
             max_connections: 10,
         }
     }
@@ -200,7 +200,7 @@ pub struct WindowsPipeConfig {
 impl Default for WindowsPipeConfig {
     fn default() -> Self {
         Self {
-            pipe_name: r"\\.\pipe\tunnelcraft".to_string(),
+            pipe_name: r"\\.\pipe\craftnet".to_string(),
             max_connections: 10,
         }
     }
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = WindowsPipeConfig::default();
-        assert!(config.pipe_name.contains("tunnelcraft"));
+        assert!(config.pipe_name.contains("craftnet"));
         assert!(config.max_connections > 0);
     }
 

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.tunnelcraft">
+    package="com.craftnet">
 
     <!-- VPN permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -30,9 +30,9 @@
             </intent-filter>
         </activity>
 
-        <!-- TunnelCraft VPN Service -->
+        <!-- CraftNet VPN Service -->
         <service
-            android:name=".vpn.TunnelCraftVpnService"
+            android:name=".vpn.CraftNetVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:exported="false"
             android:foregroundServiceType="specialUse">

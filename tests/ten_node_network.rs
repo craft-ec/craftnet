@@ -1,7 +1,7 @@
 #![allow(dead_code)] // Test harness helpers used by #[ignore]d devnet test
 //! 16-Node Live Network E2E Test
 //!
-//! Spawns 16 real TunnelCraftNode instances connected via localhost TCP,
+//! Spawns 16 real CraftNetNode instances connected via localhost TCP,
 //! runs diverse HTTP requests through the onion-routed tunnel, and tracks
 //! all network activity: gossip, connections, shard forwarding, proof
 //! generation, subscription tiers, and aggregator submissions.
@@ -21,7 +21,7 @@
 //!   Client-4 (14): Premium sub,   Triple hop, mixed requests
 //!   Client-5 (15): Ultra sub,     Quad hop,   small requests (max privacy)
 //!
-//! Run with: cargo test -p tunnelcraft-tests ten_node_live_network -- --ignored --nocapture
+//! Run with: cargo test -p craftnet-tests ten_node_live_network -- --ignored --nocapture
 
 use std::time::Duration;
 
@@ -33,11 +33,11 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::{Keypair as SolanaKeypair, Signer as _};
 use solana_system_interface::instruction as system_instruction;
 use solana_sdk::transaction::Transaction;
-use tunnelcraft_client::{Capabilities, NodeConfig, TunnelCraftNode, NodeStats};
-use tunnelcraft_core::HopMode;
-use tunnelcraft_aggregator::{BandwidthBucket, Granularity, NetworkStats};
-use tunnelcraft_network::PoolType;
-use tunnelcraft_settlement::{
+use craftnet_client::{Capabilities, NodeConfig, CraftNetNode, NodeStats};
+use craftnet_core::HopMode;
+use craftnet_aggregator::{BandwidthBucket, Granularity, NetworkStats};
+use craftnet_network::PoolType;
+use craftnet_settlement::{
     SettlementClient, SettlementConfig, Subscribe,
 };
 
@@ -50,7 +50,7 @@ enum TestCmd {
     Fetch {
         url: String,
         timeout_secs: u64,
-        reply: oneshot::Sender<Result<tunnelcraft_client::TunnelResponse, String>>,
+        reply: oneshot::Sender<Result<craftnet_client::TunnelResponse, String>>,
     },
     WaitUntilReady {
         timeout_secs: u64,
@@ -64,7 +64,7 @@ enum TestCmd {
     BuildDistribution {
         pool_pubkey: [u8; 32],
         pool_type: PoolType,
-        reply: oneshot::Sender<Option<tunnelcraft_aggregator::Distribution>>,
+        reply: oneshot::Sender<Option<craftnet_aggregator::Distribution>>,
     },
     GetNetworkBandwidth {
         start: u64,
@@ -89,7 +89,7 @@ struct FullStats {
     proof_queue_sizes: Vec<(String, usize)>,
     online_exits: usize,
     proof_queue_depth: usize,
-    compression_status: tunnelcraft_client::CompressionStatus,
+    compression_status: craftnet_client::CompressionStatus,
     aggregator_stats: Option<NetworkStats>,
     pool_breakdown: Vec<PoolBreakdown>,
 }
@@ -156,8 +156,8 @@ async fn spawn_test_node(
     let (init_tx, init_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
-        let mut node = TunnelCraftNode::new(config).unwrap();
-        node.start().await.unwrap();
+        let mut node = CraftNetNode::new(config).unwrap();
+        node.start(None).await.unwrap();
         node.set_credits(100_000);
         let peer_id = node.peer_id().unwrap();
         let pubkey = node.pubkey();
@@ -256,7 +256,7 @@ async fn get_stats(node: &TestNode) -> FullStats {
     }
 }
 
-async fn fetch(node: &TestNode, url: &str, timeout_secs: u64) -> Result<tunnelcraft_client::TunnelResponse, String> {
+async fn fetch(node: &TestNode, url: &str, timeout_secs: u64) -> Result<craftnet_client::TunnelResponse, String> {
     let (tx, rx) = oneshot::channel();
     let _ = node.cmd_tx.send(TestCmd::Fetch {
         url: url.to_string(),
@@ -284,7 +284,7 @@ async fn build_distribution(
     node: &TestNode,
     pool_pubkey: [u8; 32],
     pool_type: PoolType,
-) -> Option<tunnelcraft_aggregator::Distribution> {
+) -> Option<craftnet_aggregator::Distribution> {
     let (tx, rx) = oneshot::channel();
     let _ = node.cmd_tx.send(TestCmd::BuildDistribution {
         pool_pubkey,
@@ -387,7 +387,7 @@ fn load_keypair(raw: &str) -> Option<SolanaKeypair> {
 // =========================================================================
 
 async fn print_dashboard(nodes: &[TestNode], elapsed_secs: u64) {
-    println!("\n======= TunnelCraft Network Monitor (T+{}s) =======\n", elapsed_secs);
+    println!("\n======= CraftNet Network Monitor (T+{}s) =======\n", elapsed_secs);
 
     let mut all_stats = Vec::new();
     for node in nodes {
@@ -559,7 +559,7 @@ async fn ten_node_live_network() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,tunnelcraft_client::node=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,craftnet_client::node=info")),
         )
         .try_init();
 
@@ -773,7 +773,7 @@ async fn ten_node_live_network() {
         match client
             .subscribe(Subscribe {
                 user_pubkey: pool_pubkey,
-                tier: tunnelcraft_core::SubscriptionTier::Basic,
+                tier: craftnet_core::SubscriptionTier::Basic,
                 payment_amount: payment,
                 duration_secs: 120, // 2-minute epoch for E2E test
                 start_date: 0,
@@ -1180,7 +1180,7 @@ async fn ten_node_live_network() {
 
         match yearly_client.subscribe_yearly(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             120_000, // $0.12 yearly ($0.01/month)
             36_000,  // 36000s total period (~10h), each month = 3000s (50min)
         ).await {
@@ -1226,7 +1226,7 @@ async fn ten_node_live_network() {
     // --- Step 7g: Tier hop clamping (always runs — pure logic) ---
     println!("\n=== Tier Hop Clamping ===");
     {
-        use tunnelcraft_core::{SubscriptionTier, resolve_hop_mode};
+        use craftnet_core::{SubscriptionTier, resolve_hop_mode};
 
         // Free (no tier): always Direct regardless of request
         let clamped = resolve_hop_mode(None, HopMode::Quad);
@@ -1447,7 +1447,7 @@ async fn ten_node_live_network() {
                     println!("    Claiming for relay {} ({} bytes, leaf_index={})",
                         short_hex(&relay_pubkey), relay_bytes, leaf_index);
 
-                    match settlement_client.claim_rewards(tunnelcraft_settlement::ClaimRewards {
+                    match settlement_client.claim_rewards(craftnet_settlement::ClaimRewards {
                         pool_pubkey: user_pubkey,
                         node_pubkey: relay_pubkey,
                         relay_bytes,

@@ -1,11 +1,12 @@
 [package]
-name = "tunnelcraft-core"
+name = "craftnet-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
+craftec-crypto = { workspace = true }
 serde = { workspace = true }
 serde-big-array = { workspace = true }
 serde_json = { workspace = true }

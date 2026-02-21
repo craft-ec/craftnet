@@ -7,7 +7,7 @@
 //! gossip proven summaries, and an aggregator posts distributions on-chain.
 //! Claims pay directly from pool PDA to relay wallet (no NodeAccount).
 
-use tunnelcraft_core::{PublicKey, SubscriptionTier};
+use craftnet_core::{PublicKey, SubscriptionTier};
 
 /// USDC mint address on Solana devnet (`4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU`)
 pub const USDC_MINT_DEVNET: [u8; 32] = [

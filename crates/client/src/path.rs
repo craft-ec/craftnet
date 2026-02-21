@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-use tunnelcraft_core::{Id, PublicKey};
+use craftnet_core::{Id, PublicKey};
 use crate::{ClientError, Result};
 
 /// A single hop in an onion path

@@ -1,0 +1,4 @@
+module craftnet_uniffiFFI {
+    header "craftnet_uniffiFFI.h"
+    export *
+}

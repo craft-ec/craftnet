@@ -1,8 +1,8 @@
-# TunnelCraft Architecture — Applicable Domains
+# CraftNet Architecture — Applicable Domains
 
-## What TunnelCraft Actually Is
+## What CraftNet Actually Is
 
-TunnelCraft is a **private communication layer** — a transient pipe. Data goes in one end, traverses multi-hop erasure-coded paths with best-effort routing, gets reconstructed at the other end, and is gone. There is no storage, no persistence, no computation delegation.
+CraftNet is a **private communication layer** — a transient pipe. Data goes in one end, traverses multi-hop erasure-coded paths with best-effort routing, gets reconstructed at the other end, and is gone. There is no storage, no persistence, no computation delegation.
 
 Core primitives:
 
@@ -29,7 +29,7 @@ These use the communication layer as-is — payloads in, payloads out, nothing p
 
 ## Applications That Don't Fit (without a new layer)
 
-These require a **distributed data/storage layer** or **computation layer** that TunnelCraft does not provide. They would be a different project built on top of or alongside the communication layer.
+These require a **distributed data/storage layer** or **computation layer** that CraftNet does not provide. They would be a different project built on top of or alongside the communication layer.
 
 - Decentralized CDN (needs persistent distributed storage)
 - Censorship-resistant publishing (needs content hosting/retrieval)

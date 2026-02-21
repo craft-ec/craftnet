@@ -5,12 +5,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, info, warn, error};
+use ed25519_dalek;
 
-use tunnelcraft_client::{Capabilities, NodeConfig, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse, Socks5Server};
-use tunnelcraft_core::{ExitRegion, HopMode};
-use tunnelcraft_settlement::{SettlementClient, SettlementConfig, Subscribe};
-use tunnelcraft_core::SubscriptionTier;
-use tunnelcraft_settings::Settings;
+use craftnet_client::{Capabilities, NodeConfig, NodeStats as ClientNodeStats, CraftNetNode, TunnelResponse, Socks5Server};
+use craftnet_core::{ExitRegion, HopMode};
+use craftnet_settlement::{SettlementClient, SettlementConfig, Subscribe};
+use craftnet_core::SubscriptionTier;
+use craftec_settings::Settings;
+use craftnet_core::config::{CraftNetConfig, NodeMode, HopMode as ConfigHopMode};
 
 use crate::ipc::IpcHandler;
 use crate::Result;
@@ -45,6 +47,14 @@ pub struct StatusResponse {
     pub requests_exited: u64,
     pub mode: String,
     pub privacy_level: String,
+    /// Seconds since relay was last announced to the network (None = never / not a relay)
+    pub relay_announced_secs_ago: Option<u64>,
+    /// Seconds since exit was last announced to the network (None = never / not an exit)
+    pub exit_announced_secs_ago: Option<u64>,
+    /// Seconds since relay capability was enabled (None = relay not enabled)
+    pub relay_caps_enabled_secs_ago: Option<u64>,
+    /// Seconds since exit capability was enabled (None = exit not enabled)
+    pub exit_caps_enabled_secs_ago: Option<u64>,
 }
 
 /// Available exit node info for IPC
@@ -70,6 +80,22 @@ pub struct NodeStatsResponse {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub bytes_relayed: u64,
+}
+
+/// Serialisable snapshot of a CraftNet network peer for the UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerSummary {
+    pub peer_id: String,
+    pub role: String,
+    pub online: bool,
+    pub score: u8,
+    pub load_percent: u8,
+    pub uptime_secs: u64,
+    pub last_seen_secs: u64,
+    pub active_connections: u32,
+    pub country_code: Option<String>,
+    pub city: Option<String>,
+    pub region: String,
 }
 
 impl From<ClientNodeStats> for NodeStatsResponse {
@@ -155,6 +181,7 @@ enum NodeCommand {
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
     StopProxy(oneshot::Sender<std::result::Result<(), String>>),
+    GetPeers(oneshot::Sender<Vec<PeerSummary>>),
     GetProxyStatus(oneshot::Sender<Option<ProxyStatusInfo>>),
 }
 
@@ -174,6 +201,10 @@ struct NodeStatusInfo {
     peer_count: usize,
     shards_relayed: u64,
     requests_exited: u64,
+    /// Seconds since relay capability was last announced (None = never)
+    relay_announced_secs_ago: Option<u64>,
+    /// Seconds since exit capability was last announced (None = never)
+    exit_announced_secs_ago: Option<u64>,
 }
 
 /// Daemon service
@@ -185,6 +216,10 @@ pub struct DaemonService {
     privacy_level: Arc<RwLock<HopMode>>,
     /// Current node capabilities
     node_capabilities: Arc<RwLock<Capabilities>>,
+    /// When relay capability was last enabled (tracked at service level)
+    relay_caps_enabled_at: Arc<RwLock<Option<std::time::Instant>>>,
+    /// When exit capability was last enabled (tracked at service level)
+    exit_caps_enabled_at: Arc<RwLock<Option<std::time::Instant>>>,
     /// Local discovery preference
     local_discovery: Arc<RwLock<bool>>,
     /// Event broadcast channel
@@ -194,7 +229,7 @@ pub struct DaemonService {
     /// Node's public key (derived from signing keypair)
     node_pubkey: [u8; 32],
     /// Persisted settings
-    settings: Arc<RwLock<Settings>>,
+    settings: Arc<RwLock<Settings<CraftNetConfig>>>,
     /// Connection history (capped at 100 entries)
     connection_history: Arc<RwLock<Vec<ConnectionHistoryEntry>>>,
     /// Current connection start time (for computing duration on disconnect)
@@ -209,35 +244,52 @@ pub struct DaemonService {
     speed_test_results: Arc<RwLock<Vec<SpeedTestResultData>>>,
     /// Current bandwidth limit in kbps (None = unlimited)
     bandwidth_limit_kbps: Arc<RwLock<Option<u64>>>,
+    swarm_handles: Arc<RwLock<Option<craftnet_client::SwarmHandles>>>,
 }
 
 impl DaemonService {
     /// Create a new daemon service.
     ///
     /// Settlement config is determined by environment variables:
-    /// - `TUNNELCRAFT_PROGRAM_ID`: base58-encoded Solana program ID (overrides default devnet ID)
-    /// - `TUNNELCRAFT_NETWORK`: "mainnet" or "devnet" (default: "devnet")
+    /// - `CRAFTNET_PROGRAM_ID`: base58-encoded Solana program ID (overrides default devnet ID)
+    /// - `CRAFTNET_NETWORK`: "mainnet" or "devnet" (default: "devnet")
     pub fn new() -> Result<Self> {
         let settlement_config = Self::settlement_config_from_env();
         info!("Using {:?} settlement", settlement_config.mode);
 
-        // Load real keypair from keystore (same ed25519 key for TunnelCraft + Solana)
-        let key_path = tunnelcraft_keystore::default_key_path();
-        let keypair = tunnelcraft_keystore::load_or_generate_keypair(&key_path)
+        // Load real keypair from keystore (same ed25519 key for CraftNet + Solana)
+        let key_path = craftec_keystore::default_key_path_for("craftnet");
+        let keypair = craftec_keystore::load_or_generate_keypair(&key_path)
             .map_err(|e| crate::DaemonError::SdkError(format!("Failed to load keypair: {}", e)))?;
         let secret = keypair.secret_key_bytes();
         let node_pubkey = keypair.public_key_bytes();
 
         let settlement_client = Arc::new(SettlementClient::with_secret_key(settlement_config, &secret));
 
-        Self::new_inner(settlement_client, node_pubkey)
+        Self::new_inner(settlement_client, node_pubkey, None)
+    }
+
+    /// Create a daemon service with a specific keypair.
+    ///
+    /// Used by CraftStudio for multi-instance support where each instance
+    /// has its own identity.
+    pub fn new_with_keypair(secret: &[u8; 32]) -> Result<Self> {
+        let settlement_config = Self::settlement_config_from_env();
+        info!("Using {:?} settlement", settlement_config.mode);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(secret);
+        let node_pubkey: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        let settlement_client = Arc::new(SettlementClient::with_secret_key(settlement_config, secret));
+
+        Self::new_inner(settlement_client, node_pubkey, None)
     }
 
     /// Build settlement config from environment variables.
     fn settlement_config_from_env() -> SettlementConfig {
-        let network = std::env::var("TUNNELCRAFT_NETWORK").unwrap_or_else(|_| "devnet".to_string());
+        let network = std::env::var("CRAFTNET_NETWORK").unwrap_or_else(|_| "devnet".to_string());
 
-        let program_id = match std::env::var("TUNNELCRAFT_PROGRAM_ID") {
+        let program_id = match std::env::var("CRAFTNET_PROGRAM_ID") {
             Ok(id_str) => {
                 match bs58::decode(&id_str).into_vec() {
                     Ok(bytes) if bytes.len() == 32 => {
@@ -247,7 +299,7 @@ impl DaemonService {
                         arr
                     }
                     _ => {
-                        warn!("Invalid TUNNELCRAFT_PROGRAM_ID '{}', falling back to devnet default", id_str);
+                        warn!("Invalid CRAFTNET_PROGRAM_ID '{}', falling back to devnet default", id_str);
                         SettlementConfig::DEVNET_PROGRAM_ID
                     }
                 }
@@ -271,31 +323,34 @@ impl DaemonService {
     #[cfg(test)]
     pub fn new_with_config(settlement_config: SettlementConfig) -> Result<Self> {
         let settlement_client = Arc::new(SettlementClient::new(settlement_config, [0u8; 32]));
-        Self::new_inner(settlement_client, [0u8; 32])
+        let mut path = std::env::temp_dir();
+        path.push(format!("craftnet_daemon_settings_{}.toml", rand::random::<u64>()));
+        Self::new_inner(settlement_client, [0u8; 32], Some(path))
     }
 
-    fn new_inner(settlement_client: Arc<SettlementClient>, node_pubkey: [u8; 32]) -> Result<Self> {
+    fn new_inner(
+        settlement_client: Arc<SettlementClient>,
+        node_pubkey: [u8; 32],
+        settings_path: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
         let (event_tx, _) = broadcast::channel(64);
 
         // Load persisted settings (fall back to defaults on error)
-        let settings = Settings::load_or_default().unwrap_or_else(|e| {
-            info!("Failed to load settings, using defaults: {}", e);
-            Settings::default()
-        });
+        let settings = Settings::<CraftNetConfig>::load_or_default("craftnet", settings_path.as_deref()).expect("failed to init settings");
 
         // Apply loaded settings to initial state
-        let hop_mode = match settings.network.hop_mode {
-            tunnelcraft_settings::HopMode::Direct => HopMode::Direct,
-            tunnelcraft_settings::HopMode::Single => HopMode::Single,
-            tunnelcraft_settings::HopMode::Double => HopMode::Double,
-            tunnelcraft_settings::HopMode::Triple => HopMode::Triple,
-            tunnelcraft_settings::HopMode::Quad => HopMode::Quad,
+        let hop_mode = match settings.config.network.hop_mode {
+            ConfigHopMode::Direct => HopMode::Direct,
+            ConfigHopMode::Single => HopMode::Single,
+            ConfigHopMode::Double => HopMode::Double,
+            ConfigHopMode::Triple => HopMode::Triple,
+            ConfigHopMode::Quad => HopMode::Quad,
         };
-        let node_caps = match settings.node.mode {
-            tunnelcraft_settings::NodeMode::Disabled => Capabilities::CLIENT,
-            tunnelcraft_settings::NodeMode::Relay => Capabilities::RELAY,
-            tunnelcraft_settings::NodeMode::Exit => Capabilities::EXIT,
-            tunnelcraft_settings::NodeMode::Full => Capabilities::RELAY | Capabilities::EXIT,
+        let node_caps = match settings.config.node.mode {
+            NodeMode::Disabled => Capabilities::CLIENT,
+            NodeMode::Relay    => Capabilities::CLIENT | Capabilities::RELAY,
+            NodeMode::Exit     => Capabilities::CLIENT | Capabilities::EXIT,
+            NodeMode::Full     => Capabilities::CLIENT | Capabilities::RELAY | Capabilities::EXIT,
         };
 
         Ok(Self {
@@ -304,6 +359,12 @@ impl DaemonService {
             node_status: Arc::new(RwLock::new(NodeStatusInfo::default())),
             privacy_level: Arc::new(RwLock::new(hop_mode)),
             node_capabilities: Arc::new(RwLock::new(node_caps)),
+            relay_caps_enabled_at: Arc::new(RwLock::new(
+                if node_caps.is_relay() { Some(std::time::Instant::now()) } else { None }
+            )),
+            exit_caps_enabled_at: Arc::new(RwLock::new(
+                if node_caps.is_exit() { Some(std::time::Instant::now()) } else { None }
+            )),
             local_discovery: Arc::new(RwLock::new(true)),
             event_tx,
             settlement_client,
@@ -316,12 +377,18 @@ impl DaemonService {
             earnings_id_counter: Arc::new(RwLock::new(0)),
             speed_test_results: Arc::new(RwLock::new(Vec::new())),
             bandwidth_limit_kbps: Arc::new(RwLock::new(None)),
+            swarm_handles: Arc::new(RwLock::new(None)),
         })
     }
 
     /// Get the event broadcast sender (for IpcServer to clone)
     pub fn event_sender(&self) -> broadcast::Sender<String> {
         self.event_tx.clone()
+    }
+
+    /// Set external swarm handles (e.g. from DaemonManager for single-swarm integration)
+    pub async fn set_swarm_handles(&self, handles: craftnet_client::SwarmHandles) {
+        *self.swarm_handles.write().await = Some(handles);
     }
 
     /// Send an event to all connected IPC clients
@@ -341,7 +408,7 @@ impl DaemonService {
 
     /// Initialize and start the node in a background task
     pub async fn init(&self) -> Result<()> {
-        info!("Initializing TunnelCraft Node...");
+        info!("Initializing CraftNet Node...");
 
         let privacy_level = *self.privacy_level.read().await;
         let config = NodeConfig {
@@ -353,15 +420,48 @@ impl DaemonService {
         let (cmd_tx, cmd_rx) = mpsc::channel::<NodeCommand>(32);
         let node_status = self.node_status.clone();
 
+        let handles: Option<craftnet_client::SwarmHandles> = self.swarm_handles.write().await.take();
+
         // Spawn node task
         tokio::spawn(async move {
-            if let Err(e) = run_node_task(config, cmd_rx, node_status).await {
+            if let Err(e) = run_node_task(config, cmd_rx, node_status, handles).await {
                 error!("Node task error: {}", e);
             }
         });
 
         *self.cmd_tx.write().await = Some(cmd_tx);
         info!("Node task started");
+        Ok(())
+    }
+
+    /// Start the tunnel daemon: join the network and reach Ready state.
+    /// Idempotent — safe to call if already started.
+    pub async fn start(&self) -> Result<()> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if cmd_tx.is_some() {
+            // Already started
+            return Ok(());
+        }
+        drop(cmd_tx);
+        self.set_state(DaemonState::Starting).await;
+        self.init().await?;
+        self.set_state(DaemonState::Ready).await;
+        info!("Tunnel started and ready");
+        Ok(())
+    }
+
+    /// Stop the tunnel daemon. Disconnects first if connected.
+    pub async fn stop(&self) -> Result<()> {
+        // Disconnect routing if active
+        let state = *self.state.read().await;
+        if matches!(state, DaemonState::Connected | DaemonState::Connecting) {
+            let _ = self.disconnect().await;
+        }
+        self.set_state(DaemonState::Stopping).await;
+        // Drop the command channel — node task will exit
+        *self.cmd_tx.write().await = None;
+        self.set_state(DaemonState::Ready).await;
+        info!("Tunnel stopped");
         Ok(())
     }
 
@@ -374,12 +474,18 @@ impl DaemonService {
     pub async fn status(&self) -> StatusResponse {
         let state = *self.state.read().await;
         let caps = *self.node_capabilities.read().await;
-        let mode = if caps.is_client() && caps.is_service_node() {
+        let mode = if caps.contains(Capabilities::CLIENT | Capabilities::RELAY | Capabilities::EXIT) {
+            "full"
+        } else if caps.contains(Capabilities::CLIENT | Capabilities::RELAY) {
             "both"
-        } else if caps.is_client() {
-            "client"
+        } else if caps.contains(Capabilities::CLIENT | Capabilities::EXIT) {
+            "client_exit"
+        } else if caps.is_exit() {
+            "exit"
+        } else if caps.is_relay() {
+            "relay"
         } else {
-            "node"
+            "client"
         }.to_string();
         let privacy = match *self.privacy_level.read().await {
             HopMode::Direct => "direct",
@@ -388,6 +494,11 @@ impl DaemonService {
             HopMode::Triple => "triple",
             HopMode::Quad => "quad",
         }.to_string();
+
+        let relay_caps_enabled_secs_ago = self.relay_caps_enabled_at.read().await
+            .map(|t| t.elapsed().as_secs());
+        let exit_caps_enabled_secs_ago = self.exit_caps_enabled_at.read().await
+            .map(|t| t.elapsed().as_secs());
 
         // Try to get fresh status from node
         let cmd_tx = self.cmd_tx.read().await;
@@ -408,6 +519,10 @@ impl DaemonService {
                         requests_exited: info.requests_exited,
                         mode,
                         privacy_level: privacy,
+                        relay_announced_secs_ago: info.relay_announced_secs_ago,
+                        exit_announced_secs_ago: info.exit_announced_secs_ago,
+                        relay_caps_enabled_secs_ago,
+                        exit_caps_enabled_secs_ago,
                     };
                 }
             }
@@ -425,6 +540,10 @@ impl DaemonService {
             requests_exited: ns.requests_exited,
             mode,
             privacy_level: privacy,
+            relay_announced_secs_ago: ns.relay_announced_secs_ago,
+            exit_announced_secs_ago: ns.exit_announced_secs_ago,
+            relay_caps_enabled_secs_ago,
+            exit_caps_enabled_secs_ago,
         }
     }
 
@@ -441,6 +560,21 @@ impl DaemonService {
             }
         }
         None
+    }
+
+    /// Get list of all known CraftNet peers (relay + exit nodes)
+    pub async fn get_peers(&self) -> Vec<PeerSummary> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx.send(NodeCommand::GetPeers(reply_tx)).await.is_ok() {
+                drop(cmd_tx);
+                if let Ok(peers) = reply_rx.await {
+                    return peers;
+                }
+            }
+        }
+        vec![]
     }
 
     /// Connect to VPN
@@ -597,10 +731,13 @@ impl DaemonService {
     pub async fn set_mode(&self, mode_str: &str) -> Result<()> {
         let caps = match mode_str {
             "client" => Capabilities::CLIENT,
-            "node" => Capabilities::RELAY,
-            "both" => Capabilities::CLIENT | Capabilities::RELAY,
+            "node" | "relay" => Capabilities::RELAY,
+            "exit" => Capabilities::EXIT,
+            "both" | "client_relay" => Capabilities::CLIENT | Capabilities::RELAY,
+            "client_exit" => Capabilities::CLIENT | Capabilities::EXIT,
+            "full" => Capabilities::CLIENT | Capabilities::RELAY | Capabilities::EXIT,
             _ => return Err(crate::DaemonError::InvalidRequest(
-                format!("Unknown mode: {}. Use client, node, or both", mode_str)
+                format!("Unknown mode: {}. Use client, relay, exit, both, client_exit, or full", mode_str)
             )),
         };
 
@@ -618,18 +755,34 @@ impl DaemonService {
         }
 
         *self.node_capabilities.write().await = caps;
+        // Track when each role was enabled
+        {
+            let now = std::time::Instant::now();
+            let mut relay_at = self.relay_caps_enabled_at.write().await;
+            if caps.is_relay() {
+                if relay_at.is_none() { *relay_at = Some(now); }
+            } else {
+                *relay_at = None; // reset when disabled
+            }
+            let mut exit_at = self.exit_caps_enabled_at.write().await;
+            if caps.is_exit() {
+                if exit_at.is_none() { *exit_at = Some(now); }
+            } else {
+                *exit_at = None;
+            }
+        }
 
         // Persist mode to settings
         {
             let mut settings = self.settings.write().await;
-            settings.node.mode = if caps.is_client() && !caps.is_service_node() {
-                tunnelcraft_settings::NodeMode::Disabled
+            settings.config.node.mode = if caps.is_client() && !caps.is_service_node() {
+                NodeMode::Disabled
             } else if caps.is_relay() && caps.is_exit() {
-                tunnelcraft_settings::NodeMode::Full
+                NodeMode::Full
             } else if caps.is_exit() {
-                tunnelcraft_settings::NodeMode::Exit
+                NodeMode::Exit
             } else {
-                tunnelcraft_settings::NodeMode::Relay
+                NodeMode::Relay
             };
             if let Err(e) = settings.save() {
                 debug!("Failed to save settings: {}", e);
@@ -673,12 +826,12 @@ impl DaemonService {
         // Persist to settings
         {
             let mut settings = self.settings.write().await;
-            settings.network.hop_mode = match hop_mode {
-                HopMode::Direct => tunnelcraft_settings::HopMode::Direct,
-                HopMode::Single => tunnelcraft_settings::HopMode::Single,
-                HopMode::Double => tunnelcraft_settings::HopMode::Double,
-                HopMode::Triple => tunnelcraft_settings::HopMode::Triple,
-                HopMode::Quad => tunnelcraft_settings::HopMode::Quad,
+            settings.config.network.hop_mode = match hop_mode {
+                HopMode::Direct => ConfigHopMode::Direct,
+                HopMode::Single => ConfigHopMode::Single,
+                HopMode::Double => ConfigHopMode::Double,
+                HopMode::Triple => ConfigHopMode::Triple,
+                HopMode::Quad => ConfigHopMode::Quad,
             };
             if let Err(e) = settings.save() {
                 debug!("Failed to save settings: {}", e);
@@ -896,8 +1049,8 @@ impl DaemonService {
         use rand::RngCore;
 
         // Load the current key from keystore
-        let key_path = tunnelcraft_keystore::default_key_path();
-        let keypair = tunnelcraft_keystore::load_or_generate_keypair(&key_path)
+        let key_path = craftec_keystore::default_key_path_for("craftnet");
+        let keypair = craftec_keystore::load_or_generate_keypair(&key_path)
             .map_err(|e| crate::DaemonError::SdkError(format!("Failed to load keypair: {}", e)))?;
 
         let secret_bytes = keypair.secret_key_bytes();
@@ -980,8 +1133,8 @@ impl DaemonService {
         let public_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
         // Save to keystore
-        let key_path = tunnelcraft_keystore::default_key_path();
-        tunnelcraft_keystore::save_keypair_bytes(&key_path, &secret)
+        let key_path = craftec_keystore::default_key_path_for("craftnet");
+        craftec_keystore::save_keypair_bytes(&key_path, &secret)
             .map_err(|e| crate::DaemonError::SdkError(format!("Failed to save keypair: {}", e)))?;
 
         info!("Key imported from: {}, public key: {}", path, public_hex);
@@ -989,19 +1142,20 @@ impl DaemonService {
     }
 }
 
-/// Run the node in its own task using TunnelCraftNode
+/// Run the node in its own task using CraftNetNode
 async fn run_node_task(
     config: NodeConfig,
     mut cmd_rx: mpsc::Receiver<NodeCommand>,
     status: Arc<RwLock<NodeStatusInfo>>,
+    mut swarm_handles: Option<craftnet_client::SwarmHandles>,
 ) -> std::result::Result<(), String> {
-    let mut node = TunnelCraftNode::new(config)
+    let mut node = CraftNetNode::new(config)
         .map_err(|e| e.to_string())?;
 
     // SOCKS5 proxy state (created on StartProxy, dropped on StopProxy)
     let mut socks5_server: Option<Socks5Server> = None;
 
-    info!("TunnelCraftNode initialized in background task");
+    info!("CraftNetNode initialized in background task");
 
     loop {
         tokio::select! {
@@ -1012,7 +1166,8 @@ async fn run_node_task(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(NodeCommand::Connect(reply)) => {
-                        let result = node.start().await.map_err(|e| e.to_string());
+                        let handles = swarm_handles.take();
+                        let result = node.start(handles).await.map_err(|e| e.to_string());
                         // Wait for exit node discovery before reporting connected
                         if result.is_ok() {
                             match node.wait_for_exit(std::time::Duration::from_secs(15)).await {
@@ -1051,6 +1206,7 @@ async fn run_node_task(
                     }
                     Some(NodeCommand::GetStatus(reply)) => {
                         let node_status = node.status();
+                        let (relay_secs, exit_secs) = node.announce_timing();
                         let _ = reply.send(NodeStatusInfo {
                             connected: node_status.connected,
                             credits: node_status.credits,
@@ -1058,6 +1214,8 @@ async fn run_node_task(
                             peer_count: node_status.peer_count,
                             shards_relayed: node_status.stats.shards_relayed,
                             requests_exited: node_status.stats.requests_exited,
+                            relay_announced_secs_ago: relay_secs,
+                            exit_announced_secs_ago: exit_secs,
                         });
                     }
                     Some(NodeCommand::GetStats(reply)) => {
@@ -1065,6 +1223,9 @@ async fn run_node_task(
                     }
                     Some(NodeCommand::SetCapabilities(caps, reply)) => {
                         node.set_capabilities(caps);
+                        // Announce immediately so peers discover the new role
+                        // without waiting up to 30s for the next maintenance tick
+                        node.announce_capabilities_now();
                         let _ = reply.send(Ok(()));
                     }
                     Some(NodeCommand::SetExitGeo { region, country_code, city, reply }) => {
@@ -1099,6 +1260,25 @@ async fn run_node_task(
                             })
                             .collect();
                         let _ = reply.send(exits);
+                    }
+                    Some(NodeCommand::GetPeers(reply)) => {
+                        let peers = node.peers_info()
+                            .into_iter()
+                            .map(|p| PeerSummary {
+                                peer_id: p.peer_id,
+                                role: p.role,
+                                online: p.online,
+                                score: p.score,
+                                load_percent: p.load_percent,
+                                uptime_secs: p.uptime_secs,
+                                last_seen_secs: p.last_seen_secs,
+                                active_connections: p.active_connections,
+                                country_code: p.country_code,
+                                city: p.city,
+                                region: p.region,
+                            })
+                            .collect();
+                        let _ = reply.send(peers);
                     }
                     Some(NodeCommand::RunSpeedTest(reply)) => {
                         // Measure by pinging peers and estimating throughput
@@ -1486,7 +1666,7 @@ impl IpcHandler for DaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnelcraft_settlement::SettlementConfig;
+    use craftnet_settlement::SettlementConfig;
 
     /// Helper to create a DaemonService with mock settlement for tests
     fn mock_service() -> DaemonService {

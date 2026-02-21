@@ -11,10 +11,12 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use tunnelcraft_aggregator::Aggregator;
-use tunnelcraft_crypto::{sign_data, sign_forward_receipt, verify_forward_receipt, SigningKeypair};
-use tunnelcraft_network::{PoolType, ProofMessage};
-use tunnelcraft_settlement::{
+use craftnet_aggregator::Aggregator;
+use craftec_crypto::{sign_data, SigningKeypair};
+
+use craftnet_core::receipt_crypto::{sign_forward_receipt, verify_forward_receipt};
+use craftnet_network::{PoolType, ProofMessage};
+use craftnet_settlement::{
     ClaimRewards, PostDistribution, SettlementClient, SettlementConfig, Subscribe,
 };
 
@@ -324,7 +326,7 @@ async fn test_aggregator_to_settlement_claim_flow() {
     settlement
         .add_mock_subscription_with_expiry(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             pool_balance,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,
@@ -408,7 +410,7 @@ async fn test_chained_proofs_to_settlement() {
     settlement
         .add_mock_subscription_with_expiry(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Premium,
+            craftnet_core::SubscriptionTier::Premium,
             pool_balance,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,
@@ -478,7 +480,7 @@ async fn test_post_distribution_blocked_during_active() {
     settlement
         .subscribe(Subscribe {
             user_pubkey: user,
-            tier: tunnelcraft_core::SubscriptionTier::Standard,
+            tier: craftnet_core::SubscriptionTier::Standard,
             payment_amount: 1_000_000,
             duration_secs: 30 * 24 * 3600,
             start_date: 0,
@@ -515,7 +517,7 @@ async fn test_claim_blocked_without_distribution() {
     settlement
         .add_mock_subscription_with_expiry(
             user,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             1_000_000,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,
@@ -551,7 +553,7 @@ async fn test_double_claim_rejected_e2e() {
     settlement
         .add_mock_subscription_with_expiry(
             user,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             1_000_000,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,
@@ -699,7 +701,7 @@ async fn test_multi_pool_aggregation_and_claims() {
         settlement
             .add_mock_subscription_with_expiry(
                 user,
-                tunnelcraft_core::SubscriptionTier::Standard,
+                craftnet_core::SubscriptionTier::Standard,
                 balance,
                 now - 40 * 24 * 3600,
                 now - 10 * 24 * 3600,

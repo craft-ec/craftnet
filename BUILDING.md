@@ -1,6 +1,6 @@
-# Building TunnelCraft
+# Building CraftNet
 
-This guide covers building TunnelCraft for all supported platforms.
+This guide covers building CraftNet for all supported platforms.
 
 ## Prerequisites
 
@@ -26,8 +26,8 @@ This guide covers building TunnelCraft for all supported platforms.
 
 ```bash
 # Clone and setup
-git clone https://github.com/craftec/tunnelcraft.git
-cd tunnelcraft
+git clone https://github.com/craftec/craftnet.git
+cd craftnet
 
 # Build Rust daemon
 cargo build --release
@@ -58,7 +58,7 @@ npm run dev
 ```bash
 npm run package:mac
 ```
-**Output:** `dist/TunnelCraft-*.dmg`, `dist/TunnelCraft-*.zip`
+**Output:** `dist/CraftNet-*.dmg`, `dist/CraftNet-*.zip`
 
 **Requirements:**
 - For unsigned builds: Works out of the box
@@ -71,7 +71,7 @@ npm run package:mac
 ```bash
 npm run package:win
 ```
-**Output:** `dist/TunnelCraft Setup *.exe`, `dist/TunnelCraft-*-portable.exe`
+**Output:** `dist/CraftNet Setup *.exe`, `dist/CraftNet-*-portable.exe`
 
 **Requirements:**
 - Icon file: `build/icon.ico` (256x256 recommended)
@@ -82,7 +82,7 @@ npm run package:win
 ```bash
 npm run package:linux
 ```
-**Output:** `dist/TunnelCraft-*.AppImage`, `dist/tunnelcraft_*.deb`, `dist/tunnelcraft-*.rpm`
+**Output:** `dist/CraftNet-*.AppImage`, `dist/craftnet_*.deb`, `dist/craftnet-*.rpm`
 
 #### All Platforms
 ```bash
@@ -139,7 +139,7 @@ This script:
 1. Builds for `aarch64-apple-ios` (device)
 2. Builds for `aarch64-apple-ios-sim` and `x86_64-apple-ios` (simulator)
 3. Generates Swift bindings via UniFFI
-4. Creates `TunnelCraftUniFFI.xcframework`
+4. Creates `CraftNetUniFFI.xcframework`
 
 ### Development
 ```bash
@@ -147,11 +147,11 @@ This script:
 npm run ios
 
 # Device (requires provisioning profile with Network Extension capability)
-# Open in Xcode: apps/mobile/ios/TunnelCraft.xcworkspace
+# Open in Xcode: apps/mobile/ios/CraftNet.xcworkspace
 ```
 
 ### Production Build
-1. Open `apps/mobile/ios/TunnelCraft.xcworkspace` in Xcode
+1. Open `apps/mobile/ios/CraftNet.xcworkspace` in Xcode
 2. Select "Any iOS Device (arm64)"
 3. Product → Archive
 4. Distribute via App Store Connect or Ad Hoc
@@ -160,35 +160,35 @@ npm run ios
 
 **Apple Developer Account Setup:**
 1. Create App IDs for both the main app and VPN extension:
-   - `com.tunnelcraft.TunnelCraft`
-   - `com.tunnelcraft.TunnelCraft.TunnelCraftVPN`
+   - `com.craftnet.CraftNet`
+   - `com.craftnet.CraftNet.CraftNetVPN`
 2. Enable "Network Extensions" capability for both
 3. Enable "Personal VPN" and "Packet Tunnel" capabilities
-4. Create App Group: `group.com.tunnelcraft.vpn`
+4. Create App Group: `group.com.craftnet.vpn`
 5. Generate provisioning profiles
 
 **Xcode Configuration:**
 1. Signing & Capabilities → Add "Network Extensions"
-2. Add "App Groups" with `group.com.tunnelcraft.vpn`
+2. Add "App Groups" with `group.com.craftnet.vpn`
 3. Ensure both targets (main app + extension) share the same App Group
 
 ### iOS Architecture
 
 ```
 apps/mobile/ios/
-├── TunnelCraft/                    # Main React Native app
+├── CraftNet/                    # Main React Native app
 │   ├── NativeModules/              # Swift bridges to React Native
 │   │   ├── VPNManager.swift        # Manages NETunnelProviderManager
-│   │   └── TunnelCraftVPNModule.swift
-│   └── TunnelCraftVPN/             # Embedded extension code
+│   │   └── CraftNetVPNModule.swift
+│   └── CraftNetVPN/             # Embedded extension code
 │       └── PacketTunnelProvider.swift
-├── TunnelCraftVPN/                 # Network Extension target
+├── CraftNetVPN/                 # Network Extension target
 │   ├── Info.plist
-│   └── TunnelCraftVPN.entitlements
-└── TunnelCraftCore/                # Swift Package for UniFFI bindings
+│   └── CraftNetVPN.entitlements
+└── CraftNetCore/                # Swift Package for UniFFI bindings
     ├── Package.swift
     ├── Frameworks/
-    │   └── TunnelCraftUniFFI.xcframework
+    │   └── CraftNetUniFFI.xcframework
     └── Sources/
         └── Generated/              # Auto-generated Swift from UniFFI
 ```
@@ -200,8 +200,8 @@ apps/mobile/ios/
 Location: `apps/cli/`
 
 ```bash
-cargo build --release -p tunnelcraft-cli
-./target/release/tunnelcraft-cli --help
+cargo build --release -p craftnet-cli
+./target/release/craftnet-cli --help
 ```
 
 ---
@@ -212,10 +212,10 @@ The core daemon handles P2P networking and VPN tunneling.
 
 ```bash
 # Build daemon
-cargo build --release -p tunnelcraft-daemon
+cargo build --release -p craftnet-daemon
 
 # Run daemon
-./target/release/tunnelcraft-daemon
+./target/release/craftnet-daemon
 
 # Run tests
 cargo test --workspace
@@ -226,7 +226,7 @@ cargo test --workspace
 **For Windows (from macOS):**
 ```bash
 rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu -p tunnelcraft-daemon
+cargo build --release --target x86_64-pc-windows-gnu -p craftnet-daemon
 ```
 
 **For Linux (from macOS):**
@@ -242,7 +242,7 @@ rustup target add x86_64-unknown-linux-gnu
 
 ### macOS: "App is damaged" / Gatekeeper issues
 ```bash
-xattr -cr /Applications/TunnelCraft.app
+xattr -cr /Applications/CraftNet.app
 ```
 
 ### Windows: Missing DLLs
@@ -277,10 +277,10 @@ cargo build --release
 
 | Platform | Status | Output |
 |----------|--------|--------|
-| macOS DMG (Universal) | ✅ Working | `dist/TunnelCraft-0.1.0.dmg` (801MB) |
-| macOS DMG (ARM64) | ✅ Working | `dist/TunnelCraft-0.1.0-arm64.dmg` (1.0GB) |
-| macOS ZIP | ✅ Working | `dist/TunnelCraft-0.1.0-mac.zip` (747MB) |
-| Windows Portable | ✅ Working | `dist/win-unpacked/TunnelCraft.exe` (169MB) |
+| macOS DMG (Universal) | ✅ Working | `dist/CraftNet-0.1.0.dmg` (801MB) |
+| macOS DMG (ARM64) | ✅ Working | `dist/CraftNet-0.1.0-arm64.dmg` (1.0GB) |
+| macOS ZIP | ✅ Working | `dist/CraftNet-0.1.0-mac.zip` (747MB) |
+| Windows Portable | ✅ Working | `dist/win-unpacked/CraftNet.exe` (169MB) |
 | Windows NSIS Installer | ⚠️ Needs icon.ico | Add `build/icon.ico` then re-run |
 | Linux AppImage | 🔲 Not tested | Run `npm run package:linux` |
 | iOS | ⚠️ Manual Xcode | Requires Apple Developer + Network Extension capability |
@@ -295,6 +295,6 @@ cargo build --release
 
 1. Ensure Apple Developer enrollment with Network Extension capability
 2. Run `cd apps/mobile/ios && ./build-rust.sh` to build UniFFI xcframework
-3. Open `TunnelCraft.xcworkspace` in Xcode
+3. Open `CraftNet.xcworkspace` in Xcode
 4. Configure signing with your provisioning profiles
 5. Build and archive

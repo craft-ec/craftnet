@@ -1,6 +1,6 @@
-//! TunnelCraft CLI
+//! CraftNet CLI
 //!
-//! Command-line interface for the TunnelCraft VPN client and node operator.
+//! Command-line interface for the CraftNet VPN client and node operator.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,15 +10,15 @@ use clap::{Parser, Subcommand};
 use libp2p::{Multiaddr, PeerId};
 use tracing::info;
 
-use tunnelcraft_app::{AppBuilder, AppType, ImplementationMatrix};
-use tunnelcraft_client::{Capabilities, NodeConfig, TunnelCraftNode};
-use tunnelcraft_core::HopMode;
-use tunnelcraft_ipc_client::{IpcClient, DEFAULT_SOCKET_PATH};
-use tunnelcraft_keystore::{expand_path, load_or_generate_libp2p_keypair};
+use craftec_app::{AppBuilder, AppType};
+use craftnet_client::{Capabilities, NodeConfig, CraftNetNode};
+use craftnet_core::HopMode;
+use craftnet_ipc_client::{IpcClient, DEFAULT_SOCKET_PATH};
+use craftec_keystore::expand_path;
 
-/// TunnelCraft - Decentralized Trustless VPN
+/// CraftNet - Decentralized Trustless VPN
 #[derive(Parser)]
-#[command(name = "tunnelcraft")]
+#[command(name = "craftnet")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Socket path for daemon communication
@@ -35,7 +35,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Connect to the TunnelCraft network
+    /// Connect to the CraftNet network
     Connect {
         /// Number of relay hops (0-3)
         #[arg(short = 'n', long, default_value = "2")]
@@ -166,12 +166,6 @@ enum Commands {
         #[command(subcommand)]
         action: KeyAction,
     },
-
-    /// Developer tools and diagnostics
-    Dev {
-        #[command(subcommand)]
-        action: DevAction,
-    },
 }
 
 #[derive(Subcommand)]
@@ -187,7 +181,7 @@ enum NodeSubcommand {
         bootstrap: Vec<String>,
 
         /// Path to keypair file
-        #[arg(long, default_value = "~/.tunnelcraft/node.key")]
+        #[arg(long, default_value = "~/.craftnet/node.key")]
         keyfile: PathBuf,
 
         /// Allow being last hop (required for settlement)
@@ -210,7 +204,7 @@ enum NodeSubcommand {
         bootstrap: Vec<String>,
 
         /// Path to keypair file
-        #[arg(long, default_value = "~/.tunnelcraft/node.key")]
+        #[arg(long, default_value = "~/.craftnet/node.key")]
         keyfile: PathBuf,
 
         /// HTTP request timeout in seconds
@@ -233,7 +227,7 @@ enum NodeSubcommand {
         bootstrap: Vec<String>,
 
         /// Path to keypair file
-        #[arg(long, default_value = "~/.tunnelcraft/node.key")]
+        #[arg(long, default_value = "~/.craftnet/node.key")]
         keyfile: PathBuf,
 
         /// HTTP request timeout in seconds
@@ -248,7 +242,7 @@ enum NodeSubcommand {
     /// Show node information
     Info {
         /// Path to keypair file
-        #[arg(long, default_value = "~/.tunnelcraft/node.key")]
+        #[arg(long, default_value = "~/.craftnet/node.key")]
         keyfile: PathBuf,
     },
 }
@@ -286,14 +280,6 @@ enum KeyAction {
     },
 }
 
-#[derive(Subcommand)]
-enum DevAction {
-    /// Show feature implementation matrix
-    Matrix,
-    /// Show implementation gaps report
-    Gaps,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -305,9 +291,7 @@ async fn main() -> Result<()> {
         _ => AppType::Cli,
     };
 
-    let _app = AppBuilder::new()
-        .name("tunnelcraft")
-        .version(env!("CARGO_PKG_VERSION"))
+    let _app = AppBuilder::<()>::new("craftnet")
         .app_type(app_type)
         .verbose(cli.verbose)
         .build()
@@ -384,37 +368,18 @@ async fn main() -> Result<()> {
         Commands::Key { action } => {
             key_cmd(&cli.socket, action).await?;
         }
-        Commands::Dev { action } => {
-            run_dev(action);
-        }
     }
 
     Ok(())
 }
 
 // ============================================================================
-// Developer Tools
-// ============================================================================
-
-fn run_dev(action: DevAction) {
-    match action {
-        DevAction::Matrix => {
-            let matrix = ImplementationMatrix::current();
-            matrix.print_matrix();
-        }
-        DevAction::Gaps => {
-            let matrix = ImplementationMatrix::current();
-            matrix.print_gaps_report();
-        }
-    }
-}
-
 // ============================================================================
 // IPC Commands (using shared ipc-client crate)
 // ============================================================================
 
 async fn connect(socket: &Path, hops: u8, exit_region: Option<String>) -> Result<()> {
-    info!("Connecting to TunnelCraft network with {} hops...", hops);
+    info!("Connecting to CraftNet network with {} hops...", hops);
 
     let client = IpcClient::new(socket.to_path_buf());
 
@@ -428,7 +393,7 @@ async fn connect(socket: &Path, hops: u8, exit_region: Option<String>) -> Result
     let result = client.connect_vpn(hops).await?;
 
     if result.connected {
-        println!("Connected to TunnelCraft network");
+        println!("Connected to CraftNet network");
         if let Some(exit) = result.exit_node {
             println!("Exit node: {}", exit);
         }
@@ -440,12 +405,12 @@ async fn connect(socket: &Path, hops: u8, exit_region: Option<String>) -> Result
 }
 
 async fn disconnect(socket: &Path) -> Result<()> {
-    info!("Disconnecting from TunnelCraft network...");
+    info!("Disconnecting from CraftNet network...");
 
     let client = IpcClient::new(socket.to_path_buf());
     client.disconnect().await?;
 
-    println!("Disconnected from TunnelCraft network");
+    println!("Disconnected from CraftNet network");
     Ok(())
 }
 
@@ -455,7 +420,7 @@ async fn status(socket: &Path) -> Result<()> {
     // Use raw send_request to get the full status including new fields
     let result = client.send_request("status", None).await?;
 
-    println!("TunnelCraft Status");
+    println!("CraftNet Status");
     println!("==================");
     println!("State:         {}", result.get("state").and_then(|v| v.as_str()).unwrap_or("unknown"));
     println!("Connected:     {}", result.get("connected").and_then(|v| v.as_bool()).unwrap_or(false));
@@ -494,7 +459,7 @@ async fn stats(socket: &Path) -> Result<()> {
     let client = IpcClient::new(socket.to_path_buf());
     let result = client.get_node_stats().await?;
 
-    println!("TunnelCraft Node Statistics");
+    println!("CraftNet Node Statistics");
     println!("===========================");
     println!("Shards relayed:   {}", result.shards_relayed);
     println!("Requests exited:  {}", result.requests_exited);
@@ -623,7 +588,7 @@ async fn discovery_cmd(socket: &Path, state: Option<String>) -> Result<()> {
             println!("Local discovery: {}", if enabled { "enabled" } else { "disabled" });
         }
         None => {
-            println!("Local discovery: use 'tunnelcraft discovery on/off' to toggle");
+            println!("Local discovery: use 'craftnet discovery on/off' to toggle");
         }
     }
 
@@ -791,9 +756,9 @@ async fn bandwidth_cmd(socket: &Path, limit: Option<u64>) -> Result<()> {
             println!("Bandwidth limit set to {} kbps ({:.1} Mbps)", kbps, kbps as f64 / 1000.0);
         }
         None => {
-            println!("Usage: tunnelcraft bandwidth <limit_kbps>");
+            println!("Usage: craftnet bandwidth <limit_kbps>");
             println!("  Set to 0 to remove limit");
-            println!("  Example: tunnelcraft bandwidth 5000  (5 Mbps)");
+            println!("  Example: craftnet bandwidth 5000  (5 Mbps)");
         }
     }
 
@@ -825,13 +790,13 @@ async fn key_cmd(socket: &Path, action: KeyAction) -> Result<()> {
 // ============================================================================
 
 async fn run_daemon(bootstrap: bool, port: u16) -> Result<()> {
-    use tunnelcraft_daemon::{DaemonService, IpcConfig, IpcServer};
+    use craftnet_daemon::{DaemonService, IpcConfig, IpcServer};
 
     if bootstrap {
-        info!("Starting TunnelCraft BOOTSTRAP node on port {}...", port);
+        info!("Starting CraftNet BOOTSTRAP node on port {}...", port);
 
         // In bootstrap mode, run a relay-only node with no exit or settlement
-        let keyfile = PathBuf::from("~/.tunnelcraft/bootstrap.key");
+        let keyfile = PathBuf::from("~/.craftnet/bootstrap.key");
         let listen = format!("/ip4/0.0.0.0/tcp/{}", port);
 
         let libp2p_keypair = load_or_generate_libp2p_keypair(&keyfile)
@@ -855,8 +820,8 @@ async fn run_daemon(bootstrap: bool, port: u16) -> Result<()> {
             ..Default::default()
         };
 
-        let mut node = TunnelCraftNode::new(config)?;
-        node.start().await?;
+        let mut node = CraftNetNode::new(config)?;
+        node.start(None).await?;
 
         info!("Bootstrap node running. Press Ctrl+C to stop.");
 
@@ -869,7 +834,7 @@ async fn run_daemon(bootstrap: bool, port: u16) -> Result<()> {
         return Ok(());
     }
 
-    info!("Starting TunnelCraft daemon...");
+    info!("Starting CraftNet daemon...");
 
     let config = IpcConfig::default();
     let service = DaemonService::new().map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -917,8 +882,8 @@ async fn run_standalone(hops: u8, bootstrap: Option<String>, listen: String) -> 
         ..Default::default()
     };
 
-    let mut node = TunnelCraftNode::new(config)?;
-    node.start().await?;
+    let mut node = CraftNetNode::new(config)?;
+    node.start(None).await?;
 
     info!("Node connected. Press Ctrl+C to stop.");
 
@@ -943,8 +908,8 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
         }
     }
 
-    // Persist client receipts to ~/.tunnelcraft/data/
-    let client_data_dir = expand_path(&PathBuf::from("~/.tunnelcraft/data"));
+    // Persist client receipts to ~/.craftnet/data/
+    let client_data_dir = expand_path("~/.craftnet/data");
     let _ = std::fs::create_dir_all(&client_data_dir);
 
     let config = NodeConfig {
@@ -955,8 +920,8 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
         ..Default::default()
     };
 
-    let mut node = TunnelCraftNode::new(config)?;
-    node.start().await?;
+    let mut node = CraftNetNode::new(config)?;
+    node.start(None).await?;
 
     // Wait for exit node discovery before making the request
     node.wait_for_exit(std::time::Duration::from_secs(15)).await?;
@@ -978,7 +943,7 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
 }
 
 // ============================================================================
-// Node Operations (using TunnelCraftNode directly)
+// Node Operations (using CraftNetNode directly)
 // ============================================================================
 
 async fn run_node(mode: NodeSubcommand) -> Result<()> {
@@ -1026,10 +991,10 @@ fn show_node_info(keyfile: &Path) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to load keypair: {}", e))?;
     let peer_id = PeerId::from(keypair.public());
 
-    println!("TunnelCraft Node Information");
+    println!("CraftNet Node Information");
     println!("============================");
     println!("Peer ID: {}", peer_id);
-    println!("Keyfile: {:?}", expand_path(keyfile));
+    println!("Keyfile: {:?}", expand_path(&keyfile.to_string_lossy()));
 
     Ok(())
 }
@@ -1042,7 +1007,7 @@ async fn run_node_with_config(
     allow_last_hop: bool,
     timeout_secs: u64,
 ) -> Result<()> {
-    info!("Starting TunnelCraft node with capabilities {:?}", capabilities);
+    info!("Starting CraftNet node with capabilities {:?}", capabilities);
 
     // Load or generate libp2p keypair using shared keystore
     let libp2p_keypair = load_or_generate_libp2p_keypair(keyfile)
@@ -1057,12 +1022,12 @@ async fn run_node_with_config(
     let bootstrap_peers = parse_bootstrap_peers(bootstrap)?;
 
     // Derive data directory from keyfile location (sibling directory)
-    let data_dir = expand_path(keyfile)
+    let data_dir = expand_path(&keyfile.to_string_lossy())
         .parent()
-        .map(|p| p.join("data"))
+        .map(|p: &Path| p.join("data"))
         .inspect(|p| { let _ = std::fs::create_dir_all(p); });
 
-    // Create node config using TunnelCraftNode
+    // Create node config using CraftNetNode
     let config = NodeConfig {
         capabilities,
         listen_addr,
@@ -1075,8 +1040,8 @@ async fn run_node_with_config(
     };
 
     // Create and start node
-    let mut node = TunnelCraftNode::new(config)?;
-    node.start().await?;
+    let mut node = CraftNetNode::new(config)?;
+    node.start(None).await?;
 
     info!(
         "Node running on {}. Press Ctrl+C to stop.",
@@ -1136,7 +1101,7 @@ mod tests {
     fn test_connect_with_hops() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "connect", "-n", "3"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "connect", "-n", "3"]);
         assert!(matches.is_ok());
     }
 
@@ -1144,7 +1109,7 @@ mod tests {
     fn test_connect_with_exit_region() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "connect", "--exit-region", "eu"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "connect", "--exit-region", "eu"]);
         assert!(matches.is_ok());
     }
 
@@ -1152,7 +1117,7 @@ mod tests {
     fn test_stats_command() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "stats"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "stats"]);
         assert!(matches.is_ok());
     }
 
@@ -1160,7 +1125,7 @@ mod tests {
     fn test_mode_command() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "mode", "client"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "mode", "client"]);
         assert!(matches.is_ok());
     }
 
@@ -1168,7 +1133,7 @@ mod tests {
     fn test_mode_show() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "mode"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "mode"]);
         assert!(matches.is_ok());
     }
 
@@ -1176,7 +1141,7 @@ mod tests {
     fn test_exits_command() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "exits"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "exits"]);
         assert!(matches.is_ok());
     }
 
@@ -1184,7 +1149,7 @@ mod tests {
     fn test_privacy_command() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "privacy", "standard"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "privacy", "standard"]);
         assert!(matches.is_ok());
     }
 
@@ -1192,7 +1157,7 @@ mod tests {
     fn test_privacy_show() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "privacy"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "privacy"]);
         assert!(matches.is_ok());
     }
 
@@ -1200,7 +1165,7 @@ mod tests {
     fn test_discovery_command() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "discovery", "on"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "discovery", "on"]);
         assert!(matches.is_ok());
     }
 
@@ -1209,7 +1174,7 @@ mod tests {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let matches = cmd.try_get_matches_from(vec![
-            "tunnelcraft",
+            "craftnet",
             "run",
             "-n",
             "2",
@@ -1224,7 +1189,7 @@ mod tests {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let matches = cmd.try_get_matches_from(vec![
-            "tunnelcraft",
+            "craftnet",
             "fetch",
             "https://example.com",
             "-n",
@@ -1237,7 +1202,7 @@ mod tests {
     fn test_credits_show() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "credits", "show"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "credits", "show"]);
         assert!(matches.is_ok());
     }
 
@@ -1245,7 +1210,7 @@ mod tests {
     fn test_credits_buy() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "credits", "buy", "100"]);
+        let matches = cmd.try_get_matches_from(vec!["craftnet", "credits", "buy", "100"]);
         assert!(matches.is_ok());
     }
 
@@ -1254,7 +1219,7 @@ mod tests {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let matches = cmd.try_get_matches_from(vec![
-            "tunnelcraft",
+            "craftnet",
             "request",
             "-m",
             "POST",
@@ -1285,4 +1250,25 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0); // Invalid format is skipped with warning
     }
+}
+
+
+fn load_or_generate_libp2p_keypair(keyfile: &Path) -> Result<libp2p::identity::Keypair> {
+    let path = craftec_keystore::expand_path(&keyfile.to_string_lossy());
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if path.exists() {
+        let bytes = std::fs::read(&path)?;
+        let keypair = libp2p::identity::Keypair::ed25519_from_bytes(bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid ed25519 key: {}", e))?;
+        return Ok(keypair);
+    }
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let ed25519_keypair = keypair.clone().try_into_ed25519()
+        .map_err(|_| anyhow::anyhow!("Failed to extract ed25519"))?;
+    std::fs::write(&path, ed25519_keypair.secret().as_ref())?;
+    Ok(keypair)
 }

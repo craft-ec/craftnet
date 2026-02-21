@@ -1,4 +1,4 @@
-# TunnelCraft Implementation Progress
+# CraftNet Implementation Progress
 
 ## Summary
 
@@ -48,7 +48,7 @@ Tracking implementation progress across all major development milestones.
 - [x] Stale session cleanup
 
 ### Client SDK (crates/client)
-- [x] TunnelCraftNode with event loop
+- [x] CraftNetNode with event loop
 - [x] RequestBuilder for HTTP mode
 - [x] `build_tunnel_shards()` for tunnel mode
 - [x] SOCKS5 proxy server (RFC 1928, CONNECT, NO AUTH)
@@ -96,10 +96,10 @@ Tracking implementation progress across all major development milestones.
 ### Mobile (React Native) — 2025-01-27
 - [x] Shared UI components (StatusIndicator, ConnectButton, etc.)
 - [x] VPN Context with dual-provide pattern
-- [x] iOS Native Module (TunnelCraftVPNModule.swift)
+- [x] iOS Native Module (CraftNetVPNModule.swift)
 - [x] iOS Network Extension (PacketTunnelProvider.swift)
-- [x] Android Native Module (TunnelCraftVPNModule.kt)
-- [x] Android VPN Service (TunnelCraftVpnService.kt)
+- [x] Android Native Module (CraftNetVPNModule.kt)
+- [x] Android VPN Service (CraftNetVpnService.kt)
 - [x] NativeTunnelContext for production
 
 ### Mobile Additions — 2025-02-07
@@ -110,9 +110,9 @@ Tracking implementation progress across all major development milestones.
 - [x] App.tsx switched to `getRecommendedProvider()`
 
 ### iOS Configuration
-- [x] TunnelCraft.entitlements (main app)
-- [x] TunnelCraftVPN.entitlements (Network Extension)
-- [x] TunnelCraftVPN/Info.plist (extension info)
+- [x] CraftNet.entitlements (main app)
+- [x] CraftNetVPN.entitlements (Network Extension)
+- [x] CraftNetVPN/Info.plist (extension info)
 - [x] App Group setup for Extension ↔ App communication
 
 ---
@@ -165,11 +165,11 @@ Tracking implementation progress across all major development milestones.
 ```bash
 # Rust backend
 cargo test                              # All tests
-cargo test -p tunnelcraft-core          # Core types
-cargo test -p tunnelcraft-erasure       # Erasure coding
-cargo test -p tunnelcraft-relay         # Relay handler
-cargo test -p tunnelcraft-exit          # Exit handler
-cargo test -p tunnelcraft-client        # Client SDK
+cargo test -p craftnet-core          # Core types
+cargo test -p craftnet-erasure       # Erasure coding
+cargo test -p craftnet-relay         # Relay handler
+cargo test -p craftnet-exit          # Exit handler
+cargo test -p craftnet-client        # Client SDK
 cargo clippy                            # Lint
 
 # Desktop

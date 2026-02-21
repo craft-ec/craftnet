@@ -1,0 +1,4 @@
+module CraftNetCore {
+    header "/Users/onlyabrak/dev/craftec/craftnet/apps/mobile/ios/CraftNetCore/.build/arm64-apple-macosx/debug/CraftNetCore.build/CraftNetCore-Swift.h"
+    requires objc
+}

@@ -1,5 +1,5 @@
 /**
- * TunnelCraft Context Exports
+ * CraftNet Context Exports
  *
  * Provides both mock (TunnelContext) and native (NativeTunnelContext) implementations.
  * Use NativeTunnelContext for production, TunnelContext for development/testing.
@@ -31,10 +31,10 @@ import { LogService } from '../services/LogService';
 
 export const isNativeVPNAvailable = (): boolean => {
   if (Platform.OS === 'ios') {
-    return !!NativeModules.TunnelCraftVPN;
+    return !!NativeModules.CraftNetVPN;
   }
   if (Platform.OS === 'android') {
-    return !!NativeModules.TunnelCraftVPN;
+    return !!NativeModules.CraftNetVPN;
   }
   return false;
 };

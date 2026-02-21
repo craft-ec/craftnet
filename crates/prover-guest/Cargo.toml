@@ -1,9 +1,9 @@
 [package]
-name = "tunnelcraft-prover-guest"
+name = "craftnet-prover-guest"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tunnelcraft-prover-guest-types = { path = "../prover-guest-types" }
+craftnet-prover-guest-types = { path = "../prover-guest-types" }
 sp1-zkvm = "5.2"
 sha2 = "0.10"

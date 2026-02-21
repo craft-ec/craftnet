@@ -1,0 +1,9 @@
+/Users/onlyabrak/dev/craftec/tunnelcraft/crates/prover-guest/target/elf-compilation/riscv32im-succinct-zkvm-elf/release/deps/p3_util-c404c68d84df3e01.d: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/array_serialization.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/linear_map.rs
+
+/Users/onlyabrak/dev/craftec/tunnelcraft/crates/prover-guest/target/elf-compilation/riscv32im-succinct-zkvm-elf/release/deps/libp3_util-c404c68d84df3e01.rlib: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/array_serialization.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/linear_map.rs
+
+/Users/onlyabrak/dev/craftec/tunnelcraft/crates/prover-guest/target/elf-compilation/riscv32im-succinct-zkvm-elf/release/deps/libp3_util-c404c68d84df3e01.rmeta: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/array_serialization.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/linear_map.rs
+
+/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/lib.rs:
+/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/array_serialization.rs:
+/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p3-util-0.2.3-succinct/src/linear_map.rs:

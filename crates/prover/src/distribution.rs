@@ -15,10 +15,10 @@
 use tracing::info;
 
 use sp1_sdk::{include_elf, EnvProver, HashableKey, ProverClient, SP1Stdin};
-use tunnelcraft_distribution_guest_types::DistributionInput;
+use craftnet_distribution_guest_types::DistributionInput;
 
 /// The distribution guest ELF binary, embedded at build time by sp1_build.
-const DISTRIBUTION_ELF: &[u8] = include_elf!("tunnelcraft-distribution-guest");
+const DISTRIBUTION_ELF: &[u8] = include_elf!("craftnet-distribution-guest");
 
 /// A Groth16 proof over the distribution Merkle tree construction.
 ///

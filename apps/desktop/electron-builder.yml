@@ -1,9 +1,9 @@
-# TunnelCraft Desktop App - Electron Builder Configuration
+# CraftNet Desktop App - Electron Builder Configuration
 # https://www.electron.build/configuration/configuration
 
-appId: com.tunnelcraft.desktop
-productName: TunnelCraft
-copyright: Copyright © 2024 TunnelCraft
+appId: com.craftnet.desktop
+productName: CraftNet
+copyright: Copyright © 2024 CraftNet
 
 # Build directories
 directories:
@@ -19,8 +19,8 @@ files:
 
 # Extra files (daemon binary)
 extraResources:
-  - from: "../../target/release/tunnelcraft-daemon"
-    to: "daemon/tunnelcraft-daemon"
+  - from: "../../target/release/craftnet-daemon"
+    to: "daemon/craftnet-daemon"
     filter:
       - "**/*"
 
@@ -45,8 +45,8 @@ mac:
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
-    NSNetworkVolumesUsageDescription: "TunnelCraft requires network access to establish VPN connections."
-    NSSystemAdministrationUsageDescription: "TunnelCraft requires administrator privileges to install the VPN daemon."
+    NSNetworkVolumesUsageDescription: "CraftNet requires network access to establish VPN connections."
+    NSSystemAdministrationUsageDescription: "CraftNet requires administrator privileges to install the VPN daemon."
 
 # DMG settings
 dmg:
@@ -87,7 +87,7 @@ nsis:
   installerHeaderIcon: build/icon.ico
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  menuCategory: TunnelCraft
+  menuCategory: CraftNet
   include: build/installer.nsh
   warningsAsErrors: false
   runAfterFinish: true
@@ -108,8 +108,8 @@ linux:
         - x64
   icon: build/icons
   category: Network
-  maintainer: TunnelCraft Team
-  vendor: TunnelCraft
+  maintainer: CraftNet Team
+  vendor: CraftNet
   synopsis: Decentralized P2P VPN
   description: A trustless, decentralized VPN using P2P technology for maximum privacy.
 
@@ -129,7 +129,7 @@ deb:
 publish:
   - provider: github
     owner: craftec
-    repo: tunnelcraft
+    repo: craftnet
     releaseType: release
 
 # Notarization (macOS)

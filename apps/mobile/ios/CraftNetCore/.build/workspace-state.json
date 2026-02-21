@@ -1,0 +1,27 @@
+{
+  "object" : {
+    "artifacts" : [
+      {
+        "kind" : "xcframework",
+        "packageRef" : {
+          "identity" : "craftnetcore",
+          "kind" : "root",
+          "location" : "/Users/onlyabrak/dev/craftec/craftnet/apps/mobile/ios/CraftNetCore",
+          "name" : "CraftNetCore"
+        },
+        "path" : "/Users/onlyabrak/dev/craftec/craftnet/apps/mobile/ios/CraftNetCore/Frameworks/CraftNetUniFFI.xcframework",
+        "source" : {
+          "type" : "local"
+        },
+        "targetName" : "CraftNetUniFFI"
+      }
+    ],
+    "dependencies" : [
+
+    ],
+    "prebuilts" : [
+
+    ]
+  },
+  "version" : 7
+}

@@ -3,7 +3,7 @@
 //! Supports two modes:
 //! - **Mock Mode**: For development/testing without Solana. All operations succeed
 //!   and state is tracked in-memory.
-//! - **Live Mode**: Actual Solana RPC calls to the TunnelCraft settlement program.
+//! - **Live Mode**: Actual Solana RPC calls to the CraftNet settlement program.
 //!
 //! ## New Settlement Model
 //!
@@ -28,7 +28,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-use tunnelcraft_core::{Id, PublicKey, ForwardReceipt, SubscriptionTier};
+use craftnet_core::{Id, PublicKey, ForwardReceipt, SubscriptionTier};
 
 use crate::{
     SettlementError, Result,
@@ -56,7 +56,7 @@ pub struct SettlementConfig {
     pub mode: SettlementMode,
     /// Solana RPC endpoint (only used in Live mode)
     pub rpc_url: String,
-    /// Program ID for the TunnelCraft settlement program
+    /// Program ID for the CraftNet settlement program
     pub program_id: [u8; 32],
     /// USDC mint address (6 decimal SPL token)
     pub usdc_mint: [u8; 32],
@@ -93,7 +93,7 @@ impl SettlementConfig {
         }
     }
 
-    /// Devnet program ID for TunnelCraft settlement
+    /// Devnet program ID for CraftNet settlement
     /// Program: 2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH
     pub const DEVNET_PROGRAM_ID: [u8; 32] = [
         20, 219, 24, 53, 50, 190, 161, 233, 43, 183, 226, 86, 179, 16, 135, 37,
@@ -157,7 +157,7 @@ struct MockState {
     tx_counter: u64,
 }
 
-/// Anchor instruction discriminators for the TunnelCraft settlement program.
+/// Anchor instruction discriminators for the CraftNet settlement program.
 /// Each is the first 8 bytes of SHA256("global:<instruction_name>").
 mod instruction {
     pub const SUBSCRIBE:            [u8; 8] = [0xfe, 0x1c, 0xbf, 0x8a, 0x9c, 0xb3, 0xb7, 0x35];
@@ -1000,7 +1000,7 @@ impl SettlementClient {
 
             // Verify Merkle proof if distribution root and proof are provided
             if subscription.distribution_posted && !claim.merkle_proof.is_empty() {
-                use tunnelcraft_prover::{merkle_leaf, MerkleProof, MerkleTree};
+                use craftnet_prover::{merkle_leaf, MerkleProof, MerkleTree};
                 let leaf = merkle_leaf(&claim.node_pubkey, claim.relay_bytes);
                 let proof = MerkleProof {
                     siblings: claim.merkle_proof.clone(),

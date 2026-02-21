@@ -34,7 +34,7 @@ exports.default = async function notarizing(context) {
 
   try {
     await notarize({
-      appBundleId: 'com.tunnelcraft.desktop',
+      appBundleId: 'com.craftnet.desktop',
       appPath: appPath,
       appleId: process.env.APPLE_ID,
       appleIdPassword: process.env.APPLE_ID_PASSWORD,

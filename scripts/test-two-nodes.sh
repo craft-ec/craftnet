@@ -1,12 +1,12 @@
 #!/bin/bash
-# End-to-end test: Run two TunnelCraft nodes and verify they can connect
+# End-to-end test: Run two CraftNet nodes and verify they can connect
 
 set -e
 
-echo "Building TunnelCraft..."
-cargo build --release -p tunnelcraft-node 2>/dev/null
+echo "Building CraftNet..."
+cargo build --release -p craftnet-node 2>/dev/null
 
-NODE_BIN="./target/release/tunnelcraft-node"
+NODE_BIN="./target/release/craftnet-node"
 
 # Create temp directories for node keys
 TMPDIR=$(mktemp -d)

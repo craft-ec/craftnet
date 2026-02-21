@@ -1,4 +1,4 @@
-//! TunnelCraft Aggregator
+//! CraftNet Aggregator
 //!
 //! Standalone service that any node can run. Subscribes to the proof
 //! gossipsub topic, collects signed summaries from relays, builds
@@ -14,9 +14,9 @@ use std::path::Path;
 use serde::{Serialize, Deserialize};
 use tracing::{debug, info, warn};
 
-use tunnelcraft_core::PublicKey;
-use tunnelcraft_network::{ProofMessage, PoolType};
-use tunnelcraft_prover::{MerkleProof, MerkleTree};
+use craftnet_core::PublicKey;
+use craftnet_network::{ProofMessage, PoolType};
+use craftnet_prover::{MerkleProof, MerkleTree};
 
 /// Maximum number of pending (out-of-order) proofs per relay per pool.
 /// Prevents unbounded memory growth from misbehaving relays.
@@ -601,7 +601,7 @@ impl Aggregator {
             return Err(AggregatorError::InvalidSignature);
         }
         let sig: [u8; 64] = msg.signature[..64].try_into().unwrap();
-        if !tunnelcraft_crypto::verify_signature(&msg.relay_pubkey, &msg.signable_data(), &sig) {
+        if !craftec_crypto::verify_signature(&msg.relay_pubkey, &msg.signable_data(), &sig) {
             warn!(
                 "Invalid signature from relay {}",
                 hex::encode(&msg.relay_pubkey[..8]),
@@ -1329,7 +1329,7 @@ mod tests {
 
     /// Derive the ed25519 public key for a test relay seed
     fn relay_pubkey(seed: u8) -> [u8; 32] {
-        tunnelcraft_crypto::SigningKeypair::from_secret_bytes(&[seed; 32]).public_key_bytes()
+        craftec_crypto::SigningKeypair::from_secret_bytes(&[seed; 32]).public_key_bytes()
     }
 
     fn make_proof(relay: u8, pool: u8, pool_type: PoolType, batch: u64, cumulative: u64, prev_root: [u8; 32], new_root: [u8; 32]) -> ProofMessage {
@@ -1338,7 +1338,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     fn make_proof_epoch(relay: u8, pool: u8, pool_type: PoolType, batch: u64, cumulative: u64, prev_root: [u8; 32], new_root: [u8; 32]) -> ProofMessage {
-        let keypair = tunnelcraft_crypto::SigningKeypair::from_secret_bytes(&[relay; 32]);
+        let keypair = craftec_crypto::SigningKeypair::from_secret_bytes(&[relay; 32]);
         let mut msg = ProofMessage {
             relay_pubkey: keypair.public_key_bytes(),
             pool_pubkey: [pool; 32],
@@ -1351,7 +1351,7 @@ mod tests {
             timestamp: 1700000000,
             signature: vec![],
         };
-        let sig = tunnelcraft_crypto::sign_data(&keypair, &msg.signable_data());
+        let sig = craftec_crypto::sign_data(&keypair, &msg.signable_data());
         msg.signature = sig.to_vec();
         msg
     }
@@ -1627,7 +1627,7 @@ mod tests {
 
     /// Helper: create a temp dir + file for history tests, returns (dir, path)
     fn history_tmp(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("tunnelcraft-test-{}", name));
+        let dir = std::env::temp_dir().join(format!("craftnet-test-{}", name));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("history.bin");
         let _ = std::fs::remove_file(&path);
@@ -1847,7 +1847,7 @@ mod tests {
 
     #[test]
     fn test_history_nonexistent_file() {
-        let path = std::path::Path::new("/tmp/nonexistent-tunnelcraft-history.jsonl");
+        let path = std::path::Path::new("/tmp/nonexistent-craftnet-history.jsonl");
         assert_eq!(Aggregator::history_since(path, 0).len(), 0);
         assert_eq!(Aggregator::get_volume_history(path, 0, u64::MAX).len(), 0);
         assert_eq!(Aggregator::recover_history_seq(path), 0);

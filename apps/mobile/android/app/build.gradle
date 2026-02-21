@@ -27,11 +27,11 @@ def enableProguardInReleaseBuilds = false
 def hermesEnabled = (findProperty('hermesEnabled') ?: "true").toBoolean()
 
 android {
-    namespace "com.tunnelcraft"
+    namespace "com.craftnet"
     compileSdkVersion rootProject.ext.compileSdkVersion
 
     defaultConfig {
-        applicationId "com.tunnelcraft"
+        applicationId "com.craftnet"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1

@@ -3,11 +3,11 @@
 //! Builds HTTP request data, then delegates to the shared shard builder
 //! for encrypt → frame → erasure code → onion wrap.
 
-use tunnelcraft_core::{
+use craftnet_core::{
     Shard, Id, PublicKey,
     lease_set::LeaseSet,
 };
-use tunnelcraft_crypto::SigningKeypair;
+use craftec_crypto::SigningKeypair;
 
 use crate::path::{OnionPath, PathHop};
 use crate::shard_builder::build_onion_shards;
@@ -122,12 +122,12 @@ impl RequestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnelcraft_erasure::TOTAL_SHARDS;
+    use craftnet_erasure::TOTAL_SHARDS;
 
     #[test]
     fn test_request_builder() {
         let builder = RequestBuilder::new("GET", "https://example.com")
-            .header("User-Agent", "TunnelCraft");
+            .header("User-Agent", "CraftNet");
 
         assert_eq!(builder.method, "GET");
         assert_eq!(builder.url, "https://example.com");
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn test_build_onion_direct() {
         let keypair = SigningKeypair::generate();
-        let enc_keypair = tunnelcraft_crypto::EncryptionKeypair::generate();
+        let enc_keypair = craftec_crypto::EncryptionKeypair::generate();
 
         let exit = PathHop {
             peer_id: b"exit_peer".to_vec(),

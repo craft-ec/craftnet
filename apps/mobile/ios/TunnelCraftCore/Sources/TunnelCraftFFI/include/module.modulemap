@@ -1,4 +1,0 @@
-module tunnelcraft_uniffiFFI {
-    header "tunnelcraft_uniffiFFI.h"
-    export *
-}

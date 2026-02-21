@@ -12,7 +12,7 @@ Updated: 2026-02-08
 ### 2. Subscription Verification (gossip + cache + priority)
 - [x] Add SUBSCRIPTION_TOPIC gossipsub topic
 - [x] Add SubscriptionAnnouncement message type (user pubkey, tier, expires_at, signature)
-- [x] Add subscribe/publish methods to TunnelCraftBehaviour
+- [x] Add subscribe/publish methods to CraftNetBehaviour
 - [x] Add subscription cache to Node (pubkey → SubscriptionEntry{tier, expires_at, verified})
 - [x] Client announces subscription on connect (gossipsub publish)
 - [x] Relays handle subscription announcements → insert into cache
@@ -23,7 +23,7 @@ Updated: 2026-02-08
 ### 3. Settlement Production Readiness
 - [x] Sign ProofMessage with relay's ed25519 keypair before gossip publish
 - [x] Aggregator: verify ProofMessage signature before accepting
-- [x] Daemon: read TUNNELCRAFT_PROGRAM_ID + TUNNELCRAFT_NETWORK env vars to select devnet/mainnet config
+- [x] Daemon: read CRAFTNET_PROGRAM_ID + CRAFTNET_NETWORK env vars to select devnet/mainnet config
 
 ### 4. Dead Code Cleanup
 - [x] Remove unused `info` import in aggregator
@@ -53,11 +53,11 @@ Updated: 2026-02-08
 | CLI | `apps/cli/src/main.rs` | 20+ commands fully connected to daemon via IPC client |
 | Settings Persistence | `crates/settings/src/config.rs` | JSON config load/save |
 | Key Management | `crates/keystore/` | ED25519 generate/store/load; encrypted export/import with ChaCha20-Poly1305 |
-| Anchor Settlement Program | `programs/tunnelcraft-settlement/` | Deployed to devnet |
+| Anchor Settlement Program | `programs/craftnet-settlement/` | Deployed to devnet |
 | 2-hop + 3-hop routing | `crates/client/src/node.rs` | Unified destination resolution, cross-shard fan-out, proactive client DHT lookup |
 | Subscription Verification | `crates/network/src/subscription.rs`, `crates/client/src/node.rs` | Gossipsub announcements, relay cache, periodic on-chain batch verification, priority routing |
 | Settlement Signing | `crates/client/src/node.rs`, `crates/aggregator/src/lib.rs` | ProofMessage signed with relay ed25519 keypair; aggregator verifies before accepting |
-| Devnet/Mainnet Config | `crates/daemon/src/service.rs` | TUNNELCRAFT_PROGRAM_ID + TUNNELCRAFT_NETWORK env vars select settlement target |
+| Devnet/Mainnet Config | `crates/daemon/src/service.rs` | CRAFTNET_PROGRAM_ID + CRAFTNET_NETWORK env vars select settlement target |
 
 ### Settlement Pipeline Redesign + risc0 ZK Proofs (2026-02-08)
 

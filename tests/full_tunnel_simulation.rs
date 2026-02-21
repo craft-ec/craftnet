@@ -1,6 +1,6 @@
 //! Full Tunnel Simulation Tests (Onion Routing)
 //!
-//! End-to-end integration tests that simulate direct-mode TunnelCraft operation:
+//! End-to-end integration tests that simulate direct-mode CraftNet operation:
 //! - Client builds onion-encrypted shards via RequestBuilder::build_onion()
 //! - Exit node decrypts, reassembles, and fetches from real HTTP server
 //! - Exit creates encrypted response shards
@@ -31,13 +31,15 @@ use axum::{
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use tunnelcraft_client::{RequestBuilder, PathHop, OnionPath, build_tunnel_shards, Socks5Server, TunnelBurst, ClientError};
-use tunnelcraft_core::{Shard, TunnelMetadata, lease_set::LeaseSet};
-use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair, decrypt_from_sender, decrypt_routing_tag};
-use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
-use tunnelcraft_erasure::chunker::reassemble;
-use tunnelcraft_exit::{ExitConfig, ExitHandler, HttpRequest, HttpResponse};
-use tunnelcraft_relay::RelayHandler;
+use craftnet_client::{RequestBuilder, PathHop, OnionPath, build_tunnel_shards, Socks5Server, TunnelBurst, ClientError};
+use craftnet_core::{Shard, TunnelMetadata, lease_set::LeaseSet};
+use craftec_crypto::{SigningKeypair, EncryptionKeypair, decrypt_from_sender};
+use craftnet_core::onion_crypto::{decrypt_routing_tag};
+
+use craftnet_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
+use craftnet_erasure::chunker::reassemble;
+use craftnet_exit::{ExitConfig, ExitHandler, HttpRequest, HttpResponse};
+use craftnet_relay::RelayHandler;
 
 // =============================================================================
 // TEST HTTP SERVER
@@ -48,7 +50,7 @@ async fn start_test_server() -> (SocketAddr, oneshot::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let app = Router::new()
-        .route("/small", get(|| async { "Hello, TunnelCraft!" }))
+        .route("/small", get(|| async { "Hello, CraftNet!" }))
         .route("/medium", get(|| async {
             // ~10KB response
             "X".repeat(10 * 1024)
@@ -65,7 +67,7 @@ async fn start_test_server() -> (SocketAddr, oneshot::Sender<()>) {
             axum::Json(serde_json::json!({
                 "status": "ok",
                 "data": {
-                    "message": "TunnelCraft tunnel working!",
+                    "message": "CraftNet tunnel working!",
                     "items": (0..100).map(|i| format!("item_{}", i)).collect::<Vec<_>>(),
                 }
             }))
@@ -224,7 +226,7 @@ async fn test_full_tunnel_small_request() {
 
     // Build onion-encrypted request shards with client encryption pubkey for response
     let (_request_id, shards) = RequestBuilder::new("GET", &url)
-        .header("User-Agent", "TunnelCraft-Test/1.0")
+        .header("User-Agent", "CraftNet-Test/1.0")
         .build_onion_with_enc_key(&client_signing, &exit_hop, &[], &lease_set, client_enc_pubkey, [0u8; 32])
         .expect("Failed to build onion request");
 
@@ -268,7 +270,7 @@ async fn test_full_tunnel_small_request() {
     assert_eq!(http_response.status, 200);
     assert_eq!(
         String::from_utf8_lossy(&http_response.body),
-        "Hello, TunnelCraft!"
+        "Hello, CraftNet!"
     );
 
     println!(
@@ -682,7 +684,7 @@ async fn test_tunnel_mode_direct_echo() {
         is_close: false,
     };
 
-    let tcp_data = b"Hello from TunnelCraft socket mode!";
+    let tcp_data = b"Hello from CraftNet socket mode!";
 
     // Build tunnel-mode shards (mode 0x01)
     let (_request_id, shards) = build_tunnel_shards(
@@ -1078,7 +1080,7 @@ async fn test_socks5_full_e2e() {
     println!("SOCKS5 proxy listening on {}", socks_addr);
 
     // === 5. Spawn "mini-node" that processes TunnelBursts ===
-    // This replaces TunnelCraftNode — receives bursts, builds tunnel shards,
+    // This replaces CraftNetNode — receives bursts, builds tunnel shards,
     // feeds through exit handler, decrypts response, sends back via response_tx.
     let mini_node = tokio::spawn({
         let client_signing = client_signing.clone();

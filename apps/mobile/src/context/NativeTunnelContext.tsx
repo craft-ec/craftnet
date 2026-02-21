@@ -1,5 +1,5 @@
 /**
- * Native-Bridged TunnelCraft Context
+ * Native-Bridged CraftNet Context
  *
  * This context connects the React Native UI to the native VPN modules.
  * It replaces the mock implementation with real native calls.
@@ -15,14 +15,14 @@ import React, {
   ReactNode,
 } from 'react';
 import { Platform, AppState, AppStateStatus } from 'react-native';
-import TunnelCraftVPN, {
+import CraftNetVPN, {
   ConnectionState,
   PrivacyLevel,
   VPNStatus,
   NetworkStats,
   VPNConfig,
   NativeExitNode,
-} from '../native/TunnelCraftVPN';
+} from '../native/CraftNetVPN';
 import { NodeMode } from '../theme/colors';
 import { TunnelContext, TunnelContextType, AvailableExit } from './TunnelContext';
 import { LogService } from '../services/LogService';
@@ -148,7 +148,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
 
   // Subscribe to native events
   useEffect(() => {
-    const unsubscribeState = TunnelCraftVPN.onStateChange((state) => {
+    const unsubscribeState = CraftNetVPN.onStateChange((state) => {
       LogService.info('NativeTunnelContext', 'State changed: ' + state);
       setConnectionState(state);
 
@@ -159,12 +159,12 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
       }
     });
 
-    const unsubscribeError = TunnelCraftVPN.onError((error) => {
+    const unsubscribeError = CraftNetVPN.onError((error) => {
       LogService.error('NativeTunnelContext', 'Error: ' + error);
       setErrorMessage(error);
     });
 
-    const unsubscribeStats = TunnelCraftVPN.onStatsUpdate((nativeStats) => {
+    const unsubscribeStats = CraftNetVPN.onStatsUpdate((nativeStats) => {
       const s = nativeStats as unknown as Record<string, number>;
       setStats(prev => ({
         ...prev,
@@ -240,7 +240,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
 
     const pollExits = async () => {
       try {
-        const nativeExits = await TunnelCraftVPN.getAvailableExits();
+        const nativeExits = await CraftNetVPN.getAvailableExits();
         if (nativeExits && nativeExits.length > 0) {
           setAvailableExits(nativeExits.map((exit: NativeExitNode, idx: number) => ({
             id: exit.pubkey || String(idx + 1),
@@ -318,7 +318,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
 
   const refreshStatus = useCallback(async () => {
     try {
-      const status = await TunnelCraftVPN.getStatus();
+      const status = await CraftNetVPN.getStatus();
       setConnectionState(status.state);
       setCreditsState(status.credits);
       
@@ -339,7 +339,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
         privacyLevel,
       };
 
-      await TunnelCraftVPN.connect(config);
+      await CraftNetVPN.connect(config);
 
       // Status will be updated via event listener
     } catch (error) {
@@ -352,7 +352,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
   const disconnect = useCallback(async () => {
     try {
       setConnectionState('disconnecting');
-      await TunnelCraftVPN.disconnect();
+      await CraftNetVPN.disconnect();
       setStats(defaultStats);
     } catch (error) {
       LogService.error('NativeTunnelContext', 'Disconnect failed: ' + error);
@@ -371,7 +371,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
   const setMode = useCallback(async (newMode: NodeMode) => {
     setModeState(newMode);
     try {
-      await TunnelCraftVPN.setMode(newMode);
+      await CraftNetVPN.setMode(newMode);
     } catch (error) {
       LogService.error('NativeTunnelContext', 'Failed to set mode: ' + error);
     }
@@ -382,7 +382,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
 
     if (isConnected) {
       try {
-        await TunnelCraftVPN.setPrivacyLevel(level);
+        await CraftNetVPN.setPrivacyLevel(level);
       } catch (error) {
         LogService.error('NativeTunnelContext', 'Failed to set privacy level: ' + error);
       }
@@ -392,7 +392,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
   const setExitSelection = useCallback((selection: ExitSelection) => {
     setExitSelectionState(selection);
     const region = selection.region === 'auto' ? 'auto' : selection.region;
-    TunnelCraftVPN.selectExit(
+    CraftNetVPN.selectExit(
       region,
       selection.countryCode,
       undefined,
@@ -404,7 +404,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
   const setCredits = useCallback(async (newCredits: number) => {
     setCreditsState(newCredits);
     try {
-      await TunnelCraftVPN.setCredits(newCredits);
+      await CraftNetVPN.setCredits(newCredits);
     } catch (error) {
       LogService.error('NativeTunnelContext', 'Failed to set credits: ' + error);
     }
@@ -412,7 +412,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
 
   const purchaseCredits = useCallback(async (amount: number) => {
     try {
-      const result = await TunnelCraftVPN.purchaseCredits(amount);
+      const result = await CraftNetVPN.purchaseCredits(amount);
       setCreditsState(result.balance);
     } catch (error) {
       LogService.error('NativeTunnelContext', 'Failed to purchase credits: ' + error);
@@ -422,7 +422,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
 
   const request = useCallback(async (method: string, url: string, body?: string, headers?: Record<string, string>): Promise<{ status: number; body: string }> => {
     try {
-      return await TunnelCraftVPN.request(method, url, body, headers);
+      return await CraftNetVPN.request(method, url, body, headers);
     } catch (error) {
       LogService.error('NativeTunnelContext', 'Request failed: ' + error);
       return { status: 0, body: error instanceof Error ? error.message : 'Request failed' };

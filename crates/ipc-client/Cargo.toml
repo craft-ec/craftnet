@@ -1,5 +1,5 @@
 [package]
-name = "tunnelcraft-ipc-client"
+name = "craftnet-ipc-client"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

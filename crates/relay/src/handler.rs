@@ -13,9 +13,11 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{debug, info, warn};
-use tunnelcraft_core::{Id, PublicKey, Shard, ForwardReceipt, TunnelCraftError};
-use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair, peel_onion_layer, sign_forward_receipt};
-use tunnelcraft_settlement::SettlementClient;
+use craftnet_core::{Id, PublicKey, Shard, ForwardReceipt, CraftNetError};
+use craftec_crypto::{SigningKeypair, EncryptionKeypair};
+use craftnet_core::onion_crypto::{peel_onion_layer};
+use craftnet_core::receipt_crypto::{sign_forward_receipt};
+use craftnet_settlement::SettlementClient;
 
 #[derive(Error, Debug)]
 pub enum RelayError {
@@ -32,8 +34,8 @@ pub enum RelayError {
     Internal(String),
 }
 
-impl From<TunnelCraftError> for RelayError {
-    fn from(e: TunnelCraftError) -> Self {
+impl From<CraftNetError> for RelayError {
+    fn from(e: CraftNetError) -> Self {
         RelayError::Internal(e.to_string())
     }
 }
@@ -256,8 +258,10 @@ impl RelayHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnelcraft_crypto::{EncryptionKeypair, build_onion_header};
-    use tunnelcraft_core::OnionSettlement;
+    use craftec_crypto::{EncryptionKeypair};
+use craftnet_core::onion_crypto::{build_onion_header};
+
+    use craftnet_core::OnionSettlement;
 
     fn make_handler() -> RelayHandler {
         let keypair = SigningKeypair::generate();

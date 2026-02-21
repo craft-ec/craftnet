@@ -116,7 +116,7 @@ mod tests {
     fn test_request_roundtrip() {
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_string(), "application/json".to_string());
-        headers.insert("User-Agent".to_string(), "TunnelCraft/0.1".to_string());
+        headers.insert("User-Agent".to_string(), "CraftNet/0.1".to_string());
 
         let request = HttpRequest {
             method: "POST".to_string(),

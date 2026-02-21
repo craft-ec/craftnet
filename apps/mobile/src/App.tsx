@@ -1,5 +1,5 @@
 /**
- * TunnelCraft Mobile App
+ * CraftNet Mobile App
  *
  * A decentralized P2P VPN with unified Client/Node/Both mode support
  */

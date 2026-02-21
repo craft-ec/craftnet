@@ -1,7 +1,7 @@
 //! SOCKS5 proxy server (RFC 1928, CONNECT only, NO AUTH)
 //!
 //! Listens for incoming browser connections, performs the SOCKS5 handshake,
-//! then relays TCP data bidirectionally through the TunnelCraft network.
+//! then relays TCP data bidirectionally through the CraftNet network.
 //!
 //! Each SOCKS5 CONNECT creates a long-lived session. Incoming TCP data is
 //! buffered into bursts (50ms timeout or 18KB full) and sent as tunnel-mode
@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use tunnelcraft_core::TunnelMetadata;
+use craftnet_core::TunnelMetadata;
 
 use crate::node::TunnelBurst;
 use crate::ClientError;
@@ -38,7 +38,7 @@ impl Socks5Server {
     /// Create a new SOCKS5 server.
     ///
     /// `burst_tx` is the sending side of the channel that feeds into
-    /// `TunnelCraftNode`'s event loop via `set_tunnel_burst_rx()`.
+    /// `CraftNetNode`'s event loop via `set_tunnel_burst_rx()`.
     pub fn new(listen_addr: SocketAddr, burst_tx: mpsc::Sender<TunnelBurst>) -> Self {
         Self {
             listen_addr,

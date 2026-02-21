@@ -67,7 +67,7 @@ impl Shard {
     }
 }
 
-/// Wire format header magic bytes (new format: "TCON" = TunnelCraft ONion)
+/// Wire format header magic bytes (new format: "TCON" = CraftNet ONion)
 pub const SHARD_MAGIC: [u8; 4] = [0x54, 0x43, 0x4F, 0x4E]; // "TCON"
 
 /// Current wire format version

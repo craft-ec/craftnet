@@ -1,4 +1,4 @@
-# TunnelCraft Implementation Status
+# CraftNet Implementation Status
 
 ## Platform Support Matrix
 
@@ -21,7 +21,7 @@
 | `relay` | Best-effort relay + destination verification | Complete | Trustless destination check |
 | `exit` | Exit node + HTTP fetch + TCP tunnel | Complete | Dual-mode dispatch |
 | `settlement` | Solana client | Partial | Mock + Photon live modes |
-| `client` | TunnelCraftNode + SOCKS5 + tunnel builder | Complete | Full SDK |
+| `client` | CraftNetNode + SOCKS5 + tunnel builder | Complete | Full SDK |
 | `daemon` | Background service + IPC | Complete | JSON-RPC, Unix socket + Windows pipe |
 | `uniffi` | Mobile FFI bindings | Complete | Compiles, tests pass |
 
@@ -50,9 +50,9 @@
 | VPN Context | Complete | Unified dual-provide pattern |
 | Request screen | Complete | Method picker, URL input, response |
 | Adaptive layouts | Complete | iPhone/iPad support |
-| iOS Native Module | Complete | TunnelCraftVPNModule.swift |
+| iOS Native Module | Complete | CraftNetVPNModule.swift |
 | iOS Network Extension | Complete | PacketTunnelProvider.swift |
-| Android Native Module | Complete | TunnelCraftVPNModule.kt |
+| Android Native Module | Complete | CraftNetVPNModule.kt |
 | Android VPN Service | Complete | VpnService subclass |
 
 ## Feature Completion
@@ -102,7 +102,7 @@ cargo check
 cargo test
 
 # Build UniFFI bindings for mobile
-cargo build -p tunnelcraft-uniffi --release
+cargo build -p craftnet-uniffi --release
 
 # Desktop development
 cd apps/desktop && npm install && npm run dev

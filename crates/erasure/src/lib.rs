@@ -1,4 +1,4 @@
-//! TunnelCraft Erasure Coding
+//! CraftNet Erasure Coding
 //!
 //! Reed-Solomon encoding (5/3) for request/response fragmentation.
 //! Requests/responses are split into 5 shards; only 3 needed for reconstruction.
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn test_encode_decode_basic() {
         let coder = ErasureCoder::new().unwrap();
-        let data = b"Hello, TunnelCraft! This is a test message for erasure coding.";
+        let data = b"Hello, CraftNet! This is a test message for erasure coding.";
 
         let shards = coder.encode(data).unwrap();
         assert_eq!(shards.len(), TOTAL_SHARDS);

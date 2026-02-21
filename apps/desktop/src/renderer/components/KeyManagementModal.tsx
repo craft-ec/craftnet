@@ -22,8 +22,8 @@ export const KeyManagementModal: React.FC<KeyManagementModalProps> = ({ mode, on
     try {
       if (isExport) {
         const result = await window.electronAPI.showSaveDialog({
-          title: 'Export TunnelCraft Key',
-          defaultPath: 'tunnelcraft-key.enc',
+          title: 'Export CraftNet Key',
+          defaultPath: 'craftnet-key.enc',
           filters: [
             { name: 'Encrypted Key', extensions: ['enc'] },
             { name: 'All Files', extensions: ['*'] },
@@ -34,7 +34,7 @@ export const KeyManagementModal: React.FC<KeyManagementModalProps> = ({ mode, on
         }
       } else {
         const result = await window.electronAPI.showOpenDialog({
-          title: 'Import TunnelCraft Key',
+          title: 'Import CraftNet Key',
           filters: [
             { name: 'Encrypted Key', extensions: ['enc'] },
             { name: 'All Files', extensions: ['*'] },

@@ -1,4 +1,4 @@
-//! Shard protocol for TunnelCraft
+//! Shard protocol for CraftNet
 //!
 //! Custom libp2p request-response protocol for sending and receiving shards between peers.
 
@@ -9,10 +9,10 @@ use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 #[allow(unused_imports)]
 use libp2p::request_response::{self, Codec};
 use libp2p::StreamProtocol;
-use tunnelcraft_core::{ForwardReceipt, Shard, SHARD_MAGIC, SHARD_VERSION};
+use craftnet_core::{ForwardReceipt, Shard, SHARD_MAGIC, SHARD_VERSION};
 
 /// Protocol identifier for shard messages
-pub const SHARD_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/tunnelcraft/shard/2.0.0");
+pub const SHARD_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/craftnet/shard/2.0.0");
 
 /// Maximum shard message size (10KB — onion header + payload per shard)
 pub const MAX_SHARD_SIZE: usize = 10 * 1024;
@@ -284,7 +284,7 @@ impl Codec for ShardCodec {
 
 /// Protocol identifier for persistent shard streams
 pub const SHARD_STREAM_PROTOCOL: libp2p::StreamProtocol =
-    libp2p::StreamProtocol::new("/tunnelcraft/shard-stream/1.0.0");
+    libp2p::StreamProtocol::new("/craftnet/shard-stream/1.0.0");
 
 /// Frame type bytes
 const FRAME_TYPE_SHARD: u8 = 0x01;
@@ -518,7 +518,7 @@ mod tests {
     fn test_protocol_id() {
         assert_eq!(
             SHARD_PROTOCOL_ID.as_ref(),
-            "/tunnelcraft/shard/2.0.0"
+            "/craftnet/shard/2.0.0"
         );
     }
 
@@ -717,7 +717,7 @@ mod tests {
     fn test_stream_protocol_id() {
         assert_eq!(
             SHARD_STREAM_PROTOCOL.as_ref(),
-            "/tunnelcraft/shard-stream/1.0.0"
+            "/craftnet/shard-stream/1.0.0"
         );
     }
 

@@ -14,19 +14,16 @@ use std::time::{Duration, Instant};
 use sha2::{Sha256, Digest};
 use tracing::{debug, info, warn};
 
-use tunnelcraft_core::{
+use craftnet_core::{
     Shard, Id, PublicKey, ExitPayload,
     TunnelMetadata, PAYLOAD_MODE_TUNNEL,
 };
-use tunnelcraft_crypto::{
-    SigningKeypair, EncryptionKeypair,
-    decrypt_routing_tag, decrypt_exit_payload,
-    build_onion_header, encrypt_routing_tag,
-};
-use tunnelcraft_core::OnionSettlement;
-use tunnelcraft_erasure::ErasureCoder;
-use tunnelcraft_erasure::chunker::{chunk_and_encode, reassemble};
-use tunnelcraft_settlement::SettlementClient;
+use craftec_crypto::{SigningKeypair, EncryptionKeypair};
+use craftnet_core::onion_crypto::{decrypt_routing_tag, decrypt_exit_payload, build_onion_header, encrypt_routing_tag};
+use craftnet_core::OnionSettlement;
+use craftnet_erasure::ErasureCoder;
+use craftnet_erasure::chunker::{chunk_and_encode, reassemble};
+use craftnet_settlement::SettlementClient;
 
 use crate::{ExitError, Result, HttpRequest, HttpResponse};
 use crate::tunnel_handler::TunnelHandler;
@@ -173,7 +170,7 @@ impl ExitHandler {
     pub fn new(config: ExitConfig, _our_pubkey: PublicKey, our_secret: [u8; 32]) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .user_agent("TunnelCraft/0.1")
+            .user_agent("CraftNet/0.1")
             .build()?;
 
         let keypair = SigningKeypair::from_secret_bytes(&our_secret);
@@ -197,7 +194,7 @@ impl ExitHandler {
     pub fn with_keypair(config: ExitConfig, keypair: SigningKeypair) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .user_agent("TunnelCraft/0.1")
+            .user_agent("CraftNet/0.1")
             .build()?;
 
         let encryption_keypair = EncryptionKeypair::generate();
@@ -224,7 +221,7 @@ impl ExitHandler {
     ) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .user_agent("TunnelCraft/0.1")
+            .user_agent("CraftNet/0.1")
             .build()?;
 
         let tunnel_handler = TunnelHandler::new(keypair.clone());
@@ -251,7 +248,7 @@ impl ExitHandler {
     ) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .user_agent("TunnelCraft/0.1")
+            .user_agent("CraftNet/0.1")
             .build()?;
 
         let keypair = SigningKeypair::from_secret_bytes(&our_secret);
@@ -279,7 +276,7 @@ impl ExitHandler {
     ) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .user_agent("TunnelCraft/0.1")
+            .user_agent("CraftNet/0.1")
             .build()?;
 
         let encryption_keypair = EncryptionKeypair::generate();
@@ -384,7 +381,7 @@ impl ExitHandler {
         if !self.all_chunks_ready(&assembly_id) {
             if let Some(pending) = self.pending.get(&assembly_id) {
                 let shard_count = pending.shards.len();
-                let needed = total_chunks as usize * tunnelcraft_erasure::DATA_SHARDS;
+                let needed = total_chunks as usize * craftnet_erasure::DATA_SHARDS;
                 info!(
                     "[SHARD-FLOW] EXIT assembly={} shard received: chunk={} shard={} ({}/{} shards collected)",
                     hex::encode(&assembly_id[..8]),
@@ -629,7 +626,7 @@ impl ExitHandler {
         if chunk_counts.len() < pending.total_chunks as usize {
             return false;
         }
-        chunk_counts.values().all(|&count| count >= tunnelcraft_erasure::DATA_SHARDS)
+        chunk_counts.values().all(|&count| count >= craftnet_erasure::DATA_SHARDS)
     }
 
     /// Reconstruct data from shard payloads (multi-chunk aware)
@@ -647,20 +644,20 @@ impl ExitHandler {
         for chunk_idx in 0..pending.total_chunks {
             let chunk_shards = chunks_by_index.get(&chunk_idx);
             let mut shard_data: Vec<Option<Vec<u8>>> =
-                vec![None; tunnelcraft_erasure::TOTAL_SHARDS];
+                vec![None; craftnet_erasure::TOTAL_SHARDS];
             let mut shard_size = 0usize;
 
             if let Some(shards) = chunk_shards {
                 for &(shard_idx, payload) in shards {
                     let idx = shard_idx as usize;
-                    if idx < tunnelcraft_erasure::TOTAL_SHARDS {
+                    if idx < craftnet_erasure::TOTAL_SHARDS {
                         shard_size = payload.len();
                         shard_data[idx] = Some(payload.clone());
                     }
                 }
             }
 
-            let max_len = shard_size * tunnelcraft_erasure::DATA_SHARDS;
+            let max_len = shard_size * craftnet_erasure::DATA_SHARDS;
             let chunk_data = self
                 .erasure
                 .decode(&mut shard_data, max_len)
@@ -782,7 +779,7 @@ impl ExitHandler {
             exit_payload.response_enc_pubkey != [0u8; 32],
             exit_payload.lease_set.leases.len(),
         );
-        let encrypted_response = tunnelcraft_crypto::encrypt_for_recipient(
+        let encrypted_response = craftec_crypto::encrypt_for_recipient(
             recipient_pubkey,
             &self.encryption_keypair.secret_key_bytes(),
             response_data,
@@ -804,7 +801,7 @@ impl ExitHandler {
         let assembly_id = exit_payload.request_id;
 
         let leases = &exit_payload.lease_set.leases;
-        let mut shard_pairs = Vec::with_capacity(chunks.len() * tunnelcraft_erasure::TOTAL_SHARDS);
+        let mut shard_pairs = Vec::with_capacity(chunks.len() * craftnet_erasure::TOTAL_SHARDS);
         let mut shard_counter: usize = 0;
 
         for (chunk_index, shard_payloads) in chunks {

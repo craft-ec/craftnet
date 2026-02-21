@@ -1,4 +1,4 @@
-//! TunnelCraft Exit Node
+//! CraftNet Exit Node
 //!
 //! Exit node logic: HTTP fetch, TCP tunnel, and onion response creation.
 //!
@@ -21,7 +21,7 @@ pub use response::HttpResponse;
 pub use tunnel_handler::TunnelHandler;
 
 use thiserror::Error;
-use tunnelcraft_erasure::ErasureError;
+use craftnet_erasure::ErasureError;
 
 #[derive(Error, Debug)]
 pub enum ExitError {

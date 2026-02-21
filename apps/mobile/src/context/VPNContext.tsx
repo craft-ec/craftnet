@@ -6,12 +6,12 @@ import React, {
   useCallback,
   ReactNode,
 } from 'react';
-import TunnelCraftVPN, {
+import CraftNetVPN, {
   ConnectionState,
   PrivacyLevel,
   VPNStatus,
   NetworkStats,
-} from '../native/TunnelCraftVPN';
+} from '../native/CraftNetVPN';
 
 interface VPNContextType {
   // State
@@ -67,7 +67,7 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({children}) => {
   useEffect(() => {
     const fetchStatus = async () => {
       try {
-        const currentStatus = await TunnelCraftVPN.getStatus();
+        const currentStatus = await CraftNetVPN.getStatus();
         setStatus(currentStatus);
       } catch (err) {
         console.error('Failed to fetch VPN status:', err);
@@ -78,19 +78,19 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({children}) => {
 
   // Subscribe to events
   useEffect(() => {
-    const unsubscribeState = TunnelCraftVPN.onStateChange(state => {
+    const unsubscribeState = CraftNetVPN.onStateChange(state => {
       setStatus(prev => ({...prev, state}));
       if (state === 'connected' || state === 'disconnected') {
         setIsLoading(false);
       }
     });
 
-    const unsubscribeError = TunnelCraftVPN.onError(errorMessage => {
+    const unsubscribeError = CraftNetVPN.onError(errorMessage => {
       setError(errorMessage);
       setIsLoading(false);
     });
 
-    const unsubscribeStats = TunnelCraftVPN.onStatsUpdate(newStats => {
+    const unsubscribeStats = CraftNetVPN.onStatsUpdate(newStats => {
       setStats(newStats);
     });
 
@@ -106,8 +106,8 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({children}) => {
     setError(null);
     try {
       // Set test credits for MVP (no payment)
-      await TunnelCraftVPN.setCredits(1000);
-      await TunnelCraftVPN.connect();
+      await CraftNetVPN.setCredits(1000);
+      await CraftNetVPN.connect();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Connection failed');
       setIsLoading(false);
@@ -118,7 +118,7 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({children}) => {
     setIsLoading(true);
     setError(null);
     try {
-      await TunnelCraftVPN.disconnect();
+      await CraftNetVPN.disconnect();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Disconnect failed');
       setIsLoading(false);
@@ -135,7 +135,7 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({children}) => {
 
   const setPrivacyLevel = useCallback(async (level: PrivacyLevel) => {
     try {
-      await TunnelCraftVPN.setPrivacyLevel(level);
+      await CraftNetVPN.setPrivacyLevel(level);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to set privacy level');
     }

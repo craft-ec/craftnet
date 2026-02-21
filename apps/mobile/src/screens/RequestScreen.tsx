@@ -1,7 +1,7 @@
 /**
  * Request Screen
  *
- * Send HTTP requests through the TunnelCraft network
+ * Send HTTP requests through the CraftNet network
  */
 
 import React, { useState, useCallback } from 'react';

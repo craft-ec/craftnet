@@ -1,10 +1,10 @@
-# TunnelCraft App Feature Assessment
+# CraftNet App Feature Assessment
 
 **Last Updated**: 2025-02-08
 
 ## Executive Summary
 
-TunnelCraft is a decentralized P2P VPN operating at L4 (TCP tunnel via SOCKS5) and L7 (HTTP). The Rust backend is complete with SOCKS5 proxy, tunnel mode, best-effort routing, and bandwidth-weighted settlement. Frontend apps have full UI and native bridges. Main gaps are platform-specific packaging and tun2socks integration for mobile system-wide VPN.
+CraftNet is a decentralized P2P VPN operating at L4 (TCP tunnel via SOCKS5) and L7 (HTTP). The Rust backend is complete with SOCKS5 proxy, tunnel mode, best-effort routing, and bandwidth-weighted settlement. Frontend apps have full UI and native bridges. Main gaps are platform-specific packaging and tun2socks integration for mobile system-wide VPN.
 
 ---
 
@@ -21,7 +21,7 @@ TunnelCraft is a decentralized P2P VPN operating at L4 (TCP tunnel via SOCKS5) a
 | `relay` | Complete | Best-effort routing + trustless destination verification |
 | `exit` | Complete | HTTP fetch + TCP tunnel handler (dual-mode) |
 | `settlement` | Partial | Mock + Photon live modes, on-chain program pending |
-| `client` | Complete | TunnelCraftNode + SOCKS5 proxy + tunnel builder |
+| `client` | Complete | CraftNetNode + SOCKS5 proxy + tunnel builder |
 | `daemon` | Complete | IPC server (Unix socket + Windows named pipe) |
 | `uniffi` | Complete | iOS/Android FFI bindings |
 
@@ -33,11 +33,11 @@ TunnelCraft is a decentralized P2P VPN operating at L4 (TCP tunnel via SOCKS5) a
 |-----------|--------|---------|
 | React Native UI | Complete | HomeScreen, SettingsScreen, RequestScreen |
 | TunnelContext | Complete | Unified dual-provide pattern |
-| Native Bridge (TS) | Complete | `TunnelCraftVPN.ts` with request method |
-| TunnelCraftVPNModule.swift | Complete | RN native module |
+| Native Bridge (TS) | Complete | `CraftNetVPN.ts` with request method |
+| CraftNetVPNModule.swift | Complete | RN native module |
 | VPNManager.swift | Complete | NETunnelProviderManager wrapper |
 | PacketTunnelProvider.swift | Complete | Full implementation |
-| TunnelCraftCore.swift | Complete | UniFFI Swift wrapper |
+| CraftNetCore.swift | Complete | UniFFI Swift wrapper |
 | Entitlements | Complete | Main app + Network Extension |
 | UniFFI xcframework | Needs Build | Framework structure exists |
 | Xcode Network Extension | Needs Config | Target not fully configured |
@@ -81,8 +81,8 @@ TunnelCraft is a decentralized P2P VPN operating at L4 (TCP tunnel via SOCKS5) a
 | Component | Status | Details |
 |-----------|--------|---------|
 | React Native UI | Complete | Shared with iOS (includes RequestScreen) |
-| TunnelCraftVpnService.kt | Complete | VpnService subclass |
-| TunnelCraftVPNModule.kt | Complete | RN native module with request |
+| CraftNetVpnService.kt | Complete | VpnService subclass |
+| CraftNetVPNModule.kt | Complete | RN native module with request |
 | JNI bindings | Partial | Methods declared, not linked |
 | Gradle build | Partial | UniFFI not integrated |
 | VPN permission request | Complete | In module |
@@ -94,7 +94,7 @@ TunnelCraft is a decentralized P2P VPN operating at L4 (TCP tunnel via SOCKS5) a
 
 ### Desktop
 ```
-Apps → SOCKS5 proxy (localhost:1080) → TunnelCraft network
+Apps → SOCKS5 proxy (localhost:1080) → CraftNet network
 ```
 Apps configure SOCKS5 proxy manually or via system proxy settings.
 
@@ -104,7 +104,7 @@ All app traffic
   → TUN interface (OS VPN tunnel)
     → tun2socks (IP packets → TCP streams)
       → SOCKS5 proxy (localhost:1080)
-        → TunnelCraft network
+        → CraftNet network
 ```
 The SOCKS5 proxy runs inside the Rust library. No separate uniffi bindings needed for it. The uniffi surface is just `start(port)` / `stop()` / `status()`.
 
@@ -158,7 +158,7 @@ Decision deferred. Go tun2socks (proven) or Rust tun2proxy (stack consistency).
 ## Implementation Priority
 
 ### Phase 1: Integration Testing
-1. End-to-end SOCKS5 tunnel through live TunnelCraft network
+1. End-to-end SOCKS5 tunnel through live CraftNet network
 2. iOS Network Extension on physical device
 3. macOS DMG build + test
 

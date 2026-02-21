@@ -1,16 +1,16 @@
-//! Network node for TunnelCraft
+//! Network node for CraftNet
 //!
 //! Main entry point for P2P networking functionality.
+//! Delegates to craftec-network for swarm construction.
 
 use libp2p::{
     identity::Keypair,
-    noise, tcp, yamux,
-    Multiaddr, PeerId, SwarmBuilder,
+    Multiaddr, PeerId,
 };
 use thiserror::Error;
 use tracing::info;
 
-use crate::behaviour::TunnelCraftBehaviour;
+use crate::behaviour::CraftNetBehaviour;
 use crate::protocol::SHARD_STREAM_PROTOCOL;
 
 #[derive(Error, Debug)]
@@ -118,62 +118,29 @@ pub enum NetworkEvent {
     },
 }
 
-#[allow(deprecated)] // yamux set_receive_window_size / set_max_buffer_size
-fn yamux_config() -> yamux::Config {
-    let mut cfg = yamux::Config::default();
-    cfg.set_max_num_streams(4096);
-    cfg.set_receive_window_size(1024 * 1024); // 1MB receive window (default 256KB)
-    cfg.set_max_buffer_size(1024 * 1024); // 1MB buffer (default 64KB)
-    cfg
-}
-
-/// Build a raw swarm and return it along with the local peer ID.
+/// Build a CraftNet swarm using the generic CraftBehaviour from craftec-network.
 ///
-/// This is the recommended way to create a swarm — callers own the swarm
-/// directly and drive it in their own event loop (no intermediate wrapper).
+/// The swarm uses protocol prefix "craftnet" for Kademlia (`/craftnet/kad/1.0.0`),
+/// identify (`/craftnet/id/1.0.0`), etc.
+///
+/// Returns the swarm, local peer ID, and incoming streams for the shard protocol.
 pub async fn build_swarm(
     keypair: Keypair,
     config: NetworkConfig,
-) -> Result<(libp2p::Swarm<TunnelCraftBehaviour>, PeerId, libp2p_stream::IncomingStreams), NetworkError> {
-    let local_peer_id = PeerId::from(keypair.public());
-    info!("Local peer ID: {}", local_peer_id);
+) -> Result<(libp2p::Swarm<CraftNetBehaviour>, PeerId, libp2p_stream::IncomingStreams), NetworkError> {
+    let craftec_config = craftec_network::NetworkConfig {
+        protocol_prefix: "craftnet".to_string(),
+        secondary_protocol_prefix: None,
+        listen_addrs: config.listen_addrs,
+        bootstrap_peers: config.bootstrap_peers,
+        enable_mdns: true,
+    };
 
-    // Create the behaviour - returns (behaviour, relay_transport)
-    let (behaviour, relay_transport) = TunnelCraftBehaviour::new(local_peer_id, &keypair);
+    let (swarm, peer_id) = craftec_network::build_swarm(keypair, craftec_config)
+        .await
+        .map_err(|e| NetworkError::SwarmBuild(e.to_string()))?;
 
-    // Build swarm with relay transport
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default().nodelay(true),
-            noise::Config::new,
-            || yamux_config(),
-        )
-        .map_err(|e| NetworkError::Transport(e.to_string()))?
-        .with_relay_client(noise::Config::new, yamux_config)
-        .map_err(|e| NetworkError::Transport(e.to_string()))?
-        .with_behaviour(|_key, relay_behaviour| {
-            Ok(TunnelCraftBehaviour {
-                kademlia: behaviour.kademlia,
-                identify: behaviour.identify,
-                mdns: behaviour.mdns,
-                gossipsub: behaviour.gossipsub,
-                rendezvous_client: behaviour.rendezvous_client,
-                rendezvous_server: behaviour.rendezvous_server,
-                relay_client: relay_behaviour,
-                dcutr: behaviour.dcutr,
-                autonat: behaviour.autonat,
-                stream: libp2p_stream::Behaviour::new(),
-            })
-        })
-        .map_err(|e| NetworkError::SwarmBuild(format!("{:?}", e)))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(300)))
-        .build();
-
-    // Drop the unused relay_transport from our manual creation
-    drop(relay_transport);
-
-    // Register shard stream protocol BEFORE listening or dialing.
+    // Register shard stream protocol BEFORE any connections are established.
     // `listen_protocol()` on the connection handler captures the set of supported
     // inbound protocols at handler-creation time. If we register after connections
     // are established, those handlers won't negotiate our protocol on inbound
@@ -184,19 +151,8 @@ pub async fn build_swarm(
         .accept(SHARD_STREAM_PROTOCOL)
         .expect("shard stream protocol not yet registered");
 
-    // Start listening
-    for addr in config.listen_addrs {
-        swarm
-            .listen_on(addr)
-            .map_err(|e| NetworkError::Listen(e.to_string()))?;
-    }
-
-    // Add bootstrap peers
-    for (peer_id, addr) in config.bootstrap_peers {
-        swarm.behaviour_mut().add_address(&peer_id, addr);
-    }
-
-    Ok((swarm, local_peer_id, incoming_streams))
+    info!("CraftNet swarm built with peer ID: {}", peer_id);
+    Ok((swarm, peer_id, incoming_streams))
 }
 
 #[cfg(test)]

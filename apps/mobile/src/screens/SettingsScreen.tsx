@@ -22,7 +22,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { theme, modeColors, palette } from '../theme';
 import { typography, spacing, radius } from '../theme/typography';
 import { useTunnel } from '../context/TunnelContext';
-import { TunnelCraftVPN } from '../native/TunnelCraftVPN';
+import { CraftNetVPN } from '../native/CraftNetVPN';
 import { PrivacySelector } from '../components/PrivacySelector';
 
 interface SettingRowProps {
@@ -128,7 +128,7 @@ export function SettingsScreen() {
   const handleBootstrapNodes = () => {
     Alert.alert(
       'Bootstrap Nodes',
-      'Currently using the default TunnelCraft bootstrap nodes.\n\nCustom bootstrap configuration will be available in a future update.',
+      'Currently using the default CraftNet bootstrap nodes.\n\nCustom bootstrap configuration will be available in a future update.',
       [{ text: 'OK' }],
     );
   };
@@ -143,7 +143,7 @@ export function SettingsScreen() {
 
   const handleExportKeys = async () => {
     try {
-      const status = await TunnelCraftVPN.getStatus();
+      const status = await CraftNetVPN.getStatus();
       const peerId = status.peerId || 'Not available';
       Alert.alert(
         'Export Keys',
@@ -165,15 +165,15 @@ export function SettingsScreen() {
   };
 
   const handleDocumentation = () => {
-    Linking.openURL('https://tunnelcraft.app/docs');
+    Linking.openURL('https://craftnet.app/docs');
   };
 
   const handleCommunity = () => {
-    Linking.openURL('https://github.com/craftec/tunnelcraft/discussions');
+    Linking.openURL('https://github.com/craftec/craftnet/discussions');
   };
 
   const handleReportIssue = () => {
-    Linking.openURL('https://github.com/craftec/tunnelcraft/issues');
+    Linking.openURL('https://github.com/craftec/craftnet/issues');
   };
 
   const colors = modeColors[mode];
@@ -191,7 +191,7 @@ export function SettingsScreen() {
           {/* Header */}
           <View style={styles.header}>
             <Text style={styles.title}>Settings</Text>
-            <Text style={styles.subtitle}>Configure your TunnelCraft experience</Text>
+            <Text style={styles.subtitle}>Configure your CraftNet experience</Text>
           </View>
 
           {/* Privacy Level */}
@@ -310,7 +310,7 @@ export function SettingsScreen() {
           {/* Footer */}
           <View style={styles.footer}>
             <Text style={styles.footerText}>
-              TunnelCraft • Decentralized VPN Network
+              CraftNet • Decentralized VPN Network
             </Text>
             <Text style={styles.footerSubtext}>
               Privacy through fragmentation

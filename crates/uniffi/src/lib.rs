@@ -1,4 +1,4 @@
-//! TunnelCraft UniFFI Bindings
+//! CraftNet UniFFI Bindings
 //!
 //! Mobile bindings for iOS (Swift) and Android (Kotlin) via uniffi.
 //!
@@ -13,8 +13,8 @@ use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Runtime;
 use tracing::{debug, info};
 
-use tunnelcraft_client::{Capabilities, TunnelCraftNode};
-use tunnelcraft_core::HopMode;
+use craftnet_client::{Capabilities, CraftNetNode};
+use craftnet_core::HopMode;
 
 // Export UniFFI scaffolding
 uniffi::setup_scaffolding!();
@@ -40,7 +40,7 @@ pub fn init_library() {
         .with_max_level(tracing::Level::DEBUG)
         .try_init();
 
-    info!("TunnelCraft library initialized");
+    info!("CraftNet library initialized");
 }
 
 fn get_runtime() -> &'static Runtime {
@@ -119,7 +119,7 @@ impl From<PrivacyLevel> for HopMode {
     }
 }
 
-/// Configuration for the unified TunnelCraft node
+/// Configuration for the unified CraftNet node
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UnifiedNodeConfig {
     /// Node capabilities (list of individual flags)
@@ -183,7 +183,7 @@ pub struct ExitNodeInfo {
 
 /// Error types for VPN operations
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum TunnelCraftError {
+pub enum CraftNetError {
     #[error("Library not initialized")]
     NotInitialized,
 
@@ -235,7 +235,7 @@ pub fn create_unified_config(
 
 /// Internal state for the unified node
 struct UnifiedNodeState {
-    node: Option<TunnelCraftNode>,
+    node: Option<CraftNetNode>,
     state: ConnectionState,
     capabilities: Capabilities,
     error: Option<String>,
@@ -258,7 +258,7 @@ impl Default for UnifiedNodeState {
 
 unsafe impl Send for UnifiedNodeState {}
 
-/// Unified TunnelCraft node supporting composable capabilities
+/// Unified CraftNet node supporting composable capabilities
 ///
 /// This is the recommended interface for mobile apps. It provides:
 /// - CLIENT capability: Route your traffic through VPN (spend credits)
@@ -268,22 +268,22 @@ unsafe impl Send for UnifiedNodeState {}
 ///
 /// Capabilities are composable — combine any set of flags.
 #[derive(uniffi::Object)]
-pub struct TunnelCraftUnifiedNode {
+pub struct CraftNetUnifiedNode {
     config: RwLock<UnifiedNodeConfig>,
     state: Mutex<UnifiedNodeState>,
 }
 
 #[uniffi::export]
-impl TunnelCraftUnifiedNode {
+impl CraftNetUnifiedNode {
     /// Create a new unified node instance
     #[uniffi::constructor]
-    pub fn new(config: UnifiedNodeConfig) -> Result<Arc<Self>, TunnelCraftError> {
+    pub fn new(config: UnifiedNodeConfig) -> Result<Arc<Self>, CraftNetError> {
         if RUNTIME.get().is_none() {
-            return Err(TunnelCraftError::NotInitialized);
+            return Err(CraftNetError::NotInitialized);
         }
 
         let caps = capabilities_from_ffi(&config.capabilities);
-        info!("Creating TunnelCraftUnifiedNode with capabilities: {:?}", caps);
+        info!("Creating CraftNetUnifiedNode with capabilities: {:?}", caps);
 
         let state = UnifiedNodeState { capabilities: caps, ..Default::default() };
 
@@ -294,14 +294,14 @@ impl TunnelCraftUnifiedNode {
     }
 
     /// Start the node and connect to the network
-    pub fn start(&self) -> Result<(), TunnelCraftError> {
+    pub fn start(&self) -> Result<(), CraftNetError> {
         let mut state = self.state.lock();
 
         if state.state == ConnectionState::Connected {
-            return Err(TunnelCraftError::AlreadyConnected);
+            return Err(CraftNetError::AlreadyConnected);
         }
 
-        info!("Starting TunnelCraftUnifiedNode...");
+        info!("Starting CraftNetUnifiedNode...");
         state.state = ConnectionState::Connecting;
         state.error = None;
 
@@ -309,7 +309,7 @@ impl TunnelCraftUnifiedNode {
         let caps = capabilities_from_ffi(&config.capabilities);
 
         // Build node config
-        let node_config = tunnelcraft_client::NodeConfig {
+        let node_config = craftnet_client::NodeConfig {
             capabilities: caps,
             hop_mode: config.privacy_level.into(),
             ..Default::default()
@@ -320,13 +320,13 @@ impl TunnelCraftUnifiedNode {
 
         // Run async start on runtime
         let result = get_runtime().block_on(async {
-            let mut node = TunnelCraftNode::new(node_config)
-                .map_err(|e| TunnelCraftError::ConnectionFailed { msg: e.to_string() })?;
+            let mut node = CraftNetNode::new(node_config)
+                .map_err(|e| CraftNetError::ConnectionFailed { msg: e.to_string() })?;
 
-            node.start().await
-                .map_err(|e| TunnelCraftError::ConnectionFailed { msg: e.to_string() })?;
+            node.start(None).await
+                .map_err(|e| CraftNetError::ConnectionFailed { msg: e.to_string() })?;
 
-            Ok::<_, TunnelCraftError>(node)
+            Ok::<_, CraftNetError>(node)
         });
 
         let mut state = self.state.lock();
@@ -335,7 +335,7 @@ impl TunnelCraftUnifiedNode {
                 state.node = Some(node);
                 state.state = ConnectionState::Connected;
                 state.start_time = Some(Instant::now());
-                info!("TunnelCraftUnifiedNode started successfully");
+                info!("CraftNetUnifiedNode started successfully");
                 Ok(())
             }
             Err(e) => {
@@ -347,14 +347,14 @@ impl TunnelCraftUnifiedNode {
     }
 
     /// Stop the node and disconnect from the network
-    pub fn stop(&self) -> Result<(), TunnelCraftError> {
+    pub fn stop(&self) -> Result<(), CraftNetError> {
         let mut state = self.state.lock();
 
         if state.state == ConnectionState::Disconnected {
             return Ok(());
         }
 
-        info!("Stopping TunnelCraftUnifiedNode...");
+        info!("Stopping CraftNetUnifiedNode...");
         state.state = ConnectionState::Disconnecting;
 
         if let Some(mut node) = state.node.take() {
@@ -371,7 +371,7 @@ impl TunnelCraftUnifiedNode {
             state.state = ConnectionState::Disconnected;
         }
 
-        info!("TunnelCraftUnifiedNode stopped");
+        info!("CraftNetUnifiedNode stopped");
         Ok(())
     }
 
@@ -381,7 +381,7 @@ impl TunnelCraftUnifiedNode {
     }
 
     /// Set capabilities (can be changed while running)
-    pub fn set_capabilities(&self, capabilities: Vec<Capability>) -> Result<(), TunnelCraftError> {
+    pub fn set_capabilities(&self, capabilities: Vec<Capability>) -> Result<(), CraftNetError> {
         let new_caps = capabilities_from_ffi(&capabilities);
 
         let mut state = self.state.lock();
@@ -505,15 +505,15 @@ impl TunnelCraftUnifiedNode {
         method: String,
         url: String,
         body: Option<Vec<u8>>,
-    ) -> Result<TunnelResponse, TunnelCraftError> {
+    ) -> Result<TunnelResponse, CraftNetError> {
         let state = self.state.lock();
 
         if state.state != ConnectionState::Connected {
-            return Err(TunnelCraftError::NotConnected);
+            return Err(CraftNetError::NotConnected);
         }
 
         if state.node.is_none() {
-            return Err(TunnelCraftError::NotConnected);
+            return Err(CraftNetError::NotConnected);
         }
 
         drop(state);
@@ -522,11 +522,11 @@ impl TunnelCraftUnifiedNode {
             // Take the node temporarily to avoid holding the lock across await
             let mut node = {
                 let mut state = self.state.lock();
-                state.node.take().ok_or(TunnelCraftError::NotConnected)?
+                state.node.take().ok_or(CraftNetError::NotConnected)?
             };
             let res = node.fetch(&method, &url, body, None)
                 .await
-                .map_err(|e| TunnelCraftError::InternalError { msg: e.to_string() });
+                .map_err(|e| CraftNetError::InternalError { msg: e.to_string() });
             // Put the node back
             self.state.lock().node = Some(node);
             res
@@ -561,14 +561,14 @@ impl TunnelCraftUnifiedNode {
     }
 
     /// Select an exit node by public key hex string
-    pub fn select_exit(&self, pubkey: String) -> Result<(), TunnelCraftError> {
+    pub fn select_exit(&self, pubkey: String) -> Result<(), CraftNetError> {
         let mut state = self.state.lock();
         if let Some(ref mut node) = state.node {
             // Find the exit by pubkey
             let pubkey_bytes = hex::decode(&pubkey)
-                .map_err(|e| TunnelCraftError::InvalidConfig { msg: format!("Invalid pubkey hex: {}", e) })?;
+                .map_err(|e| CraftNetError::InvalidConfig { msg: format!("Invalid pubkey hex: {}", e) })?;
             if pubkey_bytes.len() != 32 {
-                return Err(TunnelCraftError::InvalidConfig { msg: "Pubkey must be 32 bytes".to_string() });
+                return Err(CraftNetError::InvalidConfig { msg: "Pubkey must be 32 bytes".to_string() });
             }
             let mut pk = [0u8; 32];
             pk.copy_from_slice(&pubkey_bytes);
@@ -578,15 +578,15 @@ impl TunnelCraftUnifiedNode {
                 node.select_exit(exit_info);
                 Ok(())
             } else {
-                Err(TunnelCraftError::NoExitNodes)
+                Err(CraftNetError::NoExitNodes)
             }
         } else {
-            Err(TunnelCraftError::NotConnected)
+            Err(CraftNetError::NotConnected)
         }
     }
 
     /// Purchase credits using mock settlement
-    pub fn purchase_credits(&self, amount: u64) -> Result<u64, TunnelCraftError> {
+    pub fn purchase_credits(&self, amount: u64) -> Result<u64, CraftNetError> {
         let mut state = self.state.lock();
         if let Some(ref mut node) = state.node {
             let current = node.credits();
@@ -594,7 +594,7 @@ impl TunnelCraftUnifiedNode {
             node.set_credits(new_balance);
             Ok(new_balance)
         } else {
-            Err(TunnelCraftError::NotConnected)
+            Err(CraftNetError::NotConnected)
         }
     }
 
@@ -684,7 +684,7 @@ mod tests {
     fn test_create_unified_node_with_init() {
         init_library();
 
-        let node = TunnelCraftUnifiedNode::new(UnifiedNodeConfig::default());
+        let node = CraftNetUnifiedNode::new(UnifiedNodeConfig::default());
         assert!(node.is_ok());
 
         let node = node.unwrap();
@@ -698,7 +698,7 @@ mod tests {
     fn test_unified_node_set_privacy_level() {
         init_library();
 
-        let node = TunnelCraftUnifiedNode::new(UnifiedNodeConfig::default()).unwrap();
+        let node = CraftNetUnifiedNode::new(UnifiedNodeConfig::default()).unwrap();
         assert_eq!(node.get_privacy_level(), PrivacyLevel::Triple);
 
         node.set_privacy_level(PrivacyLevel::Quad);

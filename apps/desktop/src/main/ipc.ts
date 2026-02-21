@@ -27,12 +27,12 @@ export class IPCClient extends EventEmitter {
 
   private getSocketPath(): string {
     if (process.platform === 'win32') {
-      return '\\\\.\\pipe\\tunnelcraft';
+      return '\\\\.\\pipe\\craftnet';
     }
     if (process.platform === 'darwin') {
-      return '/tmp/tunnelcraft.sock';
+      return '/tmp/craftnet.sock';
     }
-    return (process.env.XDG_RUNTIME_DIR || '/tmp') + '/tunnelcraft.sock';
+    return (process.env.XDG_RUNTIME_DIR || '/tmp') + '/craftnet.sock';
   }
 
   async connect(): Promise<void> {

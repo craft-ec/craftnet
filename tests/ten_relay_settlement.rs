@@ -17,10 +17,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tunnelcraft_crypto::{sign_forward_receipt, verify_forward_receipt, SigningKeypair, EncryptionKeypair};
-use tunnelcraft_erasure::TOTAL_SHARDS;
-use tunnelcraft_prover::MerkleTree;
-use tunnelcraft_settlement::{
+use craftec_crypto::{SigningKeypair, EncryptionKeypair};
+
+use craftnet_core::receipt_crypto::{sign_forward_receipt, verify_forward_receipt};
+use craftnet_erasure::TOTAL_SHARDS;
+use craftnet_prover::MerkleTree;
+use craftnet_settlement::{
     ClaimRewards, PostDistribution, SettlementClient, SettlementConfig, Subscribe,
 };
 
@@ -64,7 +66,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
     settlement_client
         .subscribe(Subscribe {
             user_pubkey,
-            tier: tunnelcraft_core::SubscriptionTier::Standard,
+            tier: craftnet_core::SubscriptionTier::Standard,
             payment_amount: pool_balance,
             duration_secs: 30 * 24 * 3600,
             start_date: 0,
@@ -225,7 +227,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
     settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             pool_balance,
             now - 40 * 24 * 3600, // created 40 days ago
             now - 10 * 24 * 3600, // expired 10 days ago (past grace)
@@ -346,7 +348,7 @@ async fn test_receipt_isolation_across_requests() {
     settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             500_000,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,
@@ -530,7 +532,7 @@ async fn test_merkle_proof_claim() {
     settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             pool_balance,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,
@@ -600,7 +602,7 @@ async fn test_invalid_merkle_proof_rejected() {
     settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             pool_balance,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,
@@ -640,7 +642,7 @@ async fn test_invalid_merkle_proof_rejected() {
         .await;
 
     assert!(
-        matches!(result, Err(tunnelcraft_settlement::SettlementError::InvalidMerkleProof)),
+        matches!(result, Err(craftnet_settlement::SettlementError::InvalidMerkleProof)),
         "Claim with wrong relay_bytes should be rejected with InvalidMerkleProof, got: {:?}",
         result,
     );
@@ -667,7 +669,7 @@ async fn test_invalid_merkle_proof_rejected() {
         .await;
 
     assert!(
-        matches!(result2, Err(tunnelcraft_settlement::SettlementError::InvalidMerkleProof)),
+        matches!(result2, Err(craftnet_settlement::SettlementError::InvalidMerkleProof)),
         "Claim with wrong leaf_index should be rejected with InvalidMerkleProof, got: {:?}",
         result2,
     );
@@ -690,7 +692,7 @@ async fn test_unequal_receipt_distribution() {
     settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Premium,
+            craftnet_core::SubscriptionTier::Premium,
             pool_balance,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,
@@ -783,10 +785,10 @@ async fn test_unequal_receipt_distribution() {
 /// is not tested here (see the other tests above).
 #[tokio::test]
 async fn test_direct_mode_exit_roundtrip() {
-    use tunnelcraft_client::{RequestBuilder, PathHop};
-    use tunnelcraft_core::lease_set::LeaseSet;
-    use tunnelcraft_core::Shard;
-    use tunnelcraft_exit::{ExitConfig, ExitHandler};
+    use craftnet_client::{RequestBuilder, PathHop};
+    use craftnet_core::lease_set::LeaseSet;
+    use craftnet_core::Shard;
+    use craftnet_exit::{ExitConfig, ExitHandler};
 
     let user_keypair = SigningKeypair::generate();
     let exit_keypair = SigningKeypair::generate();
@@ -805,7 +807,7 @@ async fn test_direct_mode_exit_roundtrip() {
 
     // Build onion shards in direct mode (no relay hops)
     let builder = RequestBuilder::new("GET", "https://httpbin.org/get")
-        .header("User-Agent", "TunnelCraft-DirectMode-Test");
+        .header("User-Agent", "CraftNet-DirectMode-Test");
 
     let (request_id, shards) = builder
         .build_onion(&user_keypair, &exit_hop, &[], &lease_set, [0u8; 32])
@@ -874,7 +876,7 @@ async fn test_bandwidth_weighted_settlement() {
     settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
-            tunnelcraft_core::SubscriptionTier::Standard,
+            craftnet_core::SubscriptionTier::Standard,
             pool_balance,
             now - 40 * 24 * 3600,
             now - 10 * 24 * 3600,

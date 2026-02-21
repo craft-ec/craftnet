@@ -10,9 +10,9 @@ use libp2p::swarm::SwarmEvent;
 use tokio::time::timeout;
 use futures::StreamExt;
 
-use tunnelcraft_core::Shard;
-use tunnelcraft_network::{
-    TunnelCraftBehaviour, PeerId,
+use craftnet_core::Shard;
+use craftnet_network::{
+    CraftNetBehaviour, PeerId,
     SHARD_STREAM_PROTOCOL,
 };
 
@@ -29,13 +29,11 @@ fn create_test_shard() -> Shard {
 }
 
 /// Create a test swarm with stream protocol support
-async fn create_test_swarm() -> (libp2p::Swarm<TunnelCraftBehaviour>, PeerId) {
+async fn create_test_swarm() -> (libp2p::Swarm<CraftNetBehaviour>, PeerId) {
     use libp2p::{noise, tcp, yamux, SwarmBuilder};
 
     let keypair = Keypair::generate_ed25519();
     let peer_id = PeerId::from(keypair.public());
-
-    let (behaviour, _relay_transport) = TunnelCraftBehaviour::new(peer_id, &keypair);
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -47,19 +45,9 @@ async fn create_test_swarm() -> (libp2p::Swarm<TunnelCraftBehaviour>, PeerId) {
         .unwrap()
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .unwrap()
-        .with_behaviour(|_key, relay_behaviour| {
-            Ok(TunnelCraftBehaviour {
-                kademlia: behaviour.kademlia,
-                identify: behaviour.identify,
-                mdns: behaviour.mdns,
-                gossipsub: behaviour.gossipsub,
-                rendezvous_client: behaviour.rendezvous_client,
-                rendezvous_server: behaviour.rendezvous_server,
-                relay_client: relay_behaviour,
-                dcutr: behaviour.dcutr,
-                autonat: behaviour.autonat,
-                stream: libp2p_stream::Behaviour::new(),
-            })
+        .with_behaviour(|key, relay_behaviour| {
+            let local_peer_id = PeerId::from(key.public());
+            CraftNetBehaviour::build_with_options("craftnet", local_peer_id, key, relay_behaviour, false)
         })
         .unwrap()
         .build();
@@ -70,9 +58,9 @@ async fn create_test_swarm() -> (libp2p::Swarm<TunnelCraftBehaviour>, PeerId) {
 /// Helper: connect two swarms and return them
 async fn connect_swarms(
 ) -> (
-    libp2p::Swarm<TunnelCraftBehaviour>,
+    libp2p::Swarm<CraftNetBehaviour>,
     PeerId,
-    libp2p::Swarm<TunnelCraftBehaviour>,
+    libp2p::Swarm<CraftNetBehaviour>,
     PeerId,
 ) {
     let (mut swarm1, peer1) = create_test_swarm().await;
@@ -133,7 +121,7 @@ async fn test_two_nodes_can_connect() {
 #[tokio::test]
 async fn test_stream_shard_exchange_direct() {
     // Test the stream frame protocol directly using connected libp2p streams
-    use tunnelcraft_network::{
+    use craftnet_network::{
         read_frame, write_shard_frame, write_ack_frame, StreamFrame,
     };
     use futures::io::AsyncReadExt;
@@ -209,7 +197,7 @@ async fn test_stream_shard_exchange_direct() {
 
 #[tokio::test]
 async fn test_stream_shard_rejection() {
-    use tunnelcraft_network::{
+    use craftnet_network::{
         read_frame, write_shard_frame, write_nack_frame, StreamFrame,
     };
     use futures::io::AsyncReadExt;
@@ -270,7 +258,7 @@ async fn test_stream_shard_rejection() {
 
 #[tokio::test]
 async fn test_multiple_shards_via_stream() {
-    use tunnelcraft_network::{
+    use craftnet_network::{
         read_frame, write_shard_frame, write_ack_frame, StreamFrame,
     };
     use futures::io::AsyncReadExt;

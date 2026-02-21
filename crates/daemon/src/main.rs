@@ -1,13 +1,13 @@
-//! TunnelCraft Daemon Binary
+//! CraftNet Daemon Binary
 //!
 //! Runs the IPC server for desktop/mobile frontends.
 
-use tunnelcraft_daemon::{DaemonService, IpcServer, IpcConfig, DaemonError};
+use craftnet_daemon::{DaemonService, IpcServer, IpcConfig, DaemonError};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,tunnelcraft=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,craftnet=debug"));
     
     tracing_subscriber::registry()
         .with(fmt::layer())
@@ -19,7 +19,7 @@ fn init_logging() {
 async fn main() -> Result<(), DaemonError> {
     init_logging();
     
-    tracing::info!("Starting TunnelCraft daemon...");
+    tracing::info!("Starting CraftNet daemon...");
     
     // Create the daemon service (implements IpcHandler)
     let daemon = DaemonService::new()?;

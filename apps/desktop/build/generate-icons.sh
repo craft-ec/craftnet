@@ -1,5 +1,5 @@
 #!/bin/bash
-# Generate placeholder icons for TunnelCraft
+# Generate placeholder icons for CraftNet
 
 # Create a simple PNG icon using ImageMagick or built-in tools
 # First, check if we have any tools available

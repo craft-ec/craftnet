@@ -1,20 +1,20 @@
 [package]
-name = "tunnelcraft-tests"
+name = "craftnet-tests"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-tunnelcraft-core = { workspace = true }
-tunnelcraft-crypto = { workspace = true }
-tunnelcraft-erasure = { workspace = true }
-tunnelcraft-network = { workspace = true }
-tunnelcraft-relay = { workspace = true }
-tunnelcraft-exit = { workspace = true }
-tunnelcraft-client = { workspace = true }
-tunnelcraft-settlement = { workspace = true }
-tunnelcraft-aggregator = { workspace = true }
-tunnelcraft-prover = { workspace = true }
+craftnet-core = { workspace = true }
+craftec-crypto = { workspace = true }
+craftnet-erasure = { workspace = true }
+craftnet-network = { workspace = true }
+craftnet-relay = { workspace = true }
+craftnet-exit = { workspace = true }
+craftnet-client = { workspace = true }
+craftnet-settlement = { workspace = true }
+craftnet-aggregator = { workspace = true }
+craftnet-prover = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 axum = "0.8"
@@ -34,7 +34,7 @@ solana-system-interface = "1.0"
 
 [features]
 default = []
-sp1 = ["tunnelcraft-client/sp1", "tunnelcraft-prover/sp1"]
+sp1 = ["craftnet-client/sp1", "craftnet-prover/sp1"]
 
 [[test]]
 name = "shard_flow"

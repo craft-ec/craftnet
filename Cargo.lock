@@ -2750,6 +2750,345 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-app"
+version = "0.1.0"
+dependencies = [
+ "craftec-crypto",
+ "craftec-keystore",
+ "craftec-logging",
+ "craftec-settings",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "craftec-crypto"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "ed25519-dalek 2.2.0",
+ "rand 0.8.5",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "craftec-keystore"
+version = "0.1.0"
+dependencies = [
+ "craftec-crypto",
+ "rand 0.8.5",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "craftec-logging"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "craftec-settings"
+version = "0.1.0"
+dependencies = [
+ "craftec-keystore",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "craftnet-aggregator"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "craftec-crypto",
+ "craftnet-core",
+ "craftnet-network",
+ "craftnet-prover",
+ "craftnet-settlement",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "craftnet-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "craftec-app",
+ "craftec-keystore",
+ "craftnet-client",
+ "craftnet-core",
+ "craftnet-daemon",
+ "craftnet-ipc-client",
+ "craftnet-network",
+ "libp2p",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "craftnet-client"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "craftec-crypto",
+ "craftnet-aggregator",
+ "craftnet-core",
+ "craftnet-erasure",
+ "craftnet-exit",
+ "craftnet-network",
+ "craftnet-prover",
+ "craftnet-relay",
+ "craftnet-settlement",
+ "futures",
+ "hex",
+ "libp2p",
+ "parking_lot 0.12.5",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "craftnet-core"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "bitflags 2.10.0",
+ "bytes",
+ "craftec-crypto",
+ "hex",
+ "serde",
+ "serde-big-array",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "craftnet-daemon"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "bs58",
+ "chacha20poly1305",
+ "craftec-keystore",
+ "craftec-settings",
+ "craftnet-client",
+ "craftnet-core",
+ "craftnet-settlement",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "craftnet-distribution-guest-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "craftnet-erasure"
+version = "0.1.0"
+dependencies = [
+ "craftnet-core",
+ "reed-solomon-erasure",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "craftnet-exit"
+version = "0.1.0"
+dependencies = [
+ "craftec-crypto",
+ "craftnet-core",
+ "craftnet-erasure",
+ "craftnet-settlement",
+ "hex",
+ "rand 0.8.5",
+ "reqwest",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "craftnet-ipc-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "craftnet-network"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "craftec-crypto",
+ "craftnet-core",
+ "futures",
+ "hex",
+ "libp2p",
+ "libp2p-stream",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "craftnet-prover"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "craftec-crypto",
+ "craftnet-core",
+ "craftnet-distribution-guest-types",
+ "craftnet-prover-guest-types",
+ "hex",
+ "sha2 0.10.9",
+ "sp1-build",
+ "sp1-sdk",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "craftnet-prover-guest-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde-big-array",
+]
+
+[[package]]
+name = "craftnet-relay"
+version = "0.1.0"
+dependencies = [
+ "craftec-crypto",
+ "craftnet-core",
+ "craftnet-settlement",
+ "hex",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "craftnet-settlement"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "bincode",
+ "bs58",
+ "craftnet-core",
+ "craftnet-prover",
+ "ed25519-dalek 2.2.0",
+ "light-compressed-account",
+ "light-hasher",
+ "light-sdk-types",
+ "openssl",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+ "solana-sdk-ids",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "craftnet-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "bs58",
+ "craftec-crypto",
+ "craftnet-aggregator",
+ "craftnet-client",
+ "craftnet-core",
+ "craftnet-erasure",
+ "craftnet-exit",
+ "craftnet-network",
+ "craftnet-prover",
+ "craftnet-relay",
+ "craftnet-settlement",
+ "futures",
+ "hex",
+ "hyper 1.8.1",
+ "libp2p",
+ "rand 0.8.5",
+ "reqwest",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-client",
+ "solana-sdk",
+ "solana-system-interface",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "craftnet-uniffi"
+version = "0.1.0"
+dependencies = [
+ "craftec-crypto",
+ "craftnet-client",
+ "craftnet-core",
+ "hex",
+ "once_cell",
+ "parking_lot 0.12.5",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uniffi",
+]
+
+[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11802,344 +12141,6 @@ dependencies = [
  "url",
  "utf-8",
  "webpki-roots 0.24.0",
-]
-
-[[package]]
-name = "tunnelcraft-aggregator"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tracing",
- "tunnelcraft-core",
- "tunnelcraft-crypto",
- "tunnelcraft-network",
- "tunnelcraft-prover",
- "tunnelcraft-settlement",
-]
-
-[[package]]
-name = "tunnelcraft-app"
-version = "0.1.0"
-dependencies = [
- "thiserror 1.0.69",
- "tracing",
- "tunnelcraft-keystore",
- "tunnelcraft-logging",
- "tunnelcraft-settings",
-]
-
-[[package]]
-name = "tunnelcraft-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libp2p",
- "serde_json",
- "tokio",
- "tracing",
- "tunnelcraft-app",
- "tunnelcraft-client",
- "tunnelcraft-core",
- "tunnelcraft-daemon",
- "tunnelcraft-ipc-client",
- "tunnelcraft-keystore",
- "tunnelcraft-network",
-]
-
-[[package]]
-name = "tunnelcraft-client"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "futures",
- "hex",
- "libp2p",
- "parking_lot 0.12.5",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tunnelcraft-aggregator",
- "tunnelcraft-core",
- "tunnelcraft-crypto",
- "tunnelcraft-erasure",
- "tunnelcraft-exit",
- "tunnelcraft-network",
- "tunnelcraft-prover",
- "tunnelcraft-relay",
- "tunnelcraft-settlement",
-]
-
-[[package]]
-name = "tunnelcraft-core"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "bitflags 2.10.0",
- "bytes",
- "hex",
- "serde",
- "serde-big-array",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "tunnelcraft-crypto"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
- "ed25519-dalek 2.2.0",
- "hex",
- "rand 0.8.5",
- "serde",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tunnelcraft-core",
- "x25519-dalek",
-]
-
-[[package]]
-name = "tunnelcraft-daemon"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "bs58",
- "chacha20poly1305",
- "ed25519-dalek 2.2.0",
- "hex",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tunnelcraft-client",
- "tunnelcraft-core",
- "tunnelcraft-keystore",
- "tunnelcraft-settings",
- "tunnelcraft-settlement",
-]
-
-[[package]]
-name = "tunnelcraft-distribution-guest-types"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "tunnelcraft-erasure"
-version = "0.1.0"
-dependencies = [
- "reed-solomon-erasure",
- "thiserror 1.0.69",
- "tunnelcraft-core",
-]
-
-[[package]]
-name = "tunnelcraft-exit"
-version = "0.1.0"
-dependencies = [
- "hex",
- "rand 0.8.5",
- "reqwest",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tunnelcraft-core",
- "tunnelcraft-crypto",
- "tunnelcraft-erasure",
- "tunnelcraft-settlement",
- "wiremock",
-]
-
-[[package]]
-name = "tunnelcraft-ipc-client"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tunnelcraft-keystore"
-version = "0.1.0"
-dependencies = [
- "libp2p",
- "rand 0.8.5",
- "thiserror 1.0.69",
- "tracing",
- "tunnelcraft-crypto",
-]
-
-[[package]]
-name = "tunnelcraft-logging"
-version = "0.1.0"
-dependencies = [
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tunnelcraft-network"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bincode",
- "futures",
- "hex",
- "libp2p",
- "libp2p-stream",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tunnelcraft-core",
- "tunnelcraft-crypto",
-]
-
-[[package]]
-name = "tunnelcraft-prover"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "hex",
- "sha2 0.10.9",
- "sp1-build",
- "sp1-sdk",
- "thiserror 1.0.69",
- "tracing",
- "tracing-subscriber",
- "tunnelcraft-core",
- "tunnelcraft-crypto",
- "tunnelcraft-distribution-guest-types",
- "tunnelcraft-prover-guest-types",
-]
-
-[[package]]
-name = "tunnelcraft-prover-guest-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde-big-array",
-]
-
-[[package]]
-name = "tunnelcraft-relay"
-version = "0.1.0"
-dependencies = [
- "hex",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tunnelcraft-core",
- "tunnelcraft-crypto",
- "tunnelcraft-settlement",
-]
-
-[[package]]
-name = "tunnelcraft-settings"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tracing",
- "tunnelcraft-keystore",
-]
-
-[[package]]
-name = "tunnelcraft-settlement"
-version = "0.1.0"
-dependencies = [
- "anchor-lang",
- "bincode",
- "bs58",
- "ed25519-dalek 2.2.0",
- "light-compressed-account",
- "light-hasher",
- "light-sdk-types",
- "openssl",
- "rand 0.8.5",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "solana-client",
- "solana-program",
- "solana-sdk",
- "solana-sdk-ids",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tunnelcraft-core",
- "tunnelcraft-prover",
-]
-
-[[package]]
-name = "tunnelcraft-tests"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.8",
- "bs58",
- "futures",
- "hex",
- "hyper 1.8.1",
- "libp2p",
- "rand 0.8.5",
- "reqwest",
- "serde_json",
- "sha2 0.10.9",
- "solana-client",
- "solana-sdk",
- "solana-system-interface",
- "tokio",
- "tracing-subscriber",
- "tunnelcraft-aggregator",
- "tunnelcraft-client",
- "tunnelcraft-core",
- "tunnelcraft-crypto",
- "tunnelcraft-erasure",
- "tunnelcraft-exit",
- "tunnelcraft-network",
- "tunnelcraft-prover",
- "tunnelcraft-relay",
- "tunnelcraft-settlement",
-]
-
-[[package]]
-name = "tunnelcraft-uniffi"
-version = "0.1.0"
-dependencies = [
- "hex",
- "once_cell",
- "parking_lot 0.12.5",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tunnelcraft-client",
- "tunnelcraft-core",
- "tunnelcraft-crypto",
- "uniffi",
 ]
 
 [[package]]

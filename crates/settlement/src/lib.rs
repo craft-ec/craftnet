@@ -1,4 +1,4 @@
-//! TunnelCraft Settlement
+//! CraftNet Settlement
 //!
 //! Solana client for on-chain settlement and subscription management.
 //!

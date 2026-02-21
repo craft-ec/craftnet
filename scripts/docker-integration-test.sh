@@ -1,11 +1,11 @@
 #!/bin/bash
-# TunnelCraft Docker Integration Tests
+# CraftNet Docker Integration Tests
 # This script runs inside the test-runner container
 
 set -e
 
 echo "=========================================="
-echo "TunnelCraft Integration Test Suite"
+echo "CraftNet Integration Test Suite"
 echo "=========================================="
 
 # Environment variables set by docker-compose
@@ -14,7 +14,7 @@ RELAY1=${RELAY1_ADDR:-"172.28.0.11:9000"}
 RELAY2=${RELAY2_ADDR:-"172.28.0.12:9000"}
 FULL_NODE=${FULL_NODE_ADDR:-"172.28.0.13:9000"}
 
-CLI="/app/target/release/tunnelcraft"
+CLI="/app/target/release/craftnet"
 
 # Test counters
 PASSED=0
@@ -118,7 +118,7 @@ echo "------------------------------------------"
 
 # Run the network integration tests
 cd /app
-if cargo test --release -p tunnelcraft-network --test shard_exchange -- --test-threads=1 2>&1; then
+if cargo test --release -p craftnet-network --test shard_exchange -- --test-threads=1 2>&1; then
     pass "Rust shard exchange tests"
 else
     fail "Rust shard exchange tests"

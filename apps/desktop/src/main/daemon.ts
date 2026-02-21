@@ -13,11 +13,11 @@ export class DaemonManager {
 
     if (isDev) {
       // In development, use the target directory
-      return path.join(__dirname, '../../../../target/release/tunnelcraft-daemon');
+      return path.join(__dirname, '../../../../target/release/craftnet-daemon');
     }
 
     // In production, use the bundled daemon
-    return path.join(app.getAppPath(), '../daemon/tunnelcraft-daemon');
+    return path.join(app.getAppPath(), '../daemon/craftnet-daemon');
   }
 
   async start(): Promise<void> {
@@ -63,8 +63,8 @@ export class DaemonManager {
 
         // Poll for socket existence + connectivity instead of fixed timeout
         const socketPath = process.platform === 'darwin'
-          ? '/tmp/tunnelcraft.sock'
-          : (process.env.XDG_RUNTIME_DIR || '/tmp') + '/tunnelcraft.sock';
+          ? '/tmp/craftnet.sock'
+          : (process.env.XDG_RUNTIME_DIR || '/tmp') + '/craftnet.sock';
         const maxAttempts = 50; // 50 * 100ms = 5 seconds max
         let attempts = 0;
 

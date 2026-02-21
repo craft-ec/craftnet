@@ -6,15 +6,14 @@
 
 use sha2::{Sha256, Digest};
 
-use tunnelcraft_core::{
+use craftnet_core::{
     Shard, Id, PublicKey, ExitPayload, ShardType, OnionSettlement,
     lease_set::LeaseSet,
 };
-use tunnelcraft_crypto::{
-    SigningKeypair, build_onion_header, encrypt_exit_payload, encrypt_routing_tag,
-};
-use tunnelcraft_erasure::TOTAL_SHARDS;
-use tunnelcraft_erasure::chunker::chunk_and_encode;
+use craftec_crypto::{SigningKeypair};
+use craftnet_core::onion_crypto::{build_onion_header, encrypt_exit_payload, encrypt_routing_tag};
+use craftnet_erasure::TOTAL_SHARDS;
+use craftnet_erasure::chunker::chunk_and_encode;
 
 use crate::path::{OnionPath, PathHop, random_id};
 use crate::{ClientError, Result};
@@ -193,7 +192,7 @@ mod tests {
     #[test]
     fn test_build_onion_shards_direct_http() {
         let keypair = SigningKeypair::generate();
-        let enc_keypair = tunnelcraft_crypto::EncryptionKeypair::generate();
+        let enc_keypair = craftec_crypto::EncryptionKeypair::generate();
 
         let exit = PathHop {
             peer_id: b"exit_peer".to_vec(),
@@ -231,7 +230,7 @@ mod tests {
     #[test]
     fn test_build_onion_shards_direct_tunnel() {
         let keypair = SigningKeypair::generate();
-        let enc_keypair = tunnelcraft_crypto::EncryptionKeypair::generate();
+        let enc_keypair = craftec_crypto::EncryptionKeypair::generate();
 
         let exit = PathHop {
             peer_id: b"exit_peer".to_vec(),

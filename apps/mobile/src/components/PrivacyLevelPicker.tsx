@@ -1,6 +1,6 @@
 import React from 'react';
 import {View, Text, TouchableOpacity, StyleSheet} from 'react-native';
-import {PrivacyLevel} from '../native/TunnelCraftVPN';
+import {PrivacyLevel} from '../native/CraftNetVPN';
 
 interface PrivacyLevelPickerProps {
   selected: PrivacyLevel;

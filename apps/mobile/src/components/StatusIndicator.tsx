@@ -1,6 +1,6 @@
 import React from 'react';
 import {View, Text, StyleSheet} from 'react-native';
-import {ConnectionState} from '../native/TunnelCraftVPN';
+import {ConnectionState} from '../native/CraftNetVPN';
 
 interface StatusIndicatorProps {
   state: ConnectionState;

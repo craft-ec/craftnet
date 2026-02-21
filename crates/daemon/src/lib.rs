@@ -1,10 +1,10 @@
-//! TunnelCraft Daemon
+//! CraftNet Daemon
 //!
 //! Background service with IPC server for desktop/mobile frontends.
 //!
 //! ## Components
 //!
-//! - **DaemonService**: VPN client wrapper with IPC interface (uses TunnelCraftNode)
+//! - **DaemonService**: VPN client wrapper with IPC interface (uses CraftNetNode)
 //! - **IpcServer**: JSON-RPC 2.0 over Unix sockets (macOS/Linux) or Named Pipes (Windows)
 //!
 //! ## IPC Methods
@@ -17,16 +17,17 @@
 //!
 //! ## Platform-Specific IPC
 //!
-//! - **macOS/Linux**: Unix domain sockets (`/tmp/tunnelcraft.sock`)
-//! - **Windows**: Named pipes (`\\.\pipe\tunnelcraft`)
+//! - **macOS/Linux**: Unix domain sockets (`/tmp/craftnet.sock`)
+//! - **Windows**: Named pipes (`\\.\pipe\craftnet`)
 
 mod ipc;
 mod service;
 mod windows_pipe;
 
 pub use ipc::{IpcServer, IpcConfig, IpcHandler};
-pub use service::{DaemonService, DaemonState};
+pub use service::{DaemonService, DaemonState, ConnectParams, StatusResponse, ConnectionHistoryEntry, AvailableExitResponse, PeerSummary, ProxyStatusInfo};
 pub use windows_pipe::{WindowsPipeServer, WindowsPipeConfig};
+pub use craftnet_client::SwarmHandles;
 
 use thiserror::Error;
 
@@ -36,7 +37,7 @@ pub enum DaemonError {
     IpcError(String),
 
     #[error("Client error: {0}")]
-    ClientError(#[from] tunnelcraft_client::ClientError),
+    ClientError(#[from] craftnet_client::ClientError),
 
     #[error("SDK error: {0}")]
     SdkError(String),

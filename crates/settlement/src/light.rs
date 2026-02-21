@@ -238,7 +238,7 @@ impl PhotonClient {
 
         let body = PhotonRequest {
             jsonrpc: "2.0",
-            id: "tunnelcraft-1",
+            id: "craftnet-1",
             method: "getValidityProof",
             params: PhotonParams {
                 new_addresses_with_trees: vec![PhotonAddressWithTree {

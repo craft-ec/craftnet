@@ -3,7 +3,7 @@
 //! Run with:
 //! ```
 //! SP1_PROVER=network NETWORK_PRIVATE_KEY=<key> \
-//!   cargo run -p tunnelcraft-prover --features sp1 --example vkey_hash
+//!   cargo run -p craftnet-prover --features sp1 --example vkey_hash
 //! ```
 //!
 //! The output is the `DISTRIBUTION_VKEY_HASH` constant needed in the
@@ -12,7 +12,7 @@
 fn main() {
     #[cfg(feature = "sp1")]
     {
-        let prover = tunnelcraft_prover::DistributionProver::new();
+        let prover = craftnet_prover::DistributionProver::new();
         let hash = prover.vkey_hash();
         println!("Distribution guest vkey hash: {}", hash);
     }
@@ -20,7 +20,7 @@ fn main() {
     #[cfg(not(feature = "sp1"))]
     {
         eprintln!("Error: This example requires the `sp1` feature.");
-        eprintln!("Run with: cargo run -p tunnelcraft-prover --features sp1 --example vkey_hash");
+        eprintln!("Run with: cargo run -p craftnet-prover --features sp1 --example vkey_hash");
         std::process::exit(1);
     }
 }

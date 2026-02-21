@@ -312,7 +312,6 @@ pub struct PeerInfo {
     pub is_exit: bool,
 }
 
-
 /// Cryptographic receipt proving a relay received and will forward a shard.
 ///
 /// When relay A sends a shard to relay B, relay B signs a receipt proving
@@ -362,7 +361,6 @@ impl ForwardReceipt {
         data
     }
 }
-
 
 #[cfg(test)]
 mod tests {

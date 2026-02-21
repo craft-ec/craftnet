@@ -1,4 +1,4 @@
-# TunnelCraft Integration Test Runner
+# CraftNet Integration Test Runner
 # Runs integration tests against the multi-node environment
 
 FROM rust:1.75-bookworm
@@ -19,8 +19,8 @@ COPY crates/ crates/
 COPY apps/ apps/
 
 # Build test binaries
-RUN cargo build --release -p tunnelcraft-cli
-RUN cargo test --no-run --release -p tunnelcraft-network
+RUN cargo build --release -p craftnet-cli
+RUN cargo test --no-run --release -p craftnet-network
 
 # Copy test scripts
 COPY scripts/docker-integration-test.sh /app/run-tests.sh

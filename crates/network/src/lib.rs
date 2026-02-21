@@ -1,4 +1,4 @@
-//! TunnelCraft Network
+//! CraftNet Network
 //!
 //! libp2p integration for P2P networking (Kademlia DHT, NAT traversal).
 //!
@@ -22,7 +22,7 @@ pub mod stream_manager;
 mod subscription;
 
 pub use behaviour::{
-    TunnelCraftBehaviour, TunnelCraftBehaviourEvent,
+    CraftNetBehaviour, CraftNetBehaviourEvent, CraftNetExt,
     KADEMLIA_PROTOCOL, RENDEZVOUS_NAMESPACE,
     EXIT_DHT_KEY_PREFIX, EXIT_REGISTRY_KEY, EXIT_RECORD_TTL, exit_dht_key,
     PEER_DHT_KEY_PREFIX, PEER_RECORD_TTL, peer_dht_key,

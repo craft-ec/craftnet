@@ -1,21 +1,21 @@
 {
-  "name": "tunnelcraft-desktop",
+  "name": "craftnet-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "TunnelCraft Desktop VPN Client",
+  "description": "CraftNet Desktop VPN Client",
   "main": "dist/main/index.js",
   "author": {
-    "name": "TunnelCraft Team",
-    "email": "team@tunnelcraft.app"
+    "name": "CraftNet Team",
+    "email": "team@craftnet.app"
   },
-  "homepage": "https://tunnelcraft.app",
+  "homepage": "https://craftnet.app",
   "engines": {
     "node": ">=18.0.0",
     "npm": ">=9.0.0"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/craftec/tunnelcraft"
+    "url": "https://github.com/craftec/craftnet"
   },
   "scripts": {
     "dev": "npm run build:main && npm run build:preload && concurrently \"npm run dev:renderer\" \"npm run dev:electron\"",

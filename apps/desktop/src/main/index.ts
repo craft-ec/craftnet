@@ -54,7 +54,7 @@ function createTray(): void {
   tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
 
   const contextMenu = Menu.buildFromTemplate([
-    { label: 'Show TunnelCraft', click: () => mainWindow?.show() },
+    { label: 'Show CraftNet', click: () => mainWindow?.show() },
     { type: 'separator' },
     { label: 'Connect', click: () => ipcClient?.connect() },
     { label: 'Disconnect', click: () => ipcClient?.disconnect() },
@@ -65,7 +65,7 @@ function createTray(): void {
     }},
   ]);
 
-  tray.setToolTip('TunnelCraft');
+  tray.setToolTip('CraftNet');
   tray.setContextMenu(contextMenu);
 
   tray.on('click', () => {

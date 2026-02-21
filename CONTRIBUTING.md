@@ -1,6 +1,6 @@
-# Contributing to TunnelCraft
+# Contributing to CraftNet
 
-Thank you for your interest in contributing to TunnelCraft!
+Thank you for your interest in contributing to CraftNet!
 
 ## Development Setup
 
@@ -24,8 +24,8 @@ sudo apt install build-essential pkg-config libssl-dev
 
 ```bash
 # Clone
-git clone https://github.com/craftec/tunnelcraft.git
-cd tunnelcraft
+git clone https://github.com/craftec/craftnet.git
+cd craftnet
 
 # Build all crates
 cargo build
@@ -112,7 +112,7 @@ Changes require careful review.
 cargo test
 
 # Specific crate
-cargo test -p tunnelcraft-relay
+cargo test -p craftnet-relay
 
 # With logging
 RUST_LOG=debug cargo test
